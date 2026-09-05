@@ -19,7 +19,7 @@
 //!   list is ordered by status rank first, then that sequence.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -202,20 +202,17 @@ impl HostState {
         self.connection.is_connected() && self.snapshot.is_some()
     }
 
-    /// Agents of the last snapshot whose ids fit the fleet id form.
+    /// Agents of the last snapshot.
     ///
-    /// A server that sent an id containing `/` would produce a reference whose
-    /// string form parses back into a different host, so its agents are
-    /// dropped from the merged view rather than mis-attributed.
+    /// Ingestion already dropped every agent the fleet cannot address (see
+    /// `retain_addressable_agents`), so each one here has a unique pane id and
+    /// a reference that parses back to this host. Filtering once at the door
+    /// instead of in each reader is also what keeps the roll-up, the merged
+    /// list and the deltas describing the same set of agents.
     fn snapshot_agents(&self) -> impl Iterator<Item = &ClientShellAgent> {
         self.snapshot
             .iter()
             .flat_map(|snapshot| snapshot.agents.iter())
-            .filter(|agent| {
-                is_valid_resource_id(&agent.pane_id)
-                    && is_valid_resource_id(&agent.workspace_id)
-                    && is_valid_resource_id(&agent.tab_id)
-            })
     }
 
     fn workspace_label(&self, workspace_id: &str) -> String {
@@ -261,6 +258,7 @@ pub struct MergedAgent {
     pub title: Option<String>,
     pub agent: Option<String>,
     pub display_agent: Option<String>,
+    #[serde(deserialize_with = "deserialize_agent_status")]
     pub agent_status: AgentStatus,
     /// The host's own change counter; only comparable within one host boot.
     pub state_change_seq: u64,
@@ -272,9 +270,11 @@ pub struct MergedAgent {
 /// One observable difference between two [`FleetState`] revisions.
 ///
 /// This is the fork's delta stream: `herdr fleet status --watch` prints one
-/// per line and the gateway forwards them. It is an additive JSON contract —
-/// tagged with `kind`, fields are added and never renamed, and a reader must
-/// tolerate a `kind` it does not know.
+/// per line and the gateway forwards them. It is an additive JSON contract:
+/// tagged with `kind`, fields are added and never renamed, and variants are
+/// only appended. There is deliberately no catch-all variant, so this enum
+/// decodes exactly the kinds it knows; a consumer reading a stream from a
+/// newer client must skip a `kind` it cannot decode rather than fail on it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FleetChange {
@@ -290,6 +290,11 @@ pub enum FleetChange {
         boot_id: String,
         revision: u64,
     },
+    /// An agent joined the merged list, or rejoined it with fresh recency.
+    ///
+    /// Treat it as an upsert keyed by `agent.pane`: a host that reconnects, and
+    /// a server that rebooted, re-announce every agent they still have.
+    ///
     /// Boxed to keep `FleetChange` small: a merged agent is several times the
     /// size of every other variant.
     AgentAdded {
@@ -300,7 +305,9 @@ pub enum FleetChange {
     },
     AgentStatus {
         pane: FleetPaneRef,
+        #[serde(deserialize_with = "deserialize_agent_status")]
         from: AgentStatus,
+        #[serde(deserialize_with = "deserialize_agent_status")]
         to: AgentStatus,
     },
     ActiveHost {
@@ -344,14 +351,28 @@ impl FleetState {
     ///
     /// Every enabled host starts `Connecting { attempt: 0 }`; the first enabled
     /// host is active, because the connector only streams pane surfaces for the
-    /// active host.
+    /// active host. A repeated host id is dropped with a warning.
     pub fn new(specs: Vec<HostSpec>) -> Self {
-        let active_host = specs
+        // A host id is the left half of every fleet reference, so two hosts
+        // sharing one id would make their panes indistinguishable while
+        // `apply` and `host` only ever reached the first of them — one host's
+        // data attributed to another. `resolve_hosts` already rejects
+        // duplicates; dropping them here keeps the invariant true for every
+        // other caller of this constructor.
+        let mut hosts: Vec<HostState> = Vec::with_capacity(specs.len());
+        for spec in specs {
+            if hosts.iter().any(|host| host.id() == &spec.id) {
+                tracing::warn!(host = %spec.id, "ignoring a duplicate fleet host id");
+                continue;
+            }
+            hosts.push(HostState::new(spec));
+        }
+        let active_host = hosts
             .iter()
-            .find(|spec| spec.enabled)
-            .map(|spec| spec.id.clone());
+            .find(|host| host.spec.enabled)
+            .map(|host| host.spec.id.clone());
         Self {
-            hosts: specs.into_iter().map(HostState::new).collect(),
+            hosts,
             active_host,
             change_seq: 0,
             merged: None,
@@ -541,13 +562,15 @@ impl FleetState {
     fn set_snapshot(
         &mut self,
         index: usize,
-        snapshot: Box<ClientShellSnapshot>,
+        mut snapshot: Box<ClientShellSnapshot>,
     ) -> Vec<FleetChange> {
         let Some(host) = self.hosts.get(index) else {
             return Vec::new();
         };
         // Mirror `ClientShellState::set_snapshot`: within one boot a lower
-        // revision is stale and dropped; any new boot_id replaces outright.
+        // revision is stale and dropped; any new boot_id replaces outright. An
+        // equal revision is a resend, folded in again — nothing advanced, so it
+        // yields no agent deltas.
         if host.snapshot.as_ref().is_some_and(|current| {
             current.boot_id == snapshot.boot_id && snapshot.revision < current.revision
         }) {
@@ -560,6 +583,9 @@ impl FleetState {
             .as_ref()
             .is_none_or(|current| current.boot_id != snapshot.boot_id);
 
+        retain_addressable_agents(&host_id, &mut snapshot);
+        let agent_count = snapshot.agents.len();
+
         let mut change_seq = self.change_seq;
         let mut changes = vec![FleetChange::Snapshot {
             host: host_id.clone(),
@@ -570,20 +596,27 @@ impl FleetState {
         let Some(host) = self.hosts.get_mut(index) else {
             return Vec::new();
         };
-        if boot_changed {
-            // A restarted server restarts `state_change_seq`, so nothing about
-            // the previous boot may influence recency.
-            host.seen.clear();
-        }
+        // The panes the host had a moment ago. Kept even across a boot change,
+        // where the previous boot's recency is worthless but the agents it had
+        // are still leaving the merged list and owe their readers a removal.
+        let previous_seen = std::mem::take(&mut host.seen);
         host.snapshot = Some(snapshot);
 
         let mut rollup = AgentRollup::default();
-        let mut next_seen = HashMap::new();
+        let mut next_seen = HashMap::with_capacity(agent_count);
         let mut added = Vec::new();
         let mut status_changes = Vec::new();
         for agent in host.snapshot_agents() {
             rollup.add(agent.agent_status);
-            let fleet_change_seq = match host.seen.get(&agent.pane_id) {
+            // A restarted server restarts `state_change_seq`, so nothing about
+            // the previous boot may influence recency: across a boot every
+            // agent is new.
+            let known = if boot_changed {
+                None
+            } else {
+                previous_seen.get(&agent.pane_id)
+            };
+            let fleet_change_seq = match known {
                 None => {
                     change_seq = change_seq.saturating_add(1);
                     added.push(FleetChange::AgentAdded {
@@ -620,8 +653,7 @@ impl FleetState {
             );
         }
 
-        let mut removed = host
-            .seen
+        let mut removed = previous_seen
             .keys()
             .filter(|pane_id| !next_seen.contains_key(pane_id.as_str()))
             .map(|pane_id| FleetPaneRef::new(host_id.clone(), pane_id.clone()))
@@ -695,6 +727,57 @@ fn status_rank(status: AgentStatus) -> u8 {
         AgentStatus::Idle => 3,
         AgentStatus::Unknown => 4,
     }
+}
+
+/// Drop the agents of a snapshot that the fleet cannot address.
+///
+/// A well-behaved herdr server numbers panes `w1:p1` and never repeats one, but
+/// the fleet reads whatever a host sends. An id holding `/` would mint a
+/// reference whose string form parses back into a *different* host, and a
+/// repeated pane id would put one reference in the merged list twice, so both
+/// are dropped here — once, at ingestion — instead of in every reader.
+/// Upstream filters a snapshot at the door the same way
+/// (`ClientShellState::set_snapshot` drops unknown commands).
+fn retain_addressable_agents(host: &HostId, snapshot: &mut ClientShellSnapshot) {
+    let before = snapshot.agents.len();
+    let mut pane_ids: HashSet<String> = HashSet::with_capacity(before);
+    snapshot.agents.retain(|agent| {
+        is_valid_resource_id(&agent.pane_id)
+            && is_valid_resource_id(&agent.workspace_id)
+            && is_valid_resource_id(&agent.tab_id)
+            && pane_ids.insert(agent.pane_id.clone())
+    });
+    let dropped = before.saturating_sub(snapshot.agents.len());
+    if dropped > 0 {
+        tracing::warn!(
+            host = %host,
+            dropped,
+            "dropped fleet agents whose ids are unusable or repeated"
+        );
+    }
+}
+
+/// Decode an [`AgentStatus`], falling back to `AgentStatus::Unknown`.
+///
+/// The derived `Deserialize` rejects a name it does not know, so one future
+/// status would break a whole report or delta. The fleet contract promises the
+/// opposite (see [`crate::fleet::report`]), and the wire already makes the same
+/// choice for snapshots (`deserialize_client_shell_agent_status`).
+///
+/// Fleet shapes are JSON: decoding a self-describing name is the whole
+/// contract, and a non-self-describing format fails loudly instead of guessing.
+pub(crate) fn deserialize_agent_status<'de, D>(deserializer: D) -> Result<AgentStatus, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(match raw.as_str() {
+        "idle" => AgentStatus::Idle,
+        "working" => AgentStatus::Working,
+        "blocked" => AgentStatus::Blocked,
+        "done" => AgentStatus::Done,
+        _ => AgentStatus::Unknown,
+    })
 }
 
 /// Reconnect delay: 1 s, doubling to a 30 s ceiling.
@@ -1540,5 +1623,248 @@ mod tests {
         assert_eq!(backoff.peek(), Duration::from_secs(30));
         backoff.reset();
         assert_eq!(backoff.next(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_new_boot_removes_the_agents_it_no_longer_has() {
+        let (mut state, local, _) = two_connected_hosts();
+        state.apply(
+            &local,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                3,
+                vec![
+                    agent("w1:p1", AgentStatus::Working, 5),
+                    agent("w1:p2", AgentStatus::Blocked, 6),
+                ],
+            )),
+        );
+        assert_eq!(state.merged_agents().len(), 2);
+
+        let changes = state.apply(
+            &local,
+            HostEvent::Snapshot(snapshot(
+                "boot-b",
+                1,
+                vec![agent("w1:p1", AgentStatus::Idle, 1)],
+            )),
+        );
+        let removed = changes
+            .iter()
+            .filter_map(|change| match change {
+                FleetChange::AgentRemoved { pane } => Some(pane.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            removed,
+            vec!["local/w1:p2"],
+            "a pane the new boot does not have left the merged list, so it owes \
+             its readers a removal: {changes:?}"
+        );
+        assert_eq!(
+            state
+                .merged_agents()
+                .iter()
+                .map(|agent| agent.pane.to_string())
+                .collect::<Vec<_>>(),
+            vec!["local/w1:p1"]
+        );
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn an_equal_revision_resend_reports_the_snapshot_and_nothing_else() {
+        let (mut state, local, _) = two_connected_hosts();
+        state.apply(
+            &local,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                3,
+                vec![agent("w1:p1", AgentStatus::Working, 5)],
+            )),
+        );
+        let recency = state
+            .merged_agents()
+            .first()
+            .map(|agent| agent.fleet_change_seq)
+            .expect("one merged agent");
+
+        let changes = state.apply(
+            &local,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                3,
+                vec![agent("w1:p1", AgentStatus::Working, 5)],
+            )),
+        );
+        assert_eq!(changes.len(), 1, "a resend advances nothing: {changes:?}");
+        assert!(matches!(
+            changes.first(),
+            Some(FleetChange::Snapshot { revision: 3, .. })
+        ));
+        assert_eq!(
+            state
+                .merged_agents()
+                .first()
+                .map(|agent| agent.fleet_change_seq),
+            Some(recency),
+            "a resend must not reshuffle the merged list"
+        );
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn a_repeated_pane_id_in_one_snapshot_is_kept_once() {
+        let (mut state, local, _) = two_connected_hosts();
+        let changes = state.apply(
+            &local,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                1,
+                vec![
+                    agent("w1:p1", AgentStatus::Blocked, 1),
+                    agent("w1:p1", AgentStatus::Idle, 2),
+                    agent("w1:p2", AgentStatus::Idle, 1),
+                ],
+            )),
+        );
+        assert_eq!(
+            changes
+                .iter()
+                .filter(|change| matches!(change, FleetChange::AgentAdded { .. }))
+                .count(),
+            2,
+            "the repeat is not a second agent: {changes:?}"
+        );
+        assert_eq!(
+            state
+                .merged_agents()
+                .iter()
+                .map(|agent| agent.pane.to_string())
+                .collect::<Vec<_>>(),
+            vec!["local/w1:p1", "local/w1:p2"]
+        );
+        assert_eq!(
+            state.totals(),
+            AgentRollup {
+                blocked: 1,
+                idle: 1,
+                ..AgentRollup::default()
+            },
+            "the first of the repeats wins, and the roll-up counts it once"
+        );
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn a_duplicate_host_id_never_reaches_the_state() {
+        let mut state = FleetState::new(vec![
+            HostSpec::local_default(),
+            HostSpec {
+                id: HostId::local(),
+                kind: HostKind::Ssh {
+                    target: "impostor".to_string(),
+                    session: None,
+                },
+                enabled: true,
+            },
+        ]);
+        assert_eq!(state.hosts().len(), 1, "two hosts may not share an id");
+        assert_eq!(
+            state
+                .host(&HostId::local())
+                .map(|host| host.spec.kind.as_str()),
+            Some("local"),
+            "the first spec of an id wins"
+        );
+
+        let local = HostId::local();
+        connected(&mut state, &local);
+        state.apply(
+            &local,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                1,
+                vec![agent("w1:p1", AgentStatus::Idle, 1)],
+            )),
+        );
+        assert_eq!(state.merged_agents().len(), 1);
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn a_future_agent_status_in_a_delta_decodes_to_unknown() {
+        let json = serde_json::json!({
+            "kind": "agent_status",
+            "pane": "local/w1:p1",
+            "from": "working",
+            "to": "quarantined",
+        });
+        let decoded: FleetChange =
+            serde_json::from_value(json).expect("a future status must not break the delta");
+        assert_eq!(
+            decoded,
+            FleetChange::AgentStatus {
+                pane: FleetPaneRef::new(HostId::local(), "w1:p1"),
+                from: AgentStatus::Working,
+                to: AgentStatus::Unknown,
+            }
+        );
+    }
+
+    #[test]
+    fn every_fleet_change_round_trips_through_json() {
+        let (mut state, local, _) = two_connected_hosts();
+        state.apply(
+            &local,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                1,
+                vec![agent("w1:p1", AgentStatus::Blocked, 1)],
+            )),
+        );
+        let merged = state
+            .merged_agents()
+            .first()
+            .cloned()
+            .expect("one merged agent");
+        let pane = FleetPaneRef::new(local.clone(), "w1:p1");
+        let changes = vec![
+            // `methods` is deliberately absent from the delta, so a connection
+            // that carries none round-trips exactly.
+            FleetChange::HostConnection {
+                host: local.clone(),
+                connection: HostConnection::Unavailable {
+                    reason: "connection refused".to_string(),
+                    retry_in: Some(Duration::from_secs(2)),
+                },
+            },
+            FleetChange::Snapshot {
+                host: local.clone(),
+                boot_id: "boot-a".to_string(),
+                revision: 1,
+            },
+            FleetChange::AgentAdded {
+                agent: Box::new(merged),
+            },
+            FleetChange::AgentRemoved { pane: pane.clone() },
+            FleetChange::AgentStatus {
+                pane,
+                from: AgentStatus::Idle,
+                to: AgentStatus::Blocked,
+            },
+            FleetChange::ActiveHost {
+                host: Some(local.clone()),
+            },
+            FleetChange::ActiveHost { host: None },
+        ];
+        for change in changes {
+            let json = serde_json::to_string(&change).expect("change serializes");
+            let decoded: FleetChange = serde_json::from_str(&json).expect("change decodes");
+            assert_eq!(decoded, change, "{json}");
+            let value: serde_json::Value = serde_json::from_str(&json).expect("change is json");
+            assert!(value.get("kind").is_some(), "{json}");
+        }
     }
 }

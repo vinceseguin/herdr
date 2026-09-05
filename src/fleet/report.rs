@@ -163,6 +163,7 @@ pub struct WorkspaceReport {
     pub r#ref: FleetWorkspaceRef,
     pub workspace_id: String,
     pub label: String,
+    #[serde(deserialize_with = "crate::fleet::state::deserialize_agent_status")]
     pub agent_status: AgentStatus,
     pub focused: bool,
 }
@@ -181,6 +182,7 @@ pub struct AgentReport {
     pub title: Option<String>,
     pub agent: Option<String>,
     pub display_agent: Option<String>,
+    #[serde(deserialize_with = "crate::fleet::state::deserialize_agent_status")]
     pub agent_status: AgentStatus,
     /// The host's own counter; only comparable within one host boot.
     pub state_change_seq: u64,
@@ -355,13 +357,16 @@ fn agent_status_name(status: AgentStatus) -> &'static str {
 }
 
 /// Left-aligned fixed-width table; every line is trimmed of trailing padding.
+///
+/// Column widths are terminal columns, not `char`s: workspace labels and agent
+/// names are user data and may hold wide or zero-width characters.
 fn render_table(rows: &[Vec<String>]) -> String {
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
     let mut widths = vec![0usize; columns];
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
             if let Some(width) = widths.get_mut(index) {
-                *width = (*width).max(cell.chars().count());
+                *width = (*width).max(display_width(cell));
             }
         }
     }
@@ -375,7 +380,7 @@ fn render_table(rows: &[Vec<String>]) -> String {
             line.push_str(cell);
             let width = widths.get(index).copied().unwrap_or(0);
             if index + 1 < row.len() {
-                for _ in cell.chars().count()..width {
+                for _ in display_width(cell)..width {
                     line.push(' ');
                 }
             }
@@ -384,6 +389,11 @@ fn render_table(rows: &[Vec<String>]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Terminal columns `text` occupies.
+fn display_width(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
 }
 
 #[cfg(test)]
@@ -594,6 +604,45 @@ workbox  local  unavailable  -           0        0        0     0     0
 AGENT        STATUS   WORKSPACE  NAME
 local/w1:p1  blocked  repo       reviewer
 ";
+
+    #[test]
+    fn a_future_agent_status_in_a_report_decodes_to_unknown() {
+        let mut state = two_hosts_on_the_frozen_snapshot();
+        let report = FleetStatusReport::from_state(&mut state, "0.8.2-test");
+        let mut value = serde_json::to_value(&report).expect("report is json");
+        value["agents"][0]["agent_status"] = serde_json::Value::String("quarantined".to_string());
+        value["hosts"][0]["workspaces"][0]["agent_status"] =
+            serde_json::Value::String("quarantined".to_string());
+
+        let decoded: FleetStatusReport =
+            serde_json::from_value(value).expect("a future status must not break the report");
+        assert_eq!(decoded.agents[0].agent_status, AgentStatus::Unknown);
+        assert_eq!(
+            decoded.hosts[0].workspaces[0].agent_status,
+            AgentStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn the_table_pads_by_terminal_columns_not_chars() {
+        let rows = vec![
+            vec!["A".to_string(), "x".to_string()],
+            vec!["ワイド".to_string(), "y".to_string()],
+        ];
+        let rendered = render_table(&rows);
+        let starts = rendered
+            .lines()
+            .filter_map(|line| {
+                line.find(['x', 'y'])
+                    .map(|byte| display_width(&line[..byte]))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 2, "{rendered}");
+        assert_eq!(
+            starts[0], starts[1],
+            "a wide label must not push its neighbour out of column: {rendered}"
+        );
+    }
 
     #[test]
     fn render_text_says_so_when_no_agent_is_merged() {
