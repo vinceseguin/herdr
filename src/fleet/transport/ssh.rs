@@ -455,8 +455,9 @@ mod tests {
     }
 
     /// Wait for a condition the bridge's accept thread satisfies out of band:
-    /// `connect` returns as soon as the *listener* accepts, and the ssh child
-    /// is spawned just after.
+    /// `connect` returns as soon as the kernel queues the connection on the
+    /// listener's backlog, and the accept thread picks it up and spawns the
+    /// ssh child on its next poll.
     fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -817,7 +818,23 @@ mod tests {
         let shim = FakeSsh::install("rebuild", Some(1), Bridge::ProxyTo(endpoint.socket.clone()));
 
         let mut transport = ssh_transport("lab-ssh", "herdr-ssh-lab", Some("lab-1"));
-        let stream = transport.connect().expect("connect through the bridge");
+        // Handshake before letting go: `connect` returns as soon as the kernel
+        // queues the connection on the bridge's listener, and the accept thread
+        // only picks it up on its next poll. A stream dropped right away can
+        // still be sitting in that backlog when the bridge is torn down below,
+        // in which case it never spawns an ssh child and never reaches the
+        // host. The welcome proves this connection did.
+        let mut stream = transport.connect().expect("connect through the bridge");
+        let outcome = endpoint_handshake(
+            &mut stream,
+            &HandshakeParams::read_only(ClientSurfaceSize { cols: 80, rows: 24 }),
+        )
+        .expect("handshake completes through the first bridge");
+        assert!(
+            matches!(outcome, HandshakeOutcome::Connected(_)),
+            "unexpected handshake outcome: {outcome:?}"
+        );
+        assert_eq!(endpoint.connections(), 1);
         drop(stream);
         let socket = transport.local_socket().to_path_buf();
         assert!(socket.exists(), "the bridge socket was never bound");
@@ -852,7 +869,11 @@ mod tests {
             matches!(outcome, HandshakeOutcome::Connected(_)),
             "unexpected handshake outcome: {outcome:?}"
         );
-        assert_eq!(endpoint.connections(), 2);
+        assert_eq!(
+            endpoint.connections(),
+            2,
+            "the rebuilt bridge must carry a second connection to the host"
+        );
         let probes = shim
             .trace()
             .lines()

@@ -310,9 +310,10 @@ integration test that boots two named sessions and asserts the merged status.
 | 5 | feat: fleet connector streams local hosts and herdr fleet status reports them | C · Connector and CLI | 2 | ✅ |
 | 6 | feat: fleet connector reaches ssh hosts through the shared bridge | C · Connector and CLI | 3, 5 | ✅ |
 | 7 | docs: fleet core reference, ssh lab guide, adr review | D · Docs | 6 | ⬜ |
+| 8 | fix: deflake ssh transport forward-socket rebuild test | C · Connector and CLI | 6 | ✅ |
 
 **Wave preview (2-agent cap):** W1 `[1, 4]` → W2 `[2, 3]` → W3 `[5]` → W4
-`[6]` → W5 `[7]`. Critical path 1 → 2 → 5 → 6 → 7. No PR touches
+`[6]` → W5 `[7, 8]`. Critical path 1 → 2 → 5 → 6 → 7. No PR touches
 `Cargo.toml`/`Cargo.lock`.
 
 **Model assignment:** tasks run on `opus`. Review agent must be **`fable`** for
@@ -1732,6 +1733,60 @@ user's `herdr session list` shows no `lab-*`.
 - E2 adds `docs/fork/fleet.md` (TUI keys/limits) and links here rather than
   duplicating the config reference; E3 adds `gateway.md`; E5
   `remote-access.md` points at the ssh lab section for local testing.
+
+### PR 8 — fix: deflake ssh transport forward-socket rebuild test · deps: 6
+
+**Goal:** `fleet::transport::ssh::tests::a_lost_forward_socket_is_rebuilt_on_the_next_attempt`
+passes deterministically. It failed roughly half the time on a fresh
+`origin/master` (`ce9d4928`), including in isolation, with
+`assert_eq!(endpoint.connections(), 2)` seeing `1`.
+
+**Root cause (test-only, verified).** `SshTransport::connect` returns as soon
+as `connect_local_stream` succeeds, which on a unix socket is when the kernel
+queues the connection — before `SshStdioBridge`'s accept thread, a poll loop
+(`accept()` → `WouldBlock` → sleep `BRIDGE_ACCEPT_POLL` = 50 ms → re-check
+`should_stop`), has picked it up. The test dropped the first stream at once,
+unlinked the socket, and let the failed second `connect` drop the bridge
+(`should_stop` + join). When that happened during the poll sleep, the queued
+first connection was discarded without ever spawning an ssh child. The
+failing run's shim trace has exactly one `remote-client-bridge` ARGV line
+(only the rebuilt bridge's connection), which rules out the alternative
+theory that the `python3` proxy exited before reaching the `FakeEndpoint`:
+the unix `bridge_connection` never kills its child and the proxy connects
+before it touches stdin. Nothing anyone still held was lost, so the product
+is not at fault; a bridge dropped with a connection still queued closes it,
+which is the intended teardown.
+
+**Fix.** Handshake the first connection through the bridge before dropping
+it (the same `endpoint_handshake` the sibling
+`a_connection_runs_the_remote_bridge_command_and_handshakes` uses) and assert
+`endpoint.connections() == 1` at that point. The welcome proves the first
+connection reached the host; the final `== 2` is then deterministic and the
+test still checks what it set out to: a lost forward socket is rebuilt on the
+next attempt, the rebuilt bridge carries traffic end to end, and discovery is
+not repeated. No assertion was weakened, no retry or `#[ignore]` added. The
+other tests in the module were reviewed for the same shape:
+`discovery_is_cached_across_reconnects` keeps its listener up and already
+waits with `wait_until` for the queued connections to be served;
+`a_bridge_failure_becomes_the_next_connect_reason` bounds its loop with a
+deadline; `dropping_the_transport_unlinks_the_forward_socket` also drops its
+stream at once but asserts only that `Drop` unlinked the socket, which holds
+whether or not that connection was ever accepted; the rest hold their stream
+or never bridge at all.
+
+**Evidence.** `bash scripts/fork/gate.sh <worktree> "test-one a_lost_forward_socket"`
+× 30 after the fix: `PASS=30 FAIL=0` (before: 1 of 8 and 3 of 6 failed).
+Full gate `EXIT=0`, `windows-lint` `EXIT=0`. This is a unit-test fix; the
+30× loop plus the full gate stand in for real-server validation.
+
+**Observation for later PRs (not changed here).** On unix, `SshStdioBridge`'s
+`Drop` joins the accept thread, and `bridge_connection` waits for its ssh
+child without killing it, so dropping the bridge while a bridged stream is
+still open blocks until that ssh child exits. `SshTransport::connect`'s
+error path (`self.bridge = None`) and `retire_ssh_session` inherit this;
+today the supervisor only reconnects after the previous stream died, so it
+does not bite, but an E2 caller that drops a transport while holding a stream
+should know.
 
 ## Critical files referenced (reuse, don't reinvent)
 
