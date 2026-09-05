@@ -14,15 +14,13 @@
 //! [`connector`] runs a supervisor thread per host and merges their events,
 //! and [`oneshot`] drives all of it from a plain blocking caller.
 
-// The connector ships the whole host lane — commands out, responses back —
-// because that routing is what makes "this frame belongs to that host" true,
-// and E2 (input) and E7 (requests) must not invent a second one. `herdr fleet
-// status` is read-only, so it exercises only the read half; the write half has
-// no production caller until those epics land. Scoped to these two modules:
-// the pure layers below carry no module-wide allow.
-#[allow(dead_code)]
+// No module-wide allows: the connector ships the whole host lane — commands
+// out, responses back — because that routing is what makes "this frame
+// belongs to that host" true, and E2 (input) and E7 (requests) must not invent
+// a second one. `herdr fleet status` is read-only, so the write half has no
+// production caller until those epics land; each such item carries its own
+// narrow allow with that reason next to it.
 pub mod connector;
-#[allow(dead_code)]
 pub mod endpoint_lane;
 pub mod handshake;
 pub mod hosts;

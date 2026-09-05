@@ -37,18 +37,33 @@ struct InFlight {
 ///
 /// One request is in flight at a time, matching what the server's shell lane
 /// accepts; the rest wait in order.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct EndpointLane {
     queued: VecDeque<(String, String)>,
     in_flight: Option<InFlight>,
+    timeout: Duration,
+}
+
+impl Default for EndpointLane {
+    fn default() -> Self {
+        Self::with_timeout(ENDPOINT_REQUEST_TIMEOUT)
+    }
 }
 
 impl EndpointLane {
-    pub fn new() -> Self {
-        Self::default()
+    /// A lane whose requests expire after `timeout` instead of the default.
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            queued: VecDeque::new(),
+            in_flight: None,
+            timeout,
+        }
     }
 
     /// Queue one already-serialized `api::schema::Request`.
+    // Called by the connector's `send`, whose only production caller is E2/E7;
+    // `herdr fleet status` never queues a request.
+    #[allow(dead_code)]
     pub fn enqueue(&mut self, request_id: String, request: String) {
         self.queued.push_back((request_id, request));
     }
@@ -75,6 +90,7 @@ impl EndpointLane {
         });
     }
 
+    #[cfg(test)]
     pub fn has_in_flight(&self) -> bool {
         self.in_flight.is_some()
     }
@@ -124,12 +140,13 @@ impl EndpointLane {
 
     /// Give up on a request that has been in flight too long.
     ///
-    /// Checked when the host says anything and when a request is queued, not
-    /// on a timer: the connector has no clock thread, and a host that answers
-    /// nothing at all is reported through its connection state instead.
+    /// Checked when the host publishes a snapshot and when a request is
+    /// queued, not on a timer: the connector has no clock thread, and a host
+    /// that answers nothing at all is reported through its connection state
+    /// instead.
     pub fn expire(&mut self, now: Instant) -> Option<LaneResponse> {
         let in_flight = self.in_flight.as_ref()?;
-        if now.saturating_duration_since(in_flight.sent_at) < ENDPOINT_REQUEST_TIMEOUT {
+        if now.saturating_duration_since(in_flight.sent_at) < self.timeout {
             return None;
         }
         let in_flight = self.in_flight.take()?;
@@ -169,7 +186,7 @@ mod tests {
     use super::*;
 
     fn sent_lane() -> EndpointLane {
-        let mut lane = EndpointLane::new();
+        let mut lane = EndpointLane::default();
         lane.enqueue("r1".to_string(), "{}".to_string());
         let (request_id, _) = lane.take_next().expect("queued request");
         lane.mark_sent("boot-1".to_string(), request_id, Instant::now());
@@ -216,7 +233,7 @@ mod tests {
 
     #[test]
     fn a_response_without_a_request_is_refused() {
-        let mut lane = EndpointLane::new();
+        let mut lane = EndpointLane::default();
         let error = lane
             .receive_chunk("boot-1", "r1", true, b"{}".to_vec())
             .expect_err("nothing in flight");
@@ -228,7 +245,7 @@ mod tests {
 
     #[test]
     fn only_one_request_is_in_flight_at_a_time() {
-        let mut lane = EndpointLane::new();
+        let mut lane = EndpointLane::default();
         lane.enqueue("r1".to_string(), "{}".to_string());
         lane.enqueue("r2".to_string(), "{}".to_string());
         let (first, _) = lane.take_next().expect("first request");
@@ -248,7 +265,7 @@ mod tests {
 
     #[test]
     fn an_old_request_expires() {
-        let mut lane = EndpointLane::new();
+        let mut lane = EndpointLane::default();
         lane.enqueue("r1".to_string(), "{}".to_string());
         let (request_id, _) = lane.take_next().expect("queued request");
         let sent_at = Instant::now() - ENDPOINT_REQUEST_TIMEOUT - Duration::from_secs(1);

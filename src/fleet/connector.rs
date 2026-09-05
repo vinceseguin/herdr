@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use interprocess::TryClone as _;
 use tokio::sync::mpsc;
 
-use crate::fleet::endpoint_lane::EndpointLane;
+use crate::fleet::endpoint_lane::{EndpointLane, LaneResponse, ENDPOINT_REQUEST_TIMEOUT};
 use crate::fleet::handshake::{
     endpoint_handshake, framing_error, HandshakeOutcome, HandshakeParams,
 };
@@ -84,9 +84,14 @@ pub struct FleetConnectorOptions {
     /// Surface size for whichever host is active.
     pub active_surface: ClientSurfaceSize,
     /// Whether ssh transports use herdr's managed ssh config (PR 6).
+    // Read by PR 6's ssh transport; until then only the default constructs it.
+    #[allow(dead_code)]
     pub manage_ssh_config: bool,
     /// Largest endpoint frame accepted from a host.
     pub max_frame_size: usize,
+    /// How long one endpoint request may wait for its answer before it is
+    /// failed and the next queued request runs.
+    pub endpoint_timeout: Duration,
 }
 
 impl Default for FleetConnectorOptions {
@@ -96,11 +101,17 @@ impl Default for FleetConnectorOptions {
             active_surface: INACTIVE_SURFACE,
             manage_ssh_config: false,
             max_frame_size: MAX_FRAME_SIZE,
+            endpoint_timeout: ENDPOINT_REQUEST_TIMEOUT,
         }
     }
 }
 
 /// Everything the connector reports, from every host, in arrival order.
+// Read by E2/E3 only: `herdr fleet status` is read-only, so nothing in this PR
+// reads the surface, notification, response and message payloads in production; E2 (input, surfaces) and E7 (requests)
+// are its consumers. Allowed per item rather than per module so a genuinely
+// unused helper still fails the lint.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum FleetEvent {
     /// A transport fact for [`crate::fleet::state::FleetState::apply`].
@@ -138,6 +149,11 @@ pub enum FleetEvent {
 /// status` is read-only. It exists for E2, which routes real input to the
 /// active host, and the type makes the target host explicit at every call
 /// site so input cannot land on the wrong machine.
+// Write-half item: `herdr fleet status` is read-only, so nothing in this PR
+// constructs or reads it in production; E2 (input, surfaces) and E7 (requests)
+// are its consumers. Allowed per item rather than per module so a genuinely
+// unused helper still fails the lint.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum HostCommand {
     Resize(ClientSurfaceSize),
@@ -147,10 +163,21 @@ pub enum HostCommand {
     },
     Focus(bool),
     MouseCapture(bool),
+    /// One `api::schema::Request`, already serialized. `request_id` must equal
+    /// the JSON `id` field: the host correlates its answer by that field, so a
+    /// mismatch could never be matched to this request.
+    ///
+    /// Accepted means exactly one [`FleetEvent::EndpointResponse`] follows —
+    /// the answer, the host's error, an expiry, or the disconnect that made an
+    /// answer impossible.
     Endpoint {
         request_id: String,
         request: String,
     },
+    /// Any other shell-lane message, written as given. The messages the
+    /// connector itself owns — the endpoint hello, endpoint requests — are
+    /// refused here: they carry a boot id or a handshake state that only the
+    /// connector can keep true.
     Raw(Box<ClientMessage>),
 }
 
@@ -163,6 +190,11 @@ pub enum HostSendError {
     NotConnected,
     /// The write failed; the supervisor will notice and reconnect.
     Io(io::Error),
+    /// The command is malformed or would corrupt the connector's own view of
+    /// the host (a foreign boot id, a second handshake); nothing was sent.
+    // Constructed by `send`, the write half; see the note on `HostCommand`.
+    #[allow(dead_code)]
+    Refused(&'static str),
 }
 
 impl std::fmt::Display for HostSendError {
@@ -171,6 +203,7 @@ impl std::fmt::Display for HostSendError {
             Self::UnknownHost => f.write_str("no such fleet host"),
             Self::NotConnected => f.write_str("fleet host is not connected"),
             Self::Io(error) => write!(f, "fleet host write failed: {error}"),
+            Self::Refused(reason) => write!(f, "fleet command refused: {reason}"),
         }
     }
 }
@@ -220,6 +253,12 @@ struct HostLink {
 pub struct FleetConnector {
     hosts: Vec<HostLink>,
     events: mpsc::Receiver<FleetEvent>,
+    /// For failures `send` discovers on the caller's thread (an expired
+    /// request). Weak so the channel still closes once every supervisor has
+    /// exited, which is how a consumer learns nothing else can arrive.
+    // Read by `send`, the write half; see the note on `HostCommand`.
+    #[allow(dead_code)]
+    events_tx: mpsc::WeakSender<FleetEvent>,
     options: Arc<FleetConnectorOptions>,
     active_host: Mutex<Option<HostId>>,
     stop: Arc<AtomicBool>,
@@ -245,6 +284,7 @@ impl FleetConnector {
         let options = Arc::new(options);
         let stop = Arc::new(AtomicBool::new(false));
         let (events_tx, events) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let events_tx_weak = events_tx.downgrade();
         let (finished_tx, finished) = std::sync::mpsc::channel();
 
         // The first enabled host is active, matching `FleetState::new`, so the
@@ -300,6 +340,7 @@ impl FleetConnector {
         Self {
             hosts,
             events,
+            events_tx: events_tx_weak,
             options,
             active_host: Mutex::new(active_host),
             stop,
@@ -314,10 +355,6 @@ impl FleetConnector {
     /// no host can produce another event.
     pub fn events(&mut self) -> &mut mpsc::Receiver<FleetEvent> {
         &mut self.events
-    }
-
-    pub fn active_host(&self) -> Option<HostId> {
-        lock(&self.active_host).clone()
     }
 
     /// Point the fleet at one host, or at none.
@@ -355,65 +392,6 @@ impl FleetConnector {
         Ok(())
     }
 
-    /// Send one command to one host.
-    ///
-    /// The host is always explicit: there is no "current host" fallback, so a
-    /// caller cannot accidentally type into the machine it stopped looking at.
-    pub fn send(&self, host: &HostId, command: HostCommand) -> Result<(), HostSendError> {
-        let Some(link) = self.link(host) else {
-            return Err(HostSendError::UnknownHost);
-        };
-        let mut state = lock(&link.state);
-        if state.stream.is_none() {
-            return Err(HostSendError::NotConnected);
-        }
-
-        let message = match command {
-            HostCommand::Resize(surface_size) => {
-                state.surface = Some(surface_size);
-                self.resize_message(surface_size)
-            }
-            HostCommand::PaneInput { pane_id, events } => {
-                ClientMessage::ClientShellPaneInput { pane_id, events }
-            }
-            HostCommand::Focus(focused) => ClientMessage::ClientShellFocus { focused },
-            HostCommand::MouseCapture(enabled) => {
-                ClientMessage::ClientShellMouseCapture { enabled }
-            }
-            HostCommand::Raw(message) => *message,
-            HostCommand::Endpoint {
-                request_id,
-                request,
-            } => {
-                let Some(boot_id) = state.boot_id.clone() else {
-                    // No snapshot yet: there is no projection to address, and
-                    // guessing a boot id would run the request on the wrong one.
-                    return Err(HostSendError::NotConnected);
-                };
-                state.lane.enqueue(request_id, request);
-                let Some((request_id, request)) = state.lane.take_next() else {
-                    // Another request is in flight; this one waits its turn.
-                    return Ok(());
-                };
-                let sent = write_locked(
-                    &mut state,
-                    &ClientMessage::ClientShellEndpointRequest {
-                        boot_id: boot_id.clone(),
-                        request,
-                    },
-                );
-                return match sent {
-                    Ok(()) => {
-                        state.lane.mark_sent(boot_id, request_id, Instant::now());
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                };
-            }
-        };
-        write_locked(&mut state, &message)
-    }
-
     /// Stop every host and wait, briefly, for the threads to notice.
     ///
     /// A supervisor sleeping between reconnect attempts checks the stop flag
@@ -422,8 +400,13 @@ impl FleetConnector {
     /// server hang up, which ends the read. Anything still running after the
     /// bounded wait is left detached rather than blocking the caller — it owns
     /// no state the caller can observe once the receiver is gone.
-    pub fn shutdown(self) {
+    pub fn shutdown(mut self) {
         self.stop.store(true, Ordering::Release);
+        // Closing the receiver fails every `blocking_send`, including one
+        // parked on a full channel because the consumer stopped reading before
+        // it called shutdown; otherwise that supervisor could only exit once
+        // the receiver was dropped, after the whole wait below.
+        self.events.close();
         self.close_connections();
 
         let deadline = Instant::now() + SHUTDOWN_JOIN_TIMEOUT;
@@ -500,6 +483,96 @@ impl FleetConnector {
     }
 }
 
+// Write-half item: `herdr fleet status` is read-only, so nothing in this PR
+// constructs or reads it in production; E2 (input, surfaces) and E7 (requests)
+// are its consumers. Allowed per item rather than per module so a genuinely
+// unused helper still fails the lint.
+#[allow(dead_code)]
+impl FleetConnector {
+    pub fn active_host(&self) -> Option<HostId> {
+        lock(&self.active_host).clone()
+    }
+
+    /// Send one command to one host.
+    ///
+    /// The host is always explicit: there is no "current host" fallback, so a
+    /// caller cannot accidentally type into the machine it stopped looking at.
+    pub fn send(&self, host: &HostId, command: HostCommand) -> Result<(), HostSendError> {
+        let Some(link) = self.link(host) else {
+            return Err(HostSendError::UnknownHost);
+        };
+        let mut state = lock(&link.state);
+        if state.stream.is_none() {
+            return Err(HostSendError::NotConnected);
+        }
+
+        let message = match command {
+            HostCommand::Resize(surface_size) => {
+                state.surface = Some(surface_size);
+                self.resize_message(surface_size)
+            }
+            HostCommand::PaneInput { pane_id, events } => {
+                ClientMessage::ClientShellPaneInput { pane_id, events }
+            }
+            HostCommand::Focus(focused) => ClientMessage::ClientShellFocus { focused },
+            HostCommand::MouseCapture(enabled) => {
+                ClientMessage::ClientShellMouseCapture { enabled }
+            }
+            HostCommand::Raw(message) => match *message {
+                ClientMessage::ClientShellEndpointRequest { .. } => {
+                    return Err(HostSendError::Refused(
+                        "endpoint requests go through HostCommand::Endpoint, which owns the boot id",
+                    ));
+                }
+                ClientMessage::EndpointControl { .. } => {
+                    return Err(HostSendError::Refused(
+                        "the endpoint handshake belongs to the connector",
+                    ));
+                }
+                // A raw resize is still a resize: the size bookkeeping is what
+                // keeps a later activation from skipping a needed resize.
+                ClientMessage::ClientShellResize { surface_size, .. } => {
+                    state.surface = Some(surface_size);
+                    *message
+                }
+                other => other,
+            },
+            HostCommand::Endpoint {
+                request_id,
+                request,
+            } => {
+                let (accepted, failed) = queue_endpoint(&mut state, request_id, request);
+                drop(state);
+                for response in failed {
+                    self.report_lane_failure(host, response);
+                }
+                return accepted;
+            }
+        };
+        write_locked(&mut state, &message)
+    }
+
+    /// Deliver a lane failure found on the caller's thread.
+    ///
+    /// `try_send`, never a blocking send: the caller may be the thread that
+    /// drains the channel. A full channel here means the consumer is far
+    /// behind an answer that already took the whole request timeout; the loss
+    /// is logged rather than deadlocked on.
+    fn report_lane_failure(&self, host: &HostId, response: LaneResponse) {
+        let Some(events) = self.events_tx.upgrade() else {
+            return;
+        };
+        let event = FleetEvent::EndpointResponse {
+            host: host.clone(),
+            request_id: response.request_id,
+            result: response.result,
+        };
+        if let Err(error) = events.try_send(event) {
+            tracing::warn!(host = %host, error = %error, "dropping a fleet endpoint failure report");
+        }
+    }
+}
+
 impl Drop for FleetConnector {
     fn drop(&mut self) {
         // A connector dropped without `shutdown` must not leave threads writing
@@ -540,6 +613,88 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         tracing::warn!("recovering a poisoned fleet lock");
         poisoned.into_inner()
     })
+}
+
+/// Accept one endpoint request into the host's lane and start it if the
+/// lane is free.
+///
+/// The first value says whether the request was accepted; the second carries
+/// lane failures found on the way (an earlier request that expired, or the
+/// request whose write just failed), each of which the caller must report.
+// Called by `send`, the write half; see the note on `HostCommand`.
+#[allow(dead_code)]
+fn queue_endpoint(
+    state: &mut MutexGuard<'_, HostLinkState>,
+    request_id: String,
+    request: String,
+) -> (Result<(), HostSendError>, Vec<LaneResponse>) {
+    if let Err(reason) = check_endpoint_request(&request_id, &request) {
+        return (Err(HostSendError::Refused(reason)), Vec::new());
+    }
+    if state.boot_id.is_none() {
+        // No snapshot yet: there is no projection to address, and guessing a
+        // boot id would run the request on the wrong one.
+        return (Err(HostSendError::NotConnected), Vec::new());
+    }
+    let mut failed = expire_lane(state);
+    state.lane.enqueue(request_id, request);
+    failed.extend(pump_lane(state));
+    (Ok(()), failed)
+}
+
+/// The host correlates an answer by the request's JSON `id`, and closes the
+/// connection on an envelope it cannot read. Both are checked here so one bad
+/// request cannot take the whole host down or leave the lane waiting on an id
+/// that will never come back.
+// Called by `send`, the write half; see the note on `HostCommand`.
+#[allow(dead_code)]
+fn check_endpoint_request(request_id: &str, request: &str) -> Result<(), &'static str> {
+    let envelope: serde_json::Value =
+        serde_json::from_str(request).map_err(|_| "endpoint request is not a JSON object")?;
+    match envelope.get("id").and_then(serde_json::Value::as_str) {
+        Some(id) if id == request_id => Ok(()),
+        Some(_) => Err("endpoint request id does not match the JSON id field"),
+        None => Err("endpoint request has no string id field"),
+    }
+}
+
+/// Write the next queued request for the host's current boot, if the lane is
+/// free. A request whose write failed is returned as its own failure; the
+/// stream is already cleared, so the supervisor will reconnect.
+fn pump_lane(state: &mut MutexGuard<'_, HostLinkState>) -> Vec<LaneResponse> {
+    let Some(boot_id) = state.boot_id.clone() else {
+        return Vec::new();
+    };
+    let Some((request_id, request)) = state.lane.take_next() else {
+        return Vec::new();
+    };
+    let sent = write_locked(
+        state,
+        &ClientMessage::ClientShellEndpointRequest {
+            boot_id: boot_id.clone(),
+            request,
+        },
+    );
+    state.lane.mark_sent(boot_id, request_id, Instant::now());
+    match sent {
+        Ok(()) => Vec::new(),
+        Err(error) => state
+            .lane
+            .fail_in_flight(&format!("could not send the request: {error}"))
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// Fail an in-flight request that has outlived the timeout, then let the next
+/// queued one run.
+fn expire_lane(state: &mut MutexGuard<'_, HostLinkState>) -> Vec<LaneResponse> {
+    let Some(expired) = state.lane.expire(Instant::now()) else {
+        return Vec::new();
+    };
+    let mut failed = vec![expired];
+    failed.extend(pump_lane(state));
+    failed
 }
 
 /// What ended one connection's read loop.
@@ -698,7 +853,7 @@ impl Supervisor {
             state.stream = Some(stream);
             state.boot_id = None;
             state.surface = Some(params.surface_size);
-            state.lane = EndpointLane::new();
+            state.lane = EndpointLane::with_timeout(self.options.endpoint_timeout);
             let wanted = self.wanted_surface();
             if wanted != params.surface_size {
                 state.surface = Some(wanted);
@@ -846,13 +1001,30 @@ impl Supervisor {
                 )));
             }
         };
-        {
+        let failed = {
             let mut state = lock(&self.state);
             state.boot_id = Some(snapshot.boot_id.clone());
+            // The lane is checked for an expired request wherever this lock is
+            // already taken, so an unanswered request cannot block the queue
+            // for as long as the host keeps publishing.
+            expire_lane(&mut state)
+        };
+        for response in failed {
+            if let Some(stopped) = self.report_lane_response(response) {
+                return Some(stopped);
+            }
         }
         self.forward(FleetEvent::Host {
             host: self.spec.id.clone(),
             event: HostEvent::Snapshot(Box::new(snapshot)),
+        })
+    }
+
+    fn report_lane_response(&self, response: LaneResponse) -> Option<ReadOutcome> {
+        self.forward(FleetEvent::EndpointResponse {
+            host: self.spec.id.clone(),
+            request_id: response.request_id,
+            result: response.result,
         })
     }
 
@@ -867,15 +1039,8 @@ impl Supervisor {
         let received = state
             .lane
             .receive_chunk(boot_id, request_id, final_chunk, data);
-        let (finished, next) = match received {
-            Ok(Some(response)) => {
-                // Free lane: start the next queued request on this boot.
-                let next = state.boot_id.clone().and_then(|boot_id| {
-                    let (request_id, request) = state.lane.take_next()?;
-                    Some((boot_id, request_id, request))
-                });
-                (Some(response), next)
-            }
+        let mut finished = match received {
+            Ok(Some(response)) => vec![response],
             Ok(None) => return None,
             Err(reason) => {
                 // A miscorrelated answer is a protocol violation: fail the real
@@ -884,39 +1049,22 @@ impl Supervisor {
                 let failed = state.lane.fail_in_flight(&reason);
                 drop(state);
                 if let Some(failed) = failed {
-                    if let Some(stopped) = self.forward(FleetEvent::EndpointResponse {
-                        host: self.spec.id.clone(),
-                        request_id: failed.request_id,
-                        result: failed.result,
-                    }) {
+                    if let Some(stopped) = self.report_lane_response(failed) {
                         return Some(stopped);
                     }
                 }
                 return Some(ReadOutcome::Disconnected(reason));
             }
         };
-        if let Some((boot_id, request_id, request)) = next {
-            let sent = write_locked(
-                &mut state,
-                &ClientMessage::ClientShellEndpointRequest {
-                    boot_id: boot_id.clone(),
-                    request,
-                },
-            );
-            match sent {
-                Ok(()) => state.lane.mark_sent(boot_id, request_id, Instant::now()),
-                Err(error) => {
-                    tracing::warn!(host = %self.spec.id, error = %error, "failed to send a queued endpoint request");
-                }
+        // Free lane: start the next queued request on this boot.
+        finished.extend(pump_lane(&mut state));
+        drop(state);
+        for response in finished {
+            if let Some(stopped) = self.report_lane_response(response) {
+                return Some(stopped);
             }
         }
-        drop(state);
-        let finished = finished?;
-        self.forward(FleetEvent::EndpointResponse {
-            host: self.spec.id.clone(),
-            request_id: finished.request_id,
-            result: finished.result,
-        })
+        None
     }
 
     /// Tear the connection down and fail everything that was waiting on it.
@@ -1089,6 +1237,12 @@ mod tests {
         Incompatible,
         /// Accept the connection and never answer the hello.
         Silent,
+        /// Welcome, then these messages, then answer every endpoint request
+        /// in two chunks — tagged with the request's boot id, or `reply_boot`.
+        Answer {
+            messages: Vec<ServerMessage>,
+            reply_boot: Option<String>,
+        },
     }
 
     /// A herdr endpoint server, minus herdr.
@@ -1185,9 +1339,9 @@ mod tests {
         stop: &Arc<AtomicBool>,
     ) {
         if matches!(behaviour, Behaviour::Silent) {
-            while !stop.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            // Reads like a real server (so the client's half-close ends the
+            // connection) but never answers.
+            while protocol::read_message::<_, ClientMessage>(stream, MAX_FRAME_SIZE).is_ok() {}
             return;
         }
         let Ok(hello) = protocol::read_message::<_, ClientMessage>(stream, MAX_FRAME_SIZE) else {
@@ -1220,7 +1374,9 @@ mod tests {
             Behaviour::Incompatible => return,
             Behaviour::Silent => return,
             Behaviour::DropFirstConnection(_) if index == 0 => return,
-            Behaviour::Serve(messages) | Behaviour::DropFirstConnection(messages) => messages,
+            Behaviour::Serve(messages)
+            | Behaviour::DropFirstConnection(messages)
+            | Behaviour::Answer { messages, .. } => messages,
         };
         for message in messages {
             if protocol::write_message(stream, message).is_err() {
@@ -1230,9 +1386,95 @@ mod tests {
         // Keep the connection alive, recording whatever the client sends.
         while !stop.load(Ordering::Acquire) {
             match protocol::read_message::<_, ClientMessage>(stream, MAX_FRAME_SIZE) {
-                Ok(message) => lock(received).push(message),
+                Ok(message) => {
+                    if let (
+                        Behaviour::Answer { reply_boot, .. },
+                        ClientMessage::ClientShellEndpointRequest { boot_id, request },
+                    ) = (behaviour, &message)
+                    {
+                        if !answer_endpoint(
+                            stream,
+                            reply_boot.as_deref().unwrap_or(boot_id),
+                            request,
+                        ) {
+                            return;
+                        }
+                    }
+                    lock(received).push(message);
+                }
                 Err(_) => return,
             }
+        }
+    }
+
+    /// Answer one endpoint request the way the server does: correlated by the
+    /// request's JSON `id`, split into chunks.
+    fn answer_endpoint(stream: &mut LocalStream, boot_id: &str, request: &str) -> bool {
+        let request_id = serde_json::from_str::<serde_json::Value>(request)
+            .ok()
+            .and_then(|value| value.get("id")?.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let body = format!("{{\"id\":\"{request_id}\",\"ok\":true}}");
+        let (head, tail) = body.split_at(body.len() / 2);
+        for (data, final_chunk) in [(head, false), (tail, true)] {
+            let chunk = ServerMessage::ClientShellEndpointResponseChunk {
+                boot_id: boot_id.to_string(),
+                request_id: request_id.clone(),
+                final_chunk,
+                data: data.as_bytes().to_vec(),
+            };
+            if protocol::write_message(stream, &chunk).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn endpoint_requests(messages: &[ClientMessage]) -> Vec<(String, String)> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ClientMessage::ClientShellEndpointRequest { boot_id, request } => {
+                    Some((boot_id.clone(), request.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Drain events, applying host events to `state`, until one other event
+    /// satisfies `wanted` (returned) or the deadline passes.
+    fn next_event(
+        connector: &mut FleetConnector,
+        state: &mut FleetState,
+        timeout: Duration,
+        mut wanted: impl FnMut(&FleetEvent) -> bool,
+    ) -> Option<FleetEvent> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match connector.events().try_recv() {
+                Ok(FleetEvent::Host { host, event }) => {
+                    state.apply(&host, event);
+                }
+                Ok(event) if wanted(&event) => return Some(event),
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return None,
+            }
+        }
+        None
+    }
+
+    fn endpoint_response(event: &FleetEvent) -> bool {
+        matches!(event, FleetEvent::EndpointResponse { .. })
+    }
+
+    fn endpoint_command(request_id: &str) -> HostCommand {
+        HostCommand::Endpoint {
+            request_id: request_id.to_string(),
+            request: format!("{{\"id\":\"{request_id}\",\"method\":\"session.snapshot\"}}"),
         }
     }
 
@@ -1747,6 +1989,344 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "shutdown must not wait out the backoff: {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_endpoint_request_round_trips_in_two_chunks_on_the_hosts_boot() {
+        let dir = scratch_dir("endpoint");
+        let alpha = FakeHost::start(
+            &dir,
+            "alpha",
+            Behaviour::Answer {
+                messages: vec![snapshot_message(&snapshot("boot-alpha", 1))],
+                reply_boot: None,
+            },
+        );
+        let mut state = FleetState::new(vec![alpha.spec("alpha")]);
+        let mut connector = connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        let id = HostId::new("alpha").expect("valid host id");
+        drain_until(
+            &mut connector,
+            &mut state,
+            Duration::from_secs(10),
+            |state| connected_with_snapshot(state, "alpha"),
+        );
+
+        connector
+            .send(&id, endpoint_command("r1"))
+            .expect("a connected host with a snapshot accepts a request");
+        // A second request waits its turn: exactly one is in flight.
+        connector
+            .send(&id, endpoint_command("r2"))
+            .expect("queued behind r1");
+
+        let first = next_event(
+            &mut connector,
+            &mut state,
+            Duration::from_secs(5),
+            endpoint_response,
+        )
+        .expect("r1 is answered");
+        let FleetEvent::EndpointResponse {
+            host,
+            request_id,
+            result,
+        } = first
+        else {
+            panic!("expected an endpoint response, got {first:?}");
+        };
+        assert_eq!(host, id);
+        assert_eq!(request_id, "r1");
+        assert_eq!(result, Ok(br#"{"id":"r1","ok":true}"#.to_vec()));
+
+        let second = next_event(
+            &mut connector,
+            &mut state,
+            Duration::from_secs(5),
+            endpoint_response,
+        )
+        .expect("r2 runs once r1 is answered");
+        let FleetEvent::EndpointResponse {
+            request_id, result, ..
+        } = second
+        else {
+            panic!("expected an endpoint response, got {second:?}");
+        };
+        assert_eq!(request_id, "r2");
+        assert_eq!(result, Ok(br#"{"id":"r2","ok":true}"#.to_vec()));
+
+        // Both requests carried the boot id this connection's snapshot
+        // announced, never a caller-supplied one.
+        assert!(wait_for(Duration::from_secs(2), || endpoint_requests(
+            &alpha.received()
+        )
+        .len()
+            == 2));
+        for (boot_id, _) in endpoint_requests(&alpha.received()) {
+            assert_eq!(boot_id, "boot-alpha");
+        }
+        connector.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_answer_for_another_boot_fails_the_request_and_the_connection() {
+        let dir = scratch_dir("foreign-boot");
+        let alpha = FakeHost::start(
+            &dir,
+            "alpha",
+            Behaviour::Answer {
+                messages: vec![snapshot_message(&snapshot("boot-alpha", 1))],
+                reply_boot: Some("boot-elsewhere".to_string()),
+            },
+        );
+        let mut state = FleetState::new(vec![alpha.spec("alpha")]);
+        let mut connector = connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        let id = HostId::new("alpha").expect("valid host id");
+        drain_until(
+            &mut connector,
+            &mut state,
+            Duration::from_secs(10),
+            |state| connected_with_snapshot(state, "alpha"),
+        );
+
+        connector
+            .send(&id, endpoint_command("r1"))
+            .expect("request accepted");
+        let event = next_event(
+            &mut connector,
+            &mut state,
+            Duration::from_secs(5),
+            endpoint_response,
+        )
+        .expect("the request must be failed, not silently dropped");
+        let FleetEvent::EndpointResponse {
+            request_id, result, ..
+        } = event
+        else {
+            panic!("expected an endpoint response, got {event:?}");
+        };
+        assert_eq!(request_id, "r1");
+        let reason = result.expect_err("bytes for another boot must not be handed over");
+        assert!(
+            reason.contains("boot-elsewhere"),
+            "unexpected reason: {reason}"
+        );
+
+        // The connection is treated as broken and comes back on a fresh one.
+        drain_until(
+            &mut connector,
+            &mut state,
+            Duration::from_secs(10),
+            |state| {
+                state.host(&id).is_some_and(|host| {
+                    matches!(host.connection, HostConnection::Unavailable { .. })
+                })
+            },
+        );
+        assert!(
+            state
+                .host(&id)
+                .is_some_and(|host| matches!(host.connection, HostConnection::Unavailable { .. })),
+            "a miscorrelated answer must drop the connection"
+        );
+        assert!(
+            wait_for(Duration::from_secs(5), || alpha.connections() >= 2),
+            "the host must be reconnected"
+        );
+        connector.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_and_connector_owned_commands_are_refused_before_the_host_sees_them() {
+        let dir = scratch_dir("refused");
+        let alpha = FakeHost::start(
+            &dir,
+            "alpha",
+            Behaviour::Answer {
+                messages: vec![snapshot_message(&snapshot("boot-alpha", 1))],
+                reply_boot: None,
+            },
+        );
+        let mut state = FleetState::new(vec![alpha.spec("alpha")]);
+        let mut connector = connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        let id = HostId::new("alpha").expect("valid host id");
+        drain_until(
+            &mut connector,
+            &mut state,
+            Duration::from_secs(10),
+            |state| connected_with_snapshot(state, "alpha"),
+        );
+
+        let refused = [
+            HostCommand::Endpoint {
+                request_id: "r1".to_string(),
+                request: r#"{"id":"r2","method":"session.snapshot"}"#.to_string(),
+            },
+            HostCommand::Endpoint {
+                request_id: "r1".to_string(),
+                request: r#"{"method":"session.snapshot"}"#.to_string(),
+            },
+            HostCommand::Endpoint {
+                request_id: "r1".to_string(),
+                request: "not json".to_string(),
+            },
+            HostCommand::Raw(Box::new(ClientMessage::ClientShellEndpointRequest {
+                boot_id: "boot-elsewhere".to_string(),
+                request: r#"{"id":"r1","method":"session.snapshot"}"#.to_string(),
+            })),
+            HostCommand::Raw(Box::new(ClientMessage::EndpointControl {
+                kind: crate::protocol::endpoint::ENDPOINT_HELLO_KIND.to_string(),
+                data: "{}".to_string(),
+            })),
+        ];
+        for command in refused {
+            let description = format!("{command:?}");
+            assert!(
+                matches!(connector.send(&id, command), Err(HostSendError::Refused(_))),
+                "must be refused: {description}"
+            );
+        }
+        // Nothing refused reached the host: one hello, no requests.
+        std::thread::sleep(Duration::from_millis(200));
+        let received = alpha.received();
+        assert!(endpoint_requests(&received).is_empty(), "{received:?}");
+        assert_eq!(
+            received
+                .iter()
+                .filter(|message| matches!(message, ClientMessage::EndpointControl { .. }))
+                .count(),
+            1,
+            "{received:?}"
+        );
+        // A raw resize is still tracked, so it is not repeated on activation.
+        let raw_size = ClientSurfaceSize { cols: 77, rows: 11 };
+        connector
+            .send(
+                &id,
+                HostCommand::Raw(Box::new(ClientMessage::ClientShellResize {
+                    cell_width_px: 0,
+                    cell_height_px: 0,
+                    surface_size: raw_size,
+                    pixel_mouse: false,
+                })),
+            )
+            .expect("a raw resize is a plain shell-lane message");
+        assert!(wait_for(Duration::from_secs(2), || resizes(
+            &alpha.received()
+        ) == vec![raw_size]));
+        connector.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unanswered_request_expires_when_the_next_one_is_queued() {
+        let dir = scratch_dir("expire");
+        // `Serve` records requests and never answers them.
+        let alpha = FakeHost::start(
+            &dir,
+            "alpha",
+            Behaviour::Serve(vec![snapshot_message(&snapshot("boot-alpha", 1))]),
+        );
+        let options = FleetConnectorOptions {
+            endpoint_timeout: Duration::from_millis(200),
+            ..FleetConnectorOptions::default()
+        };
+        let mut state = FleetState::new(vec![alpha.spec("alpha")]);
+        let mut connector = connector(&[("alpha", &alpha)], options);
+        let id = HostId::new("alpha").expect("valid host id");
+        drain_until(
+            &mut connector,
+            &mut state,
+            Duration::from_secs(10),
+            |state| connected_with_snapshot(state, "alpha"),
+        );
+
+        connector
+            .send(&id, endpoint_command("r1"))
+            .expect("request accepted");
+        std::thread::sleep(Duration::from_millis(300));
+        connector
+            .send(&id, endpoint_command("r2"))
+            .expect("request accepted");
+
+        let event = next_event(
+            &mut connector,
+            &mut state,
+            Duration::from_secs(5),
+            endpoint_response,
+        )
+        .expect("the expired request is reported");
+        let FleetEvent::EndpointResponse {
+            request_id, result, ..
+        } = event
+        else {
+            panic!("expected an endpoint response, got {event:?}");
+        };
+        assert_eq!(request_id, "r1");
+        assert!(result.is_err(), "an expiry is a failure");
+        // r2 was written the moment r1 expired, not stuck behind it.
+        assert!(
+            wait_for(Duration::from_secs(2), || endpoint_requests(
+                &alpha.received()
+            )
+            .len()
+                == 2),
+            "{:?}",
+            endpoint_requests(&alpha.received())
+        );
+        connector.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shutdown_returns_while_a_host_is_mid_handshake() {
+        let dir = scratch_dir("shutdown-handshake");
+        let alpha = FakeHost::start(&dir, "alpha", Behaviour::Silent);
+        let connector = connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        assert!(
+            wait_for(Duration::from_secs(5), || alpha.connections() == 1),
+            "the host must be mid-handshake"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        connector.shutdown();
+        assert!(
+            started.elapsed() < SHUTDOWN_JOIN_TIMEOUT,
+            "shutdown must end a pending handshake instead of waiting out the welcome deadline: {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shutdown_returns_while_a_host_is_blocked_on_a_full_channel() {
+        let dir = scratch_dir("shutdown-full");
+        let mut messages = vec![snapshot_message(&snapshot("boot-alpha", 1))];
+        messages.extend(
+            (1..=(EVENT_CHANNEL_CAPACITY as u64 + 50))
+                .map(|revision| surface_message("boot-alpha", revision)),
+        );
+        // alpha is active (first enabled host), so every frame is forwarded
+        // into a channel nobody drains.
+        let alpha = FakeHost::start(&dir, "alpha", Behaviour::Serve(messages));
+        let connector = connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        assert!(
+            wait_for(Duration::from_secs(5), || alpha.connections() == 1),
+            "the host must connect"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+
+        let started = Instant::now();
+        connector.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a supervisor parked on a full channel must be released by shutdown: {:?}",
             started.elapsed()
         );
         let _ = std::fs::remove_dir_all(&dir);
