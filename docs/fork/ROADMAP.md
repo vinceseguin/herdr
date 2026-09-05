@@ -161,7 +161,7 @@ Owned by `implement-roadmap`. Legend: ✅ done · 🔨 in progress · ⬜ not st
 | Epic | Title | Depends on | Status | Plan |
 | --- | --- | --- | --- | --- |
 | E0 | Fork foundations, CI, fleet lab | — | ✅ | `docs/fork/plans/e0-fork-foundations.md` |
-| E1 | Fleet core (multi-host runtime model) | E0 | 🔨 | `docs/fork/plans/e1-fleet-core.md` |
+| E1 | Fleet core (multi-host runtime model) | E0 | ✅ | `docs/fork/plans/e1-fleet-core.md` |
 | E2 | Fleet TUI (one console, every machine) | E1 | ⬜ | — |
 | E3 | Fleet gateway (HTTP + WebSocket) | E1 | ⬜ | — |
 | E4 | Phone app (installable PWA) | E3 | ⬜ | — |
@@ -299,7 +299,14 @@ connector calls directly** vs spawning `herdr --remote`-style subprocesses per
 host; (b) id form — **`host/w1:p1`** vs `w1:p1@host`; (c) where `[fleet]`
 lives — **main `config.toml`** vs a separate `fleet.toml`.
 **Constraint downstream epics must honor:** no server or wire-protocol change;
-`FleetState` stays free of ratatui, sockets, and async.
+`FleetState` stays free of ratatui, sockets, and async. Learned in E1: the
+snapshot's `agents[]` lists only detected or reported agents (a plain shell
+pane is not an agent); `fleet_change_seq` is per `FleetState` instance, so
+recency only exists inside a long-lived state (a one-shot report assigns it in
+snapshot-arrival order); an ssh host's forward socket is unlinked only by
+`shutdown`, so long-running clients (E2, E3) must call it on exit; and on unix
+dropping an `SshTransport`/`SshStdioBridge` while a bridged stream is still
+open blocks until that ssh child exits — release the stream first.
 
 ---
 
