@@ -8,7 +8,7 @@
 
 pub mod support;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,8 +31,14 @@ fn unique_root(label: &str) -> PathBuf {
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or_default();
     // Kept short on purpose: session sockets live under this root and unix
-    // socket paths are capped at ~108 bytes.
-    std::env::temp_dir().join(format!(
+    // socket paths are capped at ~108 bytes (104 on macOS, whose temp_dir()
+    // is already ~50 bytes long), so prefer a plain /tmp like tests/cli does.
+    let base = if Path::new("/tmp").is_dir() {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    base.join(format!(
         "herdr-lab-{label}-{}-{}",
         std::process::id(),
         nanos % 1_000_000
@@ -252,6 +258,35 @@ fn fleet_lab_up_fails_without_leaving_a_root_when_the_binary_is_missing() {
         "up with a missing binary must fail"
     );
     assert!(
+        stderr_of(&output).contains("herdr binary not found"),
+        "up stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        !lab.root.exists(),
+        "a failed up must not leave {} behind",
+        lab.root.display()
+    );
+}
+
+#[test]
+fn fleet_lab_up_cleans_up_when_the_server_exits_early() {
+    let lab = Lab::new("early");
+
+    // `false` accepts any argv and exits at once: the lab's server dies before
+    // it ever becomes ready, so `up` must report that and undo its own root.
+    let output = lab.run_with_bin("/bin/false", &["up", "1"]);
+
+    assert!(
+        !output.status.success(),
+        "up with a server that exits early must fail"
+    );
+    assert!(
+        stderr_of(&output).contains("exited early"),
+        "up stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(
         !lab.root.exists(),
         "a failed up must not leave {} behind",
         lab.root.display()
@@ -261,20 +296,44 @@ fn fleet_lab_up_fails_without_leaving_a_root_when_the_binary_is_missing() {
 #[test]
 fn fleet_lab_refuses_a_root_without_its_marker() {
     let lab = Lab::new("nomark");
-    std::fs::create_dir_all(lab.root.join("decoy")).expect("create decoy root");
+    let decoy = lab.root.join("decoy");
+    std::fs::create_dir_all(&decoy).expect("create decoy root");
+    let marker = lab.root.join(".herdr-fleet-lab");
 
-    let up = lab.run(&["up", "1"]);
-    assert!(!up.status.success(), "up must refuse an unmarked root");
-    assert!(
-        stderr_of(&up).contains("marker"),
-        "up stderr: {}",
-        stderr_of(&up)
-    );
+    let assert_refused = |what: &str| {
+        let up = lab.run(&["up", "1"]);
+        assert!(!up.status.success(), "up must refuse a root {what}");
+        assert!(
+            stderr_of(&up).contains("marker"),
+            "up stderr ({what}): {}",
+            stderr_of(&up)
+        );
 
-    let down = lab.run(&["down"]);
-    assert!(!down.status.success(), "down must refuse an unmarked root");
-    assert!(
-        lab.root.join("decoy").exists(),
-        "down must not delete a directory it does not own"
-    );
+        let down = lab.run(&["down"]);
+        assert!(!down.status.success(), "down must refuse a root {what}");
+        assert!(
+            stderr_of(&down).contains("marker"),
+            "down stderr ({what}): {}",
+            stderr_of(&down)
+        );
+        assert!(
+            decoy.exists(),
+            "down must not delete a directory it does not own ({what})"
+        );
+    };
+
+    assert_refused("without a marker");
+
+    std::fs::create_dir(&marker).expect("marker directory");
+    assert_refused("whose marker is a directory");
+    std::fs::remove_dir(&marker).expect("remove marker directory");
+
+    let elsewhere = lab.root.join("decoy/looks-like-a-marker");
+    std::fs::write(&elsewhere, "herdr-fleet-lab\nbin=/x\n").expect("fake marker");
+    std::os::unix::fs::symlink(&elsewhere, &marker).expect("symlink marker");
+    assert_refused("whose marker is a symlink");
+    std::fs::remove_file(&marker).expect("remove marker symlink");
+
+    std::fs::write(&marker, "not-a-fleet-lab\n").expect("foreign marker");
+    assert_refused("whose marker was not written by the lab");
 }
