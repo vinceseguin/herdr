@@ -1,2 +1,10 @@
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Fork build identity (vinceseguin/herdr). Every `cargo build/run/test/nextest`
+# in this checkout compiles channel `fork`, so binaries report `x.y.z-fork` and
+# refuse to self-update from upstream's `distribution/latest.json`.
+# Deliberately not `force`d: a real environment variable still wins, so release
+# tooling can add `HERDR_BUILD_ID` or pin a different channel explicitly.
+[env]
+HERDR_BUILD_CHANNEL = "fork"

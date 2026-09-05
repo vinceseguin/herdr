@@ -2109,8 +2109,42 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Refusal shown when a fork build is asked to replace itself.
+///
+/// The `self-update is disabled` prefix is load-bearing: `src/main.rs` prints
+/// any `herdr update` error starting with it verbatim (instead of the
+/// `update failed: …` wrapper) and exits 1.
+const FORK_UPDATE_REFUSAL: &str =
+    "self-update is disabled for fork builds; see docs/fork/README.md";
+
+/// Reason logged when the background update check is skipped on a fork build.
+const FORK_UPDATE_CHECK_SKIP: &str = "fork build: self-update disabled; see docs/fork/README.md";
+
+/// Pure guard: fork builds must never install an upstream release, because
+/// upstream's `distribution/latest.json` would replace the fork binary with a
+/// stock one. Takes the channel so it is testable without a recompile.
+pub(crate) fn fork_channel_refusal(channel: &str) -> Option<&'static str> {
+    if crate::build_info::is_fork_channel(channel) {
+        Some(FORK_UPDATE_REFUSAL)
+    } else {
+        None
+    }
+}
+
+/// Same refusal, resolved against this build's channel, for CLI call sites that
+/// would otherwise hand off to [`self_update`].
+pub(crate) fn fork_channel_update_guidance() -> Option<&'static str> {
+    fork_channel_refusal(crate::build_info::channel())
+}
+
 /// Manual self-update command (`herdr update`).
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+    // Checked before anything else, so a fork build never resolves an install
+    // kind, reads the update config, or fetches a release manifest.
+    if let Some(refusal) = fork_channel_refusal(crate::build_info::channel()) {
+        return Err(refusal.to_string());
+    }
+
     let channel = UpdateChannel::configured();
 
     if is_homebrew_managed_install() {
@@ -2262,6 +2296,13 @@ pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
                 install_command: update_install_command().to_string(),
             });
         }
+        return;
+    }
+
+    // Checked before any manifest fetch: a fork binary never contacts the
+    // upstream release manifest on its own behalf.
+    if fork_channel_refusal(crate::build_info::channel()).is_some() {
+        crate::logging::update_check_failed(FORK_UPDATE_CHECK_SKIP);
         return;
     }
 
@@ -2680,6 +2721,38 @@ mod tests {
         assert!(preview_channel_rejection_for_exe_path(nix)
             .is_some_and(|message| message.contains("Nix")));
         assert!(preview_channel_rejection_for_exe_path(direct).is_none());
+    }
+
+    #[test]
+    fn fork_channel_refusal_only_fires_for_fork_builds() {
+        let refusal = fork_channel_refusal("fork").expect("fork channel must refuse self-update");
+        assert!(
+            refusal.starts_with("self-update is disabled"),
+            "refusal must keep the prefix main.rs prints verbatim: {refusal}"
+        );
+        assert!(
+            refusal.contains("docs/fork/README.md"),
+            "refusal: {refusal}"
+        );
+
+        assert!(fork_channel_refusal("stable").is_none());
+        assert!(fork_channel_refusal("preview").is_none());
+        assert!(fork_channel_refusal("").is_none());
+        assert!(fork_channel_refusal("forked").is_none());
+    }
+
+    #[test]
+    fn fork_channel_update_guidance_tracks_the_compiled_channel() {
+        assert_eq!(
+            fork_channel_update_guidance().is_some(),
+            crate::build_info::is_fork()
+        );
+    }
+
+    #[test]
+    fn fork_channel_check_skip_reason_names_the_fork_docs() {
+        assert!(FORK_UPDATE_CHECK_SKIP.contains("fork build"));
+        assert!(FORK_UPDATE_CHECK_SKIP.contains("docs/fork/README.md"));
     }
 
     #[test]

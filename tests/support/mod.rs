@@ -24,6 +24,26 @@ const CLIENT_MESSAGE_CLIENT_SHELL_PANE_INPUT: u32 = 13;
 const CLIENT_MESSAGE_CLIENT_SHELL_FOCUS: u32 = 18;
 const CLIENT_MESSAGE_ENDPOINT_CONTROL: u32 = 20;
 
+/// The version string the binary under test reports.
+///
+/// Mirrors `crate::build_info::version()`: this checkout compiles channel
+/// `fork` (`.cargo/config.toml` `[env]`), so `herdr --version` and every API
+/// `version` field read `<base>-fork`, not the bare `CARGO_PKG_VERSION`.
+pub fn build_version() -> String {
+    let base = env!("CARGO_PKG_VERSION");
+    match non_empty_build_env(option_env!("HERDR_BUILD_CHANNEL")) {
+        None | Some("stable") => base.to_string(),
+        Some(channel) => match non_empty_build_env(option_env!("HERDR_BUILD_ID")) {
+            Some(build_id) => format!("{base}-{channel}.{build_id}"),
+            None => format!("{base}-{channel}"),
+        },
+    }
+}
+
+fn non_empty_build_env(value: Option<&'static str>) -> Option<&'static str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;

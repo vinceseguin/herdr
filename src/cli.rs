@@ -198,9 +198,10 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
         path.display()
     );
 
-    match channel_set_install_action(
+    match channel_set_install_action(channel_set_guidance(
+        crate::update::fork_channel_update_guidance(),
         crate::update::package_manager_channel_update_guidance_for_current_install(),
-    ) {
+    )) {
         ChannelSetInstallAction::PrintGuidance(guidance) => {
             println!("{guidance}");
             return Ok(0);
@@ -242,6 +243,16 @@ fn channel_set_rejection(
 enum ChannelSetInstallAction {
     RunSelfUpdate,
     PrintGuidance(&'static str),
+}
+
+/// Fork builds never hand off to `self_update`: it would try to replace the
+/// fork binary from upstream's release manifest. Their guidance therefore wins
+/// over the package-manager guidance.
+fn channel_set_guidance(
+    fork_guidance: Option<&'static str>,
+    package_manager_guidance: Option<&'static str>,
+) -> Option<&'static str> {
+    fork_guidance.or(package_manager_guidance)
 }
 
 fn channel_set_install_action(
@@ -1082,6 +1093,44 @@ mod tests {
         assert_eq!(
             super::channel_set_install_action(None),
             super::ChannelSetInstallAction::RunSelfUpdate
+        );
+    }
+
+    #[test]
+    fn channel_set_prefers_fork_guidance_over_package_manager_guidance() {
+        assert_eq!(
+            super::channel_set_guidance(Some("fork guidance"), Some("use package manager")),
+            Some("fork guidance")
+        );
+        assert_eq!(
+            super::channel_set_guidance(Some("fork guidance"), None),
+            Some("fork guidance")
+        );
+        assert_eq!(
+            super::channel_set_guidance(None, Some("use package manager")),
+            Some("use package manager")
+        );
+        assert_eq!(super::channel_set_guidance(None, None), None);
+    }
+
+    #[test]
+    fn channel_set_never_self_updates_a_fork_build() {
+        assert_eq!(
+            super::channel_set_install_action(super::channel_set_guidance(
+                Some("fork guidance"),
+                None
+            )),
+            super::ChannelSetInstallAction::PrintGuidance("fork guidance")
+        );
+        // On a fork build the real call site can never reach `self_update`.
+        assert_eq!(
+            super::channel_set_install_action(super::channel_set_guidance(
+                crate::update::fork_channel_update_guidance(),
+                crate::update::package_manager_channel_update_guidance_for_current_install(),
+            )) == super::ChannelSetInstallAction::RunSelfUpdate,
+            !crate::build_info::is_fork()
+                && crate::update::package_manager_channel_update_guidance_for_current_install()
+                    .is_none()
         );
     }
 
