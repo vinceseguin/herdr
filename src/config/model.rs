@@ -320,6 +320,7 @@ pub struct Config {
     pub advanced: AdvancedConfig,
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
+    pub fleet: FleetConfig,
 }
 
 #[derive(Debug)]
@@ -973,6 +974,165 @@ impl Default for RemoteConfig {
             manage_ssh_config: true,
         }
     }
+}
+
+/// `[fleet]` — hosts aggregated by the fork's fleet runtime.
+///
+/// Field names are the user-facing contract: add fields, never rename them.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct FleetConfig {
+    /// Include this machine's default session as host "local". Default: true.
+    pub include_local: bool,
+    /// Additional hosts; see `[[fleet.hosts]]` in `herdr --default-config`.
+    pub hosts: Vec<FleetHostConfig>,
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        Self {
+            include_local: true,
+            hosts: Vec::new(),
+        }
+    }
+}
+
+/// One `[[fleet.hosts]]` entry.
+///
+/// Every field has a default so a malformed entry is reported as a
+/// diagnostic instead of failing the whole config parse, matching how the
+/// other sections behave.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct FleetHostConfig {
+    /// Display name and id prefix (`workbox/w1:p1`). Required.
+    pub name: String,
+    /// Transport used to reach the host. Default: "ssh".
+    pub kind: FleetHostKind,
+    /// ssh destination (alias, `user@host`, `ssh://host:2222`). Required for
+    /// `kind = "ssh"`.
+    pub target: Option<String>,
+    /// Named session on that host. Required for `kind = "local"`.
+    pub session: Option<String>,
+    /// Whether the fleet connects to this host. Default: true.
+    pub enabled: bool,
+}
+
+impl Default for FleetHostConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            kind: FleetHostKind::default(),
+            target: None,
+            session: None,
+            enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FleetHostKind {
+    #[default]
+    Ssh,
+    Local,
+}
+
+impl FleetConfig {
+    /// Validate `[fleet]` without touching the network or the filesystem.
+    ///
+    /// Every problem is reported; the caller decides whether to keep going
+    /// (the TUI shows the diagnostic banner) or to refuse (`herdr fleet`).
+    pub fn diagnostics(&self) -> Vec<String> {
+        let mut diagnostics = Vec::new();
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+
+        for (index, host) in self.hosts.iter().enumerate() {
+            let field = |key: &str| format!("fleet.hosts[{index}].{key}");
+
+            match validate_fleet_host_name(&host.name) {
+                Err(reason) => diagnostics.push(format!(
+                    "invalid fleet host name: {} = {:?}; {reason}; ignoring [fleet] hosts",
+                    field("name"),
+                    host.name
+                )),
+                Ok(()) => {
+                    if self.include_local && host.name == FLEET_LOCAL_HOST_NAME {
+                        diagnostics.push(format!(
+                            "reserved fleet host name: {} = {:?} names this machine's default session; set fleet.include_local = false or rename the host; ignoring [fleet] hosts",
+                            field("name"),
+                            host.name
+                        ));
+                    }
+                    if !seen.insert(host.name.as_str()) {
+                        diagnostics.push(format!(
+                            "duplicate fleet host name: {} = {:?}; host names must be unique; ignoring [fleet] hosts",
+                            field("name"),
+                            host.name
+                        ));
+                    }
+                }
+            }
+
+            match host.kind {
+                FleetHostKind::Ssh => match host.target.as_deref() {
+                    None => diagnostics.push(format!(
+                        "missing fleet host target: {} is required for kind = \"ssh\"; ignoring [fleet] hosts",
+                        field("target")
+                    )),
+                    Some(target) => {
+                        if let Err(reason) = validate_fleet_host_target(target) {
+                            diagnostics.push(format!(
+                                "invalid fleet host target: {} = {target:?}; {reason}; ignoring [fleet] hosts",
+                                field("target")
+                            ));
+                        }
+                    }
+                },
+                FleetHostKind::Local => {
+                    if host.session.is_none() {
+                        diagnostics.push(format!(
+                            "missing fleet host session: {} is required for kind = \"local\"; ignoring [fleet] hosts",
+                            field("session")
+                        ));
+                    }
+                }
+            }
+
+            if let Some(session) = host.session.as_deref() {
+                if let Err(reason) = crate::session::validate_name(session) {
+                    diagnostics.push(format!(
+                        "invalid fleet host session: {} = {session:?}; {reason}; ignoring [fleet] hosts",
+                        field("session")
+                    ));
+                }
+            }
+        }
+
+        diagnostics
+    }
+}
+
+/// Reserved id of this machine's default session.
+pub const FLEET_LOCAL_HOST_NAME: &str = "local";
+
+/// Fleet host names follow session-name rules so they can be used verbatim as
+/// the `host/` prefix of a fleet id; `session::validate_name` stays the single
+/// source of truth for the character class.
+pub(crate) fn validate_fleet_host_name(name: &str) -> Result<(), String> {
+    crate::session::validate_name(name).map_err(|err| err.replacen("session name", "host name", 1))
+}
+
+/// Same rule `--remote` applies to its target, so a target can never be read
+/// as an ssh flag.
+pub(crate) fn validate_fleet_host_target(target: &str) -> Result<(), String> {
+    if target.is_empty() {
+        return Err("ssh target cannot be empty".to_string());
+    }
+    if target.starts_with('-') {
+        return Err("ssh target must not start with '-'".to_string());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, Deserialize)]

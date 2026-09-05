@@ -22,6 +22,7 @@ mod config;
 mod copy_mode;
 mod detect;
 mod events;
+mod fleet;
 mod ghostty;
 mod handoff_runtime;
 mod input;
@@ -399,6 +400,18 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Set false to run plain ssh against your ssh config unchanged — this does not
 # force keepalive or multiplexing off, it only stops herdr from adding its own.
 # manage_ssh_config = true
+
+[fleet]
+# Hosts aggregated by `herdr fleet status` and the fork's fleet console.
+# This machine's default session is always host "local" unless disabled.
+# include_local = true
+#
+# [[fleet.hosts]]
+# name = "workbox"        # display name and id prefix (workbox/w1:p1)
+# kind = "ssh"            # "ssh" | "local"
+# target = "workbox"      # ssh destination (alias, user@host, ssh://host:2222)
+# session = "agents"      # optional named session on that host; required for kind = "local"
+# enabled = true
 
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.
@@ -843,5 +856,94 @@ mod tests {
             args_as_utf8(args).unwrap_err(),
             "argument 2 is not valid UTF-8"
         );
+    }
+
+    /// Extract the `[fleet]` section of `DEFAULT_CONFIG` and uncomment the
+    /// TOML lines in it, leaving the prose comments alone. Scoped to the
+    /// fleet block so upstream edits to other sections cannot break it.
+    fn uncommented_default_fleet_block() -> String {
+        let start = DEFAULT_CONFIG
+            .find("\n[fleet]\n")
+            .expect("DEFAULT_CONFIG has a [fleet] section")
+            + 1;
+        let rest = &DEFAULT_CONFIG[start..];
+        let end = rest[1..]
+            .find("\n[")
+            .map(|offset| offset + 2)
+            .unwrap_or(rest.len());
+        let block = &rest[..end];
+
+        block
+            .lines()
+            .map(|line| {
+                let body = line.strip_prefix("# ").unwrap_or(line);
+                let is_toml = body.starts_with("[[fleet.hosts]]")
+                    || [
+                        "include_local",
+                        "name",
+                        "kind",
+                        "target",
+                        "session",
+                        "enabled",
+                    ]
+                    .iter()
+                    .any(|key| body.starts_with(&format!("{key} = ")));
+                if is_toml {
+                    body
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn default_config_fleet_block_parses_without_diagnostics() {
+        let block = uncommented_default_fleet_block();
+        assert!(
+            block.contains("\ninclude_local = true"),
+            "sample keys should be uncommented:\n{block}"
+        );
+
+        let config: config::Config = toml::from_str(&block).expect("fleet sample is valid TOML");
+        assert!(config.fleet.include_local);
+        assert_eq!(config.fleet.hosts.len(), 1);
+        let host = &config.fleet.hosts[0];
+        assert_eq!(host.name, "workbox");
+        assert_eq!(host.kind, config::FleetHostKind::Ssh);
+        assert_eq!(host.target.as_deref(), Some("workbox"));
+        assert_eq!(host.session.as_deref(), Some("agents"));
+        assert!(host.enabled);
+        assert!(
+            config.fleet.diagnostics().is_empty(),
+            "{:?}",
+            config.fleet.diagnostics()
+        );
+        assert_eq!(
+            fleet::hosts::resolve_hosts(&config.fleet)
+                .expect("sample resolves")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn default_config_fleet_block_is_commented_out() {
+        let start = DEFAULT_CONFIG
+            .find("\n[fleet]\n")
+            .expect("DEFAULT_CONFIG has a [fleet] section")
+            + 1;
+        let rest = &DEFAULT_CONFIG[start..];
+        let end = rest[1..]
+            .find("\n[")
+            .map(|offset| offset + 2)
+            .unwrap_or(rest.len());
+        for line in rest[..end].lines().skip(1) {
+            assert!(
+                line.is_empty() || line.starts_with('#'),
+                "the [fleet] sample must stay commented out: {line}"
+            );
+        }
     }
 }

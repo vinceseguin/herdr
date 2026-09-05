@@ -30,7 +30,10 @@ ROOT_STRUCT = "Config"
 
 # Dotted key prefixes that are open-ended (user-defined tables/arrays) and
 # therefore not enumerable in a flat reference table.
-SKIPPED_SUBTREES = ("keys.command",)
+# `[fleet]` is fork-owned (it holds the open-ended `[[fleet.hosts]]` array of
+# tables) and is documented in prose under docs/fork/, not in the upstream
+# website config reference.
+SKIPPED_SUBTREES = ("keys.command", "fleet")
 
 FIELD_RE = re.compile(r"^\s*pub ([a-z_][a-z0-9_]*):\s*(.+?),?\s*$")
 STRUCT_RE = re.compile(r"^\s*pub(?:\(crate\))? struct ([A-Za-z0-9_]+)\s*\{\s*$")
