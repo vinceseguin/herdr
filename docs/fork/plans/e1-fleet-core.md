@@ -304,7 +304,7 @@ integration test that boots two named sessions and asserts the merged status.
 | # | Title | Group | Depends on | Status |
 | --- | --- | --- | --- | --- |
 | 1 | feat: add fleet config section and host specs | A · Foundations | — | ✅ |
-| 2 | feat: pure fleet state merges host snapshots and renders a status report | A · Foundations | 1 | ⬜ |
+| 2 | feat: pure fleet state merges host snapshots and renders a status report | A · Foundations | 1 | ✅ |
 | 3 | refactor: expose ssh stdio bridge and remote discovery for reuse | B · Transport | 4 | ⬜ |
 | 4 | feat: ssh lab script runs a user-space sshd against the fleet lab | B · Transport | — | ✅ |
 | 5 | feat: fleet connector streams local hosts and herdr fleet status reports them | C · Connector and CLI | 2 | ⬜ |
@@ -754,6 +754,45 @@ fixture-driven report test. (PR 5 proves the state against live hosts.)
   checks before enabling an action.
 - `Backoff` is reused by PR 5's connector; do not duplicate.
 
+**As built (merged)**
+
+Shipped as `src/fleet/refs.rs`, `src/fleet/state.rs`, `src/fleet/report.rs`
+plus the module wiring and the architecture guard in `src/fleet/mod.rs`. The
+three modules carry `#[allow(dead_code)]` for the same reason PR 1's `hosts`
+does; **PR 5 removes all four** as it becomes the first production consumer.
+Deviations from the shapes above, all deliberate:
+
+- `FleetChange::AgentAdded { agent: Box<MergedAgent> }` — boxed for
+  `clippy::large_enum_variant` (`-D warnings`). The JSON is unchanged.
+- `HostReport.kind` is `String`, not `&'static str`: the report has to
+  `Deserialize`, and a reader must tolerate a transport name it does not know.
+- A **disabled** host starts `Unavailable { reason: "host disabled in
+  [fleet]" }` instead of `Connecting { attempt: 0 }` — the connector never
+  opens it, so "connecting" forever would be a lie. Enabled hosts start
+  `Connecting { attempt: 0 }` as specified.
+- `FleetChange::HostConnection` serializes its connection **as
+  `ConnectionReport`**, so one JSON vocabulary describes a connection
+  everywhere. The advertised `methods` list is therefore not carried in the
+  delta: a `HostConnection` rebuilt from JSON advertises nothing and every
+  method-gated action fails closed. Read `methods` from `FleetState::host` or
+  the report, never from the delta stream.
+- Contribution is gated on `Connected` **and** a snapshot, not only on
+  `Unavailable`/`Incompatible`: any transition out of `Connected` (including
+  back to `Connecting`) emits `AgentRemoved` for that host's agents and zeroes
+  its roll-up, and re-entering `Connected` re-emits `AgentAdded` keeping each
+  agent's existing `fleet_change_seq` so a blip does not reshuffle the list.
+- Snapshot ingestion drops any agent whose `pane_id`/`workspace_id`/`tab_id`
+  is empty or contains `/` (`refs::is_valid_resource_id`): such an id would
+  render a reference that parses back into a *different host*. Report
+  workspaces are filtered the same way.
+- Extras PR 5/6 may rely on: `HostConnection::{is_connected, state_name,
+  reason}`, `HostState::{id, contributes_agents}`, `AgentRollup::total`,
+  `Backoff::peek`, `FleetPaneRef::{new, host, id}` (and the tab/workspace
+  equivalents), `report::FLEET_STATUS_SCHEMA`,
+  `ConnectionReport::{state_name, reason, server_version, into_connection}`.
+- `FleetChange` is `Serialize` **and** `Deserialize`; `FleetStatusReport`
+  round-trips through JSON (a test asserts it).
+
 ### PR 3 — refactor: expose ssh stdio bridge and remote discovery for reuse · deps: 4
 
 **Goal:** the SSH stdio bridge and remote-herdr discovery in
@@ -1057,9 +1096,18 @@ proves it against real servers. SSH hosts are reported `Unavailable { reason:
   `HostCommand`, `HostSendError`, per-host supervisor/reader threads.
 - `src/fleet/endpoint_lane.rs` (new): per-host request/response reassembly.
 - `src/fleet/oneshot.rs` (new): `collect_status` / `watch`.
-- `src/fleet/mod.rs`: add the modules, and **drop the
-  `#[allow(dead_code)]` PR 1 put on `pub mod hosts;`** — the connector is
-  its first production consumer.
+- `src/fleet/mod.rs`: add the modules, and **drop the four
+  `#[allow(dead_code)]` attributes PRs 1 and 2 put on `hosts`, `refs`,
+  `report` and `state`** — the connector is their first production consumer.
+  Consume PR 2 as built: `FleetChange::AgentAdded` carries a
+  `Box<MergedAgent>`; `FleetChange::HostConnection`'s JSON does not carry the
+  advertised `methods` (read them from `FleetState::host`); a disabled host is
+  already `Unavailable { reason: "host disabled in [fleet]" }` at
+  `FleetState::new`, so the connector must not open it or emit events for it;
+  any transition out of `Connected` (including back to `Connecting`) already
+  retires that host's agents, so the connector only reports transport facts
+  and never edits the merged list itself. Reuse `state::Backoff` (1 s → 30 s,
+  `next`/`peek`/`reset`) rather than a second schedule.
 - `src/cli/fleet.rs` (new); `src/cli.rs` *(upstream — one `mod fleet;` and one
   match arm)*; `src/cli/spec.rs` *(upstream — `fleet_command()` +
   `.subcommand(fleet_command())`)*; `src/main.rs` *(upstream — one usage line
