@@ -228,9 +228,15 @@ mod tests {
     fn host_id_errors_talk_about_hosts_not_sessions() {
         let err = HostId::new("").expect_err("empty host name is invalid");
         assert_eq!(err, "host name cannot be empty");
-        let err = HostId::new("a/b").expect_err("slash is invalid");
-        assert!(err.contains("host name"), "{err}");
-        assert!(!err.contains("session name"), "{err}");
+
+        // Every `session::validate_name` message must be reworded, so this
+        // covers all four of them: upstream changing one of those strings has
+        // to show up here rather than leaking "session name" to a fleet user.
+        for name in ["", "a/b", "..", &"a".repeat(65)] {
+            let err = HostId::new(name).expect_err("invalid host name");
+            assert!(err.starts_with("host name"), "{name:?}: {err}");
+            assert!(!err.contains("session"), "{name:?}: {err}");
+        }
     }
 
     #[test]
@@ -246,8 +252,11 @@ mod tests {
             id
         );
         assert!(serde_json::from_str::<HostId>("\"work/box\"").is_err());
+        assert!(serde_json::from_str::<HostId>("\"\"").is_err());
         assert!(HostId::local().is_local());
+        assert_eq!(HostId::local(), HostId::new(HostId::LOCAL).expect("valid"));
         assert_eq!(HostId::LOCAL, "local");
+        assert!(!HostId::LOCAL.contains('/'));
     }
 
     #[test]

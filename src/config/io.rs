@@ -350,8 +350,17 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         &mut invalid_sections,
         |section| config.remote = section,
     );
+    load_live_section(
+        table,
+        "fleet",
+        "fleet config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.fleet = section,
+    );
 
     diagnostics.extend(config.theme.diagnostics());
+    diagnostics.extend(config.fleet.diagnostics());
 
     Ok(LoadedConfig {
         config,
@@ -1108,5 +1117,104 @@ mouse_capture = false
         let (updated, removed) = remove_keybinding_config_sections(content);
         assert!(!removed);
         assert_eq!(updated, content);
+    }
+
+    #[test]
+    fn live_config_loads_the_fleet_section_and_reports_its_diagnostics() {
+        let loaded = load_live_config_from_str(
+            r#"
+[fleet]
+include_local = false
+
+[[fleet.hosts]]
+name = "workbox"
+target = "workbox"
+"#,
+        )
+        .expect("live config parses");
+
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert!(!loaded.config.fleet.include_local);
+        assert_eq!(loaded.config.fleet.hosts.len(), 1);
+
+        let loaded = load_live_config_from_str(
+            "[[fleet.hosts]]\nname = \"local\"\nkind = \"local\"\nsession = \"agents\"\nhots = 1\n",
+        )
+        .expect("live config parses");
+
+        assert_eq!(
+            loaded.diagnostics,
+            vec![
+                "unknown config key fleet.hosts.0.hots; ignoring key".to_string(),
+                "reserved fleet host name: fleet.hosts[0].name = \"local\" names this machine's \
+                 default session; set fleet.include_local = false or rename the host; ignoring \
+                 [fleet] hosts"
+                    .to_string(),
+            ]
+        );
+        assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn live_config_keeps_an_invalid_fleet_section_local_to_fleet() {
+        let loaded = load_live_config_from_str(
+            "[fleet]\ninclude_local = \"yes\"\n\n[ui]\nmouse_capture = false\n",
+        )
+        .expect("live config parses");
+
+        assert_eq!(loaded.diagnostics.len(), 1, "{:?}", loaded.diagnostics);
+        assert!(loaded.diagnostics[0].contains("invalid fleet config"));
+        assert_eq!(loaded.invalid_sections, vec!["fleet"]);
+        assert!(loaded.config.fleet.include_local, "fleet stays at defaults");
+        assert!(
+            !loaded.config.ui.mouse_capture,
+            "other sections still apply"
+        );
+    }
+
+    #[test]
+    fn startup_config_knows_the_fleet_section_and_reports_keys_inside_it() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-config-fleet-section-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+[fleet]
+include_local = true
+includ_local = false
+
+[[fleet.hosts]]
+name = "workbox"
+target = "workbox"
+sesion = "agents"
+
+[[fleet.hosts]]
+name = "workbox"
+target = "other"
+"#,
+        )
+        .unwrap();
+        std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+
+        let loaded = Config::load();
+
+        std::env::remove_var(CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(
+            loaded.diagnostics,
+            vec![
+                "unknown config key fleet.hosts.0.sesion; ignoring key".to_string(),
+                "unknown config key fleet.includ_local; ignoring key".to_string(),
+                "duplicate fleet host name: fleet.hosts[1].name = \"workbox\"; host names must be \
+                 unique; ignoring [fleet] hosts"
+                    .to_string(),
+            ],
+            "[fleet] must be a known section whose inner keys are still checked"
+        );
+        assert_eq!(loaded.config.fleet.hosts.len(), 2);
     }
 }

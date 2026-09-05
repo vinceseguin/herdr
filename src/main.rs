@@ -858,10 +858,10 @@ mod tests {
         );
     }
 
-    /// Extract the `[fleet]` section of `DEFAULT_CONFIG` and uncomment the
-    /// TOML lines in it, leaving the prose comments alone. Scoped to the
-    /// fleet block so upstream edits to other sections cannot break it.
-    fn uncommented_default_fleet_block() -> String {
+    /// The `[fleet]` section of `DEFAULT_CONFIG`, header line included.
+    /// Scoped to that block so upstream edits to other sections cannot break
+    /// the tests below.
+    fn default_config_fleet_block() -> &'static str {
         let start = DEFAULT_CONFIG
             .find("\n[fleet]\n")
             .expect("DEFAULT_CONFIG has a [fleet] section")
@@ -871,23 +871,25 @@ mod tests {
             .find("\n[")
             .map(|offset| offset + 2)
             .unwrap_or(rest.len());
-        let block = &rest[..end];
+        &rest[..end]
+    }
 
-        block
+    /// Uncomment the sample TOML lines of the `[fleet]` block, leaving the
+    /// prose comments alone. A line counts as TOML when it is a table header
+    /// or a `key = value` assignment, so a key added to the sample later is
+    /// uncommented too instead of being silently skipped.
+    fn uncommented_default_fleet_block() -> String {
+        default_config_fleet_block()
             .lines()
             .map(|line| {
                 let body = line.strip_prefix("# ").unwrap_or(line);
-                let is_toml = body.starts_with("[[fleet.hosts]]")
-                    || [
-                        "include_local",
-                        "name",
-                        "kind",
-                        "target",
-                        "session",
-                        "enabled",
-                    ]
-                    .iter()
-                    .any(|key| body.starts_with(&format!("{key} = ")));
+                let key = body.split(" = ").next().unwrap_or_default();
+                let is_toml = body.starts_with("[[fleet.")
+                    || (!key.is_empty()
+                        && key.len() < body.len()
+                        && key
+                            .bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte == b'_'));
                 if is_toml {
                     body
                 } else {
@@ -930,16 +932,9 @@ mod tests {
 
     #[test]
     fn default_config_fleet_block_is_commented_out() {
-        let start = DEFAULT_CONFIG
-            .find("\n[fleet]\n")
-            .expect("DEFAULT_CONFIG has a [fleet] section")
-            + 1;
-        let rest = &DEFAULT_CONFIG[start..];
-        let end = rest[1..]
-            .find("\n[")
-            .map(|offset| offset + 2)
-            .unwrap_or(rest.len());
-        for line in rest[..end].lines().skip(1) {
+        let block = default_config_fleet_block();
+        assert!(block.starts_with("[fleet]\n"), "{block}");
+        for line in block.lines().skip(1) {
             assert!(
                 line.is_empty() || line.starts_with('#'),
                 "the [fleet] sample must stay commented out: {line}"
