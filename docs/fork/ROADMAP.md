@@ -264,7 +264,9 @@ separated from runtime" principle and is testable without sockets.
     (`Connecting | Connected { server_version } | Unavailable { reason } |
     Incompatible { generation }`), per-host latest `ClientShellSnapshot` with
     `boot_id`/`revision`, `active_host`, merged agent list ordered
-    blocked → working → done → idle → unknown then by `state_change_seq`,
+    blocked → working → done → idle → unknown then by fleet-wide recency
+    (a `FleetState`-owned `fleet_change_seq`; `state_change_seq` is per server
+    boot and not comparable across hosts),
     per-host roll-ups (counts by status). Host-qualified ids through a typed
     `FleetPaneRef { host: HostId, pane_id: String }` (and tab/workspace
     equivalents) with a stable string form `host/w1:p1` for CLI/JSON.
@@ -280,9 +282,11 @@ separated from runtime" principle and is testable without sockets.
   - Snapshot ingestion: replace a host's snapshot on new `boot_id`/`revision`;
     forward pane surface frames only for the active host (inactive hosts must
     not cost render work — multiplicative-perf rule).
-- CLI: `herdr fleet status [--json]` — hosts, connection state, server version,
-  agent counts by status, and the merged agent list. First user-visible
-  deliverable and the shape the gateway later serves.
+- CLI: `herdr fleet status [--json] [--timeout-ms <n>] [--watch]` — hosts,
+  connection state, server version, agent counts by status, and the merged
+  agent list; `--watch` streams one change per line. First user-visible
+  deliverable and the shape the gateway later serves. Documented in
+  `docs/fork/fleet-core.md`.
 - Tests: pure-state unit tests (merge ordering, id round-trips, reconnect state
   machine, unknown-status fallback); an integration test under `tests/` that
   boots two named sessions with the `tests/support` harness and asserts

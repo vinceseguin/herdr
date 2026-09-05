@@ -240,6 +240,141 @@ base64-encoded `bytes`, not raw ANSI.)
 `tests/fork_fleet_lab.rs` exercises the whole lifecycle inside `just ci`, so
 the script is covered by the gate.
 
+## SSH lab
+
+`scripts/fork/ssh-lab.sh` turns the fleet lab into an **SSH-reachable host**, so
+the fork's ssh transport (and `herdr --remote`) can be exercised end to end on
+one machine. It starts a **user-space** sshd on `127.0.0.1:2299` — no root, no
+system service, and no contact with your `~/.ssh`, `~/.config` or installed
+herdr.
+
+```bash
+bash scripts/fork/fleet-lab.sh up 2         # the ssh lab layers on the fleet lab
+bash scripts/fork/ssh-lab.sh up             # start the sshd; prints the status
+bash scripts/fork/ssh-lab.sh status --json
+eval "$(bash scripts/fork/ssh-lab.sh env)"
+bash scripts/fork/ssh-lab.sh down           # stop the sshd, delete <lab root>/ssh
+```
+
+It lives in `$HERDR_FLEET_LAB_ROOT/ssh` and refuses to run without the fleet
+lab's `.herdr-fleet-lab` marker next to it. `status --json` is the
+machine-readable contract (fields are added, never renamed):
+
+```json
+{"root": "/tmp/herdr-fleet-lab/ssh", "port": 2299, "running": true, "pid": 1615485,
+ "target": "herdr-ssh-lab", "home": "/tmp/herdr-fleet-lab/ssh/home",
+ "ssh_config": "/tmp/herdr-fleet-lab/ssh/home/.ssh/config"}
+```
+
+`env` prints exactly five exports:
+
+```console
+$ bash scripts/fork/ssh-lab.sh env
+export HERDR_SSH_LAB_ROOT="/tmp/herdr-fleet-lab/ssh"
+export HERDR_SSH_LAB_HOME="/tmp/herdr-fleet-lab/ssh/home"
+export HERDR_SSH_LAB_TARGET="herdr-ssh-lab"
+export HERDR_SSH_LAB_PORT="2299"
+export HERDR_SSH_LAB_SSH_CONFIG="/tmp/herdr-fleet-lab/ssh/home/.ssh/config"
+```
+
+It deliberately does **not** export `HOME`. Instead, **run the herdr client with
+`HOME=$HERDR_SSH_LAB_HOME`**: herdr's managed ssh config
+(`[remote].manage_ssh_config`) `Include`s `$HOME/.ssh/config`, so that one
+variable is what makes the alias `herdr-ssh-lab` resolvable without herdr ever
+reading your real `~/.ssh`.
+
+```console
+$ ssh -F "$HERDR_SSH_LAB_SSH_CONFIG" -o BatchMode=yes herdr-ssh-lab \
+    'echo $HOME; command -v herdr; herdr --session lab-1 status server --json'
+/tmp/herdr-fleet-lab/ssh/home
+/tmp/herdr-fleet-lab/ssh/home/.local/bin/herdr
+{"status":"running","running":true,"version":"0.8.2-fork","protocol":22,…,"session":"lab-1",…}
+```
+
+A fleet host pointing at it is then just:
+
+```toml
+[[fleet.hosts]]
+name = "lab-ssh"
+kind = "ssh"
+target = "herdr-ssh-lab"
+session = "lab-1"
+```
+
+Isolation, by construction: everything lives under `<lab root>/ssh` behind its
+own `.herdr-ssh-lab` marker; the sshd listens only on loopback, accepts only the
+invoking user with a throwaway key under the lab, forwards nothing, and is told
+not to run `~/.ssh/rc` or read `~/.ssh/authorized_keys`/`~/.ssh/environment`;
+the remote side runs a wrapper that `exec`s the **fleet lab's own** herdr binary
+(the one in the fleet lab marker's `bin=`) under the lab's `XDG_*` dirs, so
+`ssh herdr-ssh-lab herdr …` can only reach lab sessions. `down` signals only the
+pid this lab's pid file holds — after re-checking its argv and, on Linux, its
+executable — then the per-connection children that listener still had, and
+deletes only the marked `ssh` directory.
+
+Knobs:
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `HERDR_FLEET_LAB_ROOT` | `/tmp/herdr-fleet-lab` | the ssh lab is `<root>/ssh` |
+| `HERDR_SSH_LAB_PORT` | `2299` | unprivileged loopback port; `up` refuses a port already bound |
+| `HERDR_FLEET_LAB_TIMEOUT_MS` | `15000` | per-step timeout |
+| `HERDR_SSH_LAB_SSHD` | `/usr/sbin/sshd`, `/usr/bin/sshd`, then `sshd` on `PATH` | absolute path; a bad override is a hard error (exit 1), never "sshd not found" |
+
+Exit codes: `0` ok, `1` error, `2` usage, **`3` `sshd not found`**. Exit 3 is the
+one that means "this machine cannot run the ssh lab" — CI and validation scripts
+treat it as a skip and fall back to `kind = "local"` hosts, so a typo in
+`HERDR_SSH_LAB_SSHD` must never produce it.
+
+Two ordering rules:
+
+- **`ssh-lab.sh down` before `fleet-lab.sh down`.** The fleet lab's `down`
+  deletes the whole root, including `<root>/ssh` and the sshd pid file, after
+  which the sshd can no longer be identified.
+- `ssh-lab.sh down` also sweeps the listener's per-connection processes, so the
+  `ControlMaster`/`ControlPersist` master herdr opens does not keep the lab
+  alive. You never need `ssh -O exit` by hand.
+
+`tests/fork_ssh_lab.rs` exercises the lifecycle inside `just ci`, asserting one
+of two explicit outcomes: the lab works end to end, or `up` exits 3 with
+`sshd not found`.
+
+## Fleet core
+
+`herdr fleet status` merges the herdr servers listed in the `[fleet]` section of
+`config.toml` into one host-qualified view — this machine's default session,
+other named sessions on it, and machines reached over SSH.
+
+```toml
+[fleet]
+include_local = true
+
+[[fleet.hosts]]
+name = "workbox"
+kind = "ssh"          # "ssh" | "local"
+target = "workbox"    # ssh destination; required for kind = "ssh"
+session = "agents"    # named session on that host; required for kind = "local"
+```
+
+```console
+$ herdr fleet status
+client 0.8.2-fork  active host: none
+
+HOST     KIND   STATE        VERSION     BLOCKED  WORKING  DONE  IDLE  UNKNOWN
+local    local  unavailable  -           0        0        0     0     0
+lab-ssh  ssh    connected    0.8.2-fork  0        0        0     0     0
+lab-2    local  connected    0.8.2-fork  0        0        0     0     0
+  ! local: no herdr server for session default at /tmp/herdr-fleet-lab/xdg/herdr-dev/herdr-client.sock
+
+no agents
+```
+
+`--json` prints the `herdr.fleet.status.v1` report the gateway will serve, and
+`--watch` streams one `FleetChange` per line. Full reference — every `[fleet]`
+key, the `host/w1:p1` id form, connection states and reasons, ssh host setup and
+reconnect behaviour, and the `src/fleet/` module map for E2/E3 — is in
+[`fleet-core.md`](./fleet-core.md).
+
 ## Continuous integration
 
 Fork CI is [`.github/workflows/fork-ci.yml`](../../.github/workflows/fork-ci.yml)
@@ -281,15 +416,27 @@ git push -u origin HEAD && gh pr create -R vinceseguin/herdr --base master --fil
 After every sync, re-run `gh workflow list --all -R vinceseguin/herdr` and
 `gh workflow disable <file>` any **new** upstream workflow the merge added.
 
-Fork-owned paths (`docs/fork/`, `.claude/`, `scripts/fork/`, `src/fleet/`,
-`src/gateway/`, `web/`, `.github/workflows/fork-*.yml`, `tests/fork_*.rs`) never
-conflict. The upstream files that currently carry fork wiring, and may:
-`.cargo/config.toml` (the `[env]` channel), `src/build_info.rs`,
-`src/update.rs`, `src/cli.rs`, `src/main.rs`, `src/release_notes.rs`,
-`src/app/mod.rs` (tests only), `tests/support/mod.rs`, `tests/api_ping.rs`,
-`tests/cli/sessions.rs`, `.gitignore`, and the fork section at the tail of
-`AGENTS.md`. Later epics add `src/main.rs` / `src/cli.rs` subcommand wiring and
-a `src/config/model.rs` field.
+Fork-owned paths never conflict — whole directories (`docs/fork/`, `.claude/`,
+`scripts/fork/`, including `fleet-lab.sh`, `ssh-lab.sh`, `gate.sh` and
+`dev-setup.sh`; `src/fleet/`, and `src/gateway/` and `web/` once later epics
+create them) plus fork-only files that live inside upstream directories:
+`src/cli/fleet.rs`, `.github/workflows/fork-*.yml`, every `tests/fork_*.rs`
+(today `tests/fork_channel.rs`, `tests/fork_fleet_lab.rs`,
+`tests/fork_ssh_lab.rs`), `tests/support/fleet_lab.rs` and `tests/cli/fleet.rs`.
+
+The upstream files that currently carry fork wiring, and may conflict:
+
+| File | Fork wiring |
+| --- | --- |
+| `.cargo/config.toml` | the `[env]` build channel |
+| `src/build_info.rs`, `src/update.rs`, `src/release_notes.rs` | fork build identity, self-update disabled |
+| `src/main.rs` | `mod fleet;`, the `[fleet]` block of `DEFAULT_CONFIG`, one `--help` usage line, `"fleet"` in the bare-command list |
+| `src/cli.rs`, `src/cli/spec.rs` | one `mod fleet;` + match arm, and `fleet_command()` |
+| `src/config/model.rs`, `src/config/io.rs`, `src/config.rs` | the `[fleet]` section, its `KNOWN_TOP_LEVEL_CONFIG_KEYS`/live-reload entry, and its diagnostics |
+| `src/remote/attach.rs` | `pub(crate)` visibility on the ssh stdio bridge and remote discovery, plus `start_with`/`local_forward_socket_path_scoped`/`BridgeErrorSink` (E1 PR 3) |
+| `scripts/config_reference_check.py` | one `SKIPPED_SUBTREES` entry for `fleet` |
+| `src/app/mod.rs` (tests only), `tests/support/mod.rs`, `tests/api_ping.rs`, `tests/cli/sessions.rs`, `tests/cli/mod.rs` | fork test wiring |
+| `.gitignore`, the fork section at the tail of `AGENTS.md` | fork layout and rules |
 
 `src/protocol/wire.rs`, `src/protocol/endpoint.rs` and
 `tests/fixtures/endpoint-*.json` are never touched by the fork; take upstream's
