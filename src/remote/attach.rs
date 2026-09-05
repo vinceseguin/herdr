@@ -3362,4 +3362,336 @@ mod tests {
 
         assert!(!dir.exists());
     }
+
+    // --- Characterization tests for the E1 PR 3 SSH transport refactor ---
+    //
+    // These pin `herdr --remote`'s observable SSH behaviour (bridge command
+    // string, forward socket names, discovery vs. `HERDR_REMOTE_BINARY`
+    // ordering, and a real byte round-trip through the stdio bridge) so the
+    // reuse refactor cannot change it.
+
+    #[test]
+    fn remote_bridge_command_appends_named_session() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        assert_eq!(
+            remote_bridge_command(&remote_herdr, "lab-1"),
+            "exec \"$HOME/.local/bin/herdr\" --session lab-1 remote-client-bridge"
+        );
+    }
+
+    #[test]
+    fn remote_bridge_command_quotes_unusual_session_and_binary() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        })
+        .with_shell_path("'/opt/h e/herdr'".to_string());
+        assert_eq!(
+            remote_bridge_command(&remote_herdr, "a b"),
+            "exec '/opt/h e/herdr' --session 'a b' remote-client-bridge"
+        );
+    }
+
+    #[cfg(unix)]
+    fn with_tmpdir<R>(dir: &Path, body: impl FnOnce() -> R) -> R {
+        let prior = std::env::var_os("TMPDIR");
+        std::env::set_var("TMPDIR", dir);
+        let result = body();
+        match prior {
+            Some(value) => std::env::set_var("TMPDIR", value),
+            None => std::env::remove_var("TMPDIR"),
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_forward_socket_path_names_match_pre_refactor_goldens() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let pid = std::process::id();
+        // Golden strings captured from `master` before the refactor; the
+        // readable form is used when TMPDIR is short, the hashed short form
+        // when it is not.
+        let cases = [
+            (
+                "user@example.com",
+                "work",
+                format!("herdr-remote-{pid}-user-example.com-work.sock"),
+                format!("herdr-r-{pid}-user-exa-6bd0228ee4bfbc7e.sock"),
+            ),
+            (
+                "dev",
+                "default",
+                format!("herdr-remote-{pid}-dev-default.sock"),
+                format!("herdr-r-{pid}-dev-eda958cb6a858d62.sock"),
+            ),
+            (
+                "herdr-ssh-lab",
+                "lab-1",
+                format!("herdr-remote-{pid}-herdr-ssh-lab-lab-1.sock"),
+                format!("herdr-r-{pid}-herdr-ss-92acab754136d732.sock"),
+            ),
+            (
+                "longish-host.example.com",
+                "a-fairly-long-session-name-here",
+                format!(
+                    "herdr-remote-{pid}-longish-host.example.com-a-fairly-long-session-name-here.sock"
+                ),
+                format!("herdr-r-{pid}-longish--cca164f07943a811.sock"),
+            ),
+        ];
+
+        let long_dir = std::env::temp_dir().join("b".repeat(80));
+        let _ = fs::create_dir_all(&long_dir);
+        let observed: Vec<(PathBuf, PathBuf)> = cases
+            .iter()
+            .map(|(target, session, _, _)| {
+                (
+                    with_tmpdir(Path::new("/tmp"), || {
+                        local_forward_socket_path(target, session)
+                    }),
+                    with_tmpdir(&long_dir, || local_forward_socket_path(target, session)),
+                )
+            })
+            .collect();
+        let _ = fs::remove_dir_all(&long_dir);
+
+        for ((target, session, readable, short), (readable_path, short_path)) in
+            cases.iter().zip(observed.iter())
+        {
+            assert_eq!(
+                readable_path,
+                &PathBuf::from(format!("/tmp/{readable}")),
+                "readable socket name for {target}/{session}"
+            );
+            assert_eq!(
+                short_path,
+                &PathBuf::from(format!("/tmp/{short}")),
+                "hashed socket name for {target}/{session}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    struct FakeSsh {
+        dir: PathBuf,
+        trace: PathBuf,
+        prior_path: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl FakeSsh {
+        /// Write an `ssh` shim into a private directory and prepend it to
+        /// `PATH`. Callers must hold `remote_env_lock()`.
+        fn install(name: &str, body: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let dir =
+                std::env::temp_dir().join(format!("herdr-fake-ssh-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("create fake ssh dir");
+            let trace = dir.join("argv.log");
+            let script = body.replace("__TRACE__", &trace.display().to_string());
+            let ssh = dir.join("ssh");
+            fs::write(&ssh, script).expect("write fake ssh");
+            fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).expect("chmod fake ssh");
+
+            let prior_path = std::env::var_os("PATH");
+            let joined = match &prior_path {
+                Some(value) => {
+                    let mut entries = vec![dir.clone()];
+                    entries.extend(std::env::split_paths(value));
+                    std::env::join_paths(entries).expect("join PATH")
+                }
+                None => dir.clone().into_os_string(),
+            };
+            std::env::set_var("PATH", joined);
+
+            Self {
+                dir,
+                trace,
+                prior_path,
+            }
+        }
+
+        fn trace(&self) -> String {
+            fs::read_to_string(&self.trace).unwrap_or_default()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeSsh {
+        fn drop(&mut self) {
+            match self.prior_path.take() {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// An `ssh` shim that answers herdr's remote discovery probes. `status
+    /// client --json` reports `generation`; `status server --json` always
+    /// fails so the interactive install path stops before prompting.
+    #[cfg(unix)]
+    fn discovery_shim(generation: Option<u32>, on_path: bool) -> String {
+        let client_status = match generation {
+            Some(generation) => format!(
+                "printf '%s\\n' '{{\"version\":\"0.0.0-test\",\"protocol\":22,\"endpoint_protocol_generation\":{generation}}}'; exit 0"
+            ),
+            None => "exit 1".to_string(),
+        };
+        let path_probe = if on_path {
+            "printf '/opt/herdr/bin/herdr\\n'; exit 0"
+        } else {
+            "exit 1"
+        };
+        format!(
+            r#"#!/bin/sh
+trace='__TRACE__'
+printf 'ARGV %s\n' "$*" >> "$trace"
+last=''
+for arg in "$@"; do last="$arg"; done
+payload="$last"
+if [ "$last" = '/bin/sh -s' ]; then
+  payload=$(cat)
+fi
+printf 'PAYLOAD %s\n' "$payload" >> "$trace"
+case "$payload" in
+  *'uname -s'*) printf 'Linux\nx86_64\n'; exit 0 ;;
+  *'status client --json'*) {client_status} ;;
+  *'status server --json'*) printf 'no server\n' >&2; exit 3 ;;
+  *'command -v herdr'*) {path_probe} ;;
+  *) exit 0 ;;
+esac
+"#
+        )
+    }
+
+    #[cfg(unix)]
+    fn without_remote_binary_override<R>(body: impl FnOnce() -> R) -> R {
+        let prior = std::env::var_os(REMOTE_BINARY_ENV_VAR);
+        std::env::remove_var(REMOTE_BINARY_ENV_VAR);
+        let result = body();
+        if let Some(value) = prior {
+            std::env::set_var(REMOTE_BINARY_ENV_VAR, value);
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_remote_herdr_returns_first_generation_one_candidate() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let ssh_shim = FakeSsh::install("prepare-ok", &discovery_shim(Some(1), true));
+
+        let prepared = without_remote_binary_override(|| {
+            let ssh = RemoteSsh::new("charact-host".to_string(), false);
+            prepare_remote_herdr(&ssh, false)
+        })
+        .expect("discovery finds the generation-1 binary");
+
+        assert_eq!(prepared.remote_herdr.shell_path, "/opt/herdr/bin/herdr");
+        assert!(!prepared.stop_after_install_approved);
+        let trace = ssh_shim.trace();
+        assert!(
+            trace.contains("ARGV -T charact-host /bin/sh -s"),
+            "trace: {trace}"
+        );
+        assert!(
+            trace.contains(
+                "PAYLOAD test -x /opt/herdr/bin/herdr && /opt/herdr/bin/herdr status client --json"
+            ),
+            "trace: {trace}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_remote_herdr_applies_binary_override_before_discovery() {
+        let _guard = remote_env_lock().lock().unwrap();
+        if io::stdin().is_terminal() {
+            // The install path this test walks prompts on a tty. nextest runs
+            // tests without one; skip rather than block an interactive run.
+            return;
+        }
+        let ssh_shim = FakeSsh::install("prepare-override", &discovery_shim(Some(1), true));
+        let override_binary = ssh_shim.dir.join("override-herdr");
+        fs::write(&override_binary, b"not a real binary").expect("write override binary");
+
+        let prior = std::env::var_os(REMOTE_BINARY_ENV_VAR);
+        std::env::set_var(REMOTE_BINARY_ENV_VAR, &override_binary);
+        let result = {
+            let ssh = RemoteSsh::new("charact-host".to_string(), false);
+            prepare_remote_herdr(&ssh, false)
+        };
+        match prior {
+            Some(value) => std::env::set_var(REMOTE_BINARY_ENV_VAR, value),
+            None => std::env::remove_var(REMOTE_BINARY_ENV_VAR),
+        }
+
+        let err = result.err().expect("override skips the discovery shortcut");
+        assert!(
+            err.to_string()
+                .contains("could not inspect the running remote herdr server on charact-host"),
+            "unexpected error: {err}"
+        );
+        let trace = ssh_shim.trace();
+        assert!(
+            !trace.contains("status client --json"),
+            "override must skip endpoint discovery probes; trace: {trace}"
+        );
+        assert!(
+            trace.contains("status server --json"),
+            "override must reach the install path; trace: {trace}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_proxies_a_local_connection_through_ssh_stdio() {
+        use std::io::Read as _;
+
+        let _guard = remote_env_lock().lock().unwrap();
+        let ssh_shim = FakeSsh::install(
+            "bridge-echo",
+            "#!/bin/sh\nprintf 'ARGV %s\\n' \"$*\" >> '__TRACE__'\nexec cat\n",
+        );
+
+        let socket = std::env::temp_dir().join(format!(
+            "herdr-bridge-proxy-test-{}.sock",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&socket);
+        let bridge = SshStdioBridge::start(
+            "bridge-host".to_string(),
+            RemoteHerdr::for_platform(RemotePlatform::local()),
+            socket.clone(),
+            "lab-1".to_string(),
+            None,
+        )
+        .expect("start bridge listener");
+
+        let mut client = crate::ipc::connect_local_stream(&socket).expect("connect to bridge");
+        client.write_all(b"ping").expect("write to bridge");
+        client.flush().expect("flush bridge write");
+        let mut echoed = [0_u8; 4];
+        client.read_exact(&mut echoed).expect("read bridge echo");
+        assert_eq!(&echoed, b"ping");
+
+        drop(client);
+        drop(bridge);
+
+        assert!(!socket.exists(), "bridge socket was not unlinked");
+        let trace = ssh_shim.trace();
+        assert!(
+            trace.contains(
+                "ARGV -T bridge-host exec \"$HOME/.local/bin/herdr\" --session lab-1 remote-client-bridge"
+            ),
+            "trace: {trace}"
+        );
+    }
 }
