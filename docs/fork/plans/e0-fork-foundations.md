@@ -205,7 +205,7 @@ epic dependency.
 | # | Title | Group | Depends on | Status |
 | --- | --- | --- | --- | --- |
 | 1 | ci: add fork ci workflow and disable upstream workflows | A · Repository | — | ✅ |
-| 2 | chore: add mise-based fork dev setup script and verify the gate | A · Repository | 1 | ⬜ |
+| 2 | chore: add mise-based fork dev setup script and verify the gate | A · Repository | 1 | ✅ |
 | 3 | feat: fork build channel disables self-update and shows in version | B · Identity | 1 | ⬜ |
 | 4 | feat: fleet lab script boots isolated named herdr sessions | C · Fleet lab | 1 | ⬜ |
 | 5 | docs: fork readme for dev setup, ci, fleet lab; review adr 0001 | D · Docs | 2, 3, 4 | ⬜ |
@@ -474,12 +474,74 @@ setup server </dev/null >/tmp/herdr-e0-setup.log 2>&1 &`, then
 `… herdr session list --json` lists `setup`; `… herdr session stop setup`;
 `rm -rf /tmp/herdr-e0-setup`.
 
+**Outcome (as merged)**
+
+- `scripts/fork/dev-setup.sh` (new, executable, `shellcheck -S warning` clean)
+  implements the six steps in order. Each line prints `ok` (already satisfied),
+  `installed` (this run changed something) or `missing`; the script exits 1 if
+  anything is still `missing` after step 5, so the gate never runs on a
+  half-set-up machine. `--check` implies `--skip-ci` (verify only, installs
+  nothing), `--skip-ci` runs steps 1–5, `-h/--help` prints the header comment
+  block, an unknown flag exits 2.
+- **Two deliberate refinements over the plan text:**
+  1. The Rust pin is read from `rust-toolchain.toml` (`channel = "1.96.1"`,
+     falling back to `1.96.1`) instead of being hardcoded, so the script cannot
+     drift from the toolchain the build actually uses. Zig stays a script
+     constant (`ZIG_VERSION="0.15.2"`): `build.rs` has no version check, so this
+     script is the guard, and it prints the `export ZIG=…` hint on mismatch.
+  2. `mise use -g` is called **only** with the specs `mise ls --json` does not
+     already satisfy (parsed by an inline `python3` snippet — no `jq`
+     dependency). An `@latest` spec counts as satisfied by any installed, active
+     version, so a deliberate local pin is never clobbered, and an already
+     set-up machine never has `~/.config/mise/config.toml` rewritten. That is
+     what makes the idempotence requirement byte-exact rather than
+     best-effort.
+- Step 2 also verifies what the build will really use (`rustc --version`
+  contains the pinned version, `cargo fmt --version`, `cargo clippy --version`),
+  because `rust-toolchain.toml` — not mise — is what selects the toolchain and
+  its components on this machine (`rustc` resolves to the rustup shim in
+  `~/.cargo/bin`). The script therefore resolves its own directory, refuses to
+  run when that does not sit in a herdr checkout (`justfile` +
+  `rust-toolchain.toml`, exit 2, the same guard shape `gate.sh` uses) and
+  `cd`s to the repo root first, so the rustup shim resolves the checkout's pin
+  no matter where the script was invoked from. `-h/--help` still works there.
+- Hardened for `set -euo pipefail`: every probe of an external tool
+  (`zig version`, `rustc --version`, `sed` over `rust-toolchain.toml`,
+  `mise ls --json`, the `python3` helper) is captured with an explicit failure
+  branch, so a tool that is present but broken is reported `missing` with its
+  error text instead of aborting the run with no diagnostic, and no probe is
+  piped into `head` where `pipefail` could turn a SIGPIPE into a false
+  `missing`. Step 1 reports all three prerequisites before exiting rather than
+  stopping at the first one. The mise helper returns each spec's *resolved*
+  version, so `just`/`bun`/`shellcheck` report `ok 1.58.0` rather than
+  `ok latest`.
+- Step 5 runs `just install-hooks`, which writes `core.hooksPath .githooks` into
+  the **shared** repo config: hooks become active in the root checkout and in
+  every worktree at once. `.githooks/pre-commit` then runs `just lint` (bare
+  `cargo fmt --check` + `cargo clippy --all-targets --locked`) **outside** the
+  gate lock, so from here on commit only right after a green gate on the same
+  tree, and never while another agent's gate is mid-build.
+- `scripts/fork/gate.sh` is unchanged and was verified as the plan asks:
+  `EXIT=0` for a full `just ci`; two concurrent `lint` gates where the second
+  prints `gate: waiting for gate lock (another gate is running)…` before its own
+  `EXIT=0`; `bash scripts/fork/gate.sh /nonexistent` → `EXIT=2`. Evidence is in
+  the PR body.
+
 **Downstream**
 
 - `dev-setup.sh` is the documented entry point (PR 5) and the first step of
   the epic's end-to-end validation.
 - Hooks are active from here on: commit after gating so `pre-commit`'s
   `just lint` is a cache hit.
+- **For PR 5's README rewrite** (PR 2 must not edit `docs/fork/README.md`):
+  replace the `mise use -g …` block under *Development setup* with
+  `bash scripts/fork/dev-setup.sh`, and document the three modes — plain (steps
+  1–6, last line is the gate's `EXIT=`), `--skip-ci` (steps 1–5), `--check`
+  (verify only, exit non-zero on any `missing`). Mention that the script pins
+  `rust` (from `rust-toolchain.toml`), `zig@0.15.2`, `just`, `bun` and
+  `shellcheck` through `mise use -g`, only touching the global mise config when
+  a pin is actually missing, and that it installs the git hooks, after which
+  every commit runs `just lint`.
 
 ### PR 3 — feat: fork build channel disables self-update and shows in version · deps: 1
 
