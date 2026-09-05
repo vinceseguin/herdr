@@ -607,6 +607,17 @@ deliberate:
   `scratch_dir`, `snapshot`, `snapshot_message`, `surface_message`,
   `drain_until`, `connected_with_snapshot`, `wait_for`, `hello_surface`,
   `hello_geometry`, `resizes`, `resize_geometry`.
+- `src/fleet/oneshot.rs` is a fourth edited file (two `events()` call sites),
+  beyond this PR's Files list. Fork-owned and benign.
+- Two things the review deferred, for later PRs to own: (1) a supervisor
+  parked in `blocking_send` can only be released by the *receiver*, so a
+  console that shuts down while still holding a taken receiver leaks those
+  threads (bounded 2 s wait, `warn!`, detach — pinned by a test); PR 4 must
+  drop the receiver first, as the cross-cutting constraints already say.
+  (2) `set_active` and `set_active_geometry` write to a socket while holding
+  the active-host and link locks (pre-existing from E1), so a host that stops
+  reading could stall the console loop — **PR 8** owns "the active host is
+  down" and should decide whether a write timeout is needed.
 
 **Tests**
 
@@ -629,13 +640,19 @@ H="env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH -u HERDR_ENV target/debu
 # [fleet] with lab-1, lab-2 as kind = "local" (see Verification); status must be unchanged by this PR:
 $H fleet status --json | python3 -c 'import json,sys;r=json.load(sys.stdin);print([(h["id"],h["connection"]["state"]) for h in r["hosts"]])'
 # geometry is a no-op for a read-only status run: a 120-col line in lab-1's pane stays unwrapped
-$H --session lab-1 pane run "$HERDR_FLEET_LAB_PANE_1" 'printf "%0120d\n" 0'; $H fleet status >/dev/null
-$H --session lab-1 pane read "$HERDR_FLEET_LAB_PANE_1" --source recent | grep -c '^0\{120\}$'   # 1
+# NOTE (from PR 1's run): the marker pane `exec`s `sh -c 'while :; do sleep 60; done'`,
+# so `pane run` types into a sleeping shell and nothing executes. Measure the host's
+# grid directly instead — `pane layout` reports the server-side area, and `stty size`
+# in a pane that *does* have a shell (`workspace create`) reports the pty:
+$H --session lab-1 workspace create --label probe   # -> w2:p1, a real shell
+$H --session lab-1 pane layout --pane w2:p1         # area 120x40 (herdr's headless default)
+$H fleet status --watch &                           # hold the fleet connections open
+$H --session lab-1 pane run w2:p1 'stty size'       # 40 119 with and without the fleet client
 bash scripts/fork/fleet-lab.sh down
 ```
 
-Evidence: unchanged status output, the unwrapped line, green
-`test-one fleet::connector`.
+Evidence: unchanged status output, an unreflowed host grid while a fleet
+client is connected, green `test-one fleet::connector`.
 
 **Downstream**
 
