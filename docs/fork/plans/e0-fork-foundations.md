@@ -337,6 +337,18 @@ cannot re-enable them.
   `disabled_manually` for all ten file-backed workflows and `active` only for
   `Fork CI` (after merge) and any dynamic entry that could not be disabled.
   Paste that output into the PR body.
+- **Confirm Actions actually run on the fork.** As of the plan PR
+  (`vinceseguin/herdr#1`) the fork has never executed a workflow:
+  `gh run list -R vinceseguin/herdr` is empty and the PR's
+  `statusCheckRollup` was `[]`, although `actions/permissions` reports
+  `enabled: true`. GitHub forks need a one-time "enable workflows" in the
+  repository's Actions tab. After disabling the upstream workflows and pushing
+  this PR, check `gh run list -R vinceseguin/herdr --branch <branch>`; if no
+  `Fork CI` run appears within two minutes, enable Actions in the fork's
+  Actions tab (or via `gh api -X PUT repos/vinceseguin/herdr/actions/permissions
+  -f enabled=true -f allowed_actions=all` and re-push), then re-verify. PR 1 is
+  not done until a `Fork CI` run exists for its head and is green. Always pass
+  `-R vinceseguin/herdr` to `gh`.
 
 **Tests**
 
