@@ -90,13 +90,18 @@ mod tests {
 
     #[test]
     fn fork_builds_render_a_fork_version() {
-        if !is_fork() {
-            return;
+        if is_fork() {
+            assert!(
+                version().starts_with(&format!("{BASE_VERSION}-fork")),
+                "fork build reported version {}",
+                version()
+            );
+        } else {
+            assert!(
+                !version().contains("-fork"),
+                "non-fork build reported version {}",
+                version()
+            );
         }
-        assert!(
-            version().starts_with(&format!("{BASE_VERSION}-fork")),
-            "fork build reported version {}",
-            version()
-        );
     }
 }

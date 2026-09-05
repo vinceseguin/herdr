@@ -2755,6 +2755,86 @@ mod tests {
         assert!(FORK_UPDATE_CHECK_SKIP.contains("docs/fork/README.md"));
     }
 
+    /// Exercises the real `auto_update` call site, not just the pure guard: the
+    /// manifest fetch shells out to `curl`, so a `curl` shim first on `PATH`
+    /// records whether the background check ever tried to reach the manifest.
+    #[test]
+    fn auto_update_never_fetches_the_manifest_on_fork_builds() {
+        let _guard = env_lock().lock().unwrap();
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-auto-update-fork-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let marker = dir.join("curl-invoked");
+        let shim = bin_dir.join("curl");
+        std::fs::write(
+            &shim,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let previous_path = std::env::var_os("PATH");
+        let previous_config = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
+        let previous_fake = std::env::var_os(FAKE_UPDATE_VERSION_ENV);
+        let mut path = bin_dir.into_os_string();
+        if let Some(previous) = &previous_path {
+            path.push(":");
+            path.push(previous);
+        }
+        std::env::set_var("PATH", &path);
+        std::env::set_var(
+            crate::config::CONFIG_PATH_ENV_VAR,
+            dir.join("missing-config.toml"),
+        );
+        std::env::remove_var(FAKE_UPDATE_VERSION_ENV);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        auto_update(tx);
+
+        let fetched = marker.exists();
+        let event = rx.try_recv();
+
+        match previous_path {
+            Some(previous) => std::env::set_var("PATH", previous),
+            None => std::env::remove_var("PATH"),
+        }
+        match previous_config {
+            Some(previous) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, previous),
+            None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
+        }
+        if let Some(previous) = previous_fake {
+            std::env::set_var(FAKE_UPDATE_VERSION_ENV, previous);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if crate::build_info::is_fork() {
+            assert!(
+                !fetched,
+                "fork build must skip the background update check before fetching the manifest"
+            );
+        } else {
+            assert!(
+                fetched,
+                "non-fork build should reach the manifest fetch (the curl shim was never invoked)"
+            );
+        }
+        assert!(
+            event.is_err(),
+            "no update event may be emitted when the manifest fetch is skipped or fails"
+        );
+    }
+
     #[test]
     fn non_nix_store_path_is_not_detected() {
         let path = Path::new("/usr/local/bin/herdr");

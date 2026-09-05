@@ -66,24 +66,20 @@ fn version_flag_reports_the_build_channel() {
 
 #[test]
 fn fork_builds_report_a_fork_version() {
-    if !is_fork_build() {
+    let version = support::build_version();
+    if is_fork_build() {
+        assert!(
+            version.starts_with(&format!("{}-fork", env!("CARGO_PKG_VERSION"))),
+            "version: {version}"
+        );
+    } else {
         // Someone compiled this checkout with an explicit non-fork channel.
-        return;
+        assert!(!version.contains("-fork"), "version: {version}");
     }
-
-    assert!(
-        support::build_version().starts_with(&format!("{}-fork", env!("CARGO_PKG_VERSION"))),
-        "version: {}",
-        support::build_version()
-    );
 }
 
 #[test]
 fn update_refuses_on_a_fork_build() {
-    if !is_fork_build() {
-        return;
-    }
-
     // `HERDR_ENV=1` is a backstop, not the behaviour under test: `herdr update`
     // refuses inside a herdr session too, so if the fork guard ever regressed
     // this test would still never reach the network or install anything — it
@@ -98,14 +94,87 @@ fn update_refuses_on_a_fork_build() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
-    assert!(
-        stderr.starts_with(FORK_REFUSAL),
-        "`herdr update` must refuse with the fork message first; stderr: {stderr}"
-    );
+    if is_fork_build() {
+        assert!(
+            stderr.starts_with(FORK_REFUSAL),
+            "`herdr update` must refuse with the fork message first; stderr: {stderr}"
+        );
+    } else {
+        assert!(
+            !stderr.contains("fork builds"),
+            "non-fork build must not print the fork refusal; stderr: {stderr}"
+        );
+    }
     assert!(
         !stderr.contains("checking"),
-        "fork build must not start an update check; stderr: {stderr}"
+        "no update check may start; stderr: {stderr}"
     );
+}
+
+/// `herdr channel set` writes the config and then, on a stock build, hands
+/// off to `self_update`. A fork build must print the fork guidance instead and
+/// exit 0 without ever reaching the update machinery.
+fn assert_channel_set_never_self_updates(channel: &str) {
+    let home = IsolatedConfigHome::new(&format!("channel-set-{channel}"));
+    let config_path = home.0.join("config.toml");
+    let output = home
+        .herdr()
+        .args(["channel", "set", channel])
+        // Backstop only, as in `update_refuses_on_a_fork_build`.
+        .env("HERDR_ENV", "1")
+        .env("HERDR_CONFIG_PATH", &config_path)
+        .output()
+        .expect("run `herdr channel set`");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let config = std::fs::read_to_string(&config_path).expect("channel set writes the config");
+    assert!(
+        config.contains(&format!("channel = \"{channel}\"")),
+        "config: {config}"
+    );
+    assert!(
+        stdout.contains(&format!("Herdr update channel set to {channel}")),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stderr.contains("checking") && !stderr.contains("downloading"),
+        "no update check may start; stderr: {stderr}"
+    );
+
+    if is_fork_build() {
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stdout.contains(FORK_REFUSAL),
+            "fork build must print the fork guidance; stdout: {stdout}"
+        );
+        assert!(
+            !stderr.contains("update failed"),
+            "fork build must not reach self_update; stderr: {stderr}"
+        );
+    } else {
+        // A stock build hands off to `self_update`, which the `HERDR_ENV`
+        // backstop refuses before any network access.
+        assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+        assert!(
+            !stdout.contains("fork builds") && !stderr.contains("fork builds"),
+            "non-fork build must not print the fork guidance; stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn channel_set_stable_writes_config_without_self_updating_on_a_fork_build() {
+    assert_channel_set_never_self_updates("stable");
+}
+
+#[test]
+fn channel_set_preview_writes_config_without_self_updating_on_a_fork_build() {
+    assert_channel_set_never_self_updates("preview");
 }
 
 #[test]
