@@ -2,11 +2,12 @@ use std::collections::VecDeque;
 use std::io;
 use std::time::{Duration, Instant};
 
+use tracing::debug;
+
 use crate::api::client::ApiClientError;
 use crate::api::schema::{Request, ResponseResult};
-use crate::ipc::LocalStream;
-use crate::protocol::ClientMessage;
 
+use super::link::ServerLink;
 use super::shell::ClientShellEndpointError;
 
 const ENDPOINT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
@@ -36,7 +37,7 @@ impl EndpointCommands {
         self.queued.push_back((boot_id, request));
     }
 
-    pub(super) fn send_next(&mut self, stream: &mut LocalStream) -> io::Result<()> {
+    pub(super) fn send_next(&mut self, link: &mut ServerLink) -> io::Result<()> {
         if self.in_flight.is_some() {
             return Ok(());
         }
@@ -46,13 +47,9 @@ impl EndpointCommands {
         let request_id = request.id.clone();
         let request = serde_json::to_string(&request)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        super::write_to_server(
-            stream,
-            &ClientMessage::ClientShellEndpointRequest {
-                boot_id: boot_id.clone(),
-                request,
-            },
-        )?;
+        // The link decides how the request is correlated: on the wire for a
+        // single host, through the connector's per-host lane for a fleet.
+        super::link::io_result(link.write_endpoint_request(&boot_id, &request_id, request))?;
         self.in_flight = Some(InFlightCommand {
             boot_id,
             request_id,
@@ -61,6 +58,48 @@ impl EndpointCommands {
             timed_out: false,
         });
         Ok(())
+    }
+
+    /// Completes the in-flight command from an already reassembled answer.
+    ///
+    /// The fleet connector owns one endpoint lane per host: it correlates the
+    /// answer by `request_id` and hands it over whole, so there is no boot id
+    /// on the wire to check here. An answer for anything but the in-flight
+    /// request is ignored — a stale host's late reply must not release the
+    /// lane of the request that replaced it.
+    pub(super) fn complete(
+        &mut self,
+        request_id: &str,
+        result: Result<Vec<u8>, String>,
+    ) -> Option<EndpointCommandResult> {
+        let in_flight = self.in_flight.as_ref()?;
+        if in_flight.request_id != request_id {
+            debug!(
+                request_id,
+                in_flight = in_flight.request_id,
+                "ignoring an endpoint answer for another request"
+            );
+            return None;
+        }
+        let in_flight = self.in_flight.take()?;
+        let result = match result {
+            Ok(response) => match String::from_utf8(response) {
+                Ok(response) => parse_response(&in_flight.request_id, &response),
+                Err(error) => Err(ClientShellEndpointError {
+                    code: None,
+                    message: format!("invalid endpoint response: {error}"),
+                }),
+            },
+            Err(message) => Err(ClientShellEndpointError {
+                code: Some("endpoint_unavailable".into()),
+                message,
+            }),
+        };
+        Some(EndpointCommandResult {
+            boot_id: in_flight.boot_id,
+            request_id: in_flight.request_id,
+            result,
+        })
     }
 
     pub(super) fn expire(&mut self, now: Instant) -> Option<EndpointCommandResult> {
@@ -271,6 +310,59 @@ mod tests {
     }
 
     #[test]
+    fn a_reassembled_fleet_answer_completes_the_in_flight_command() {
+        let mut commands = commands_with_in_flight();
+        let response = serde_json::to_vec(&SuccessResponse {
+            id: "request-a".into(),
+            result: ResponseResult::Ok {},
+        })
+        .unwrap();
+
+        let completed = commands
+            .complete("request-a", Ok(response))
+            .expect("the in-flight command is completed");
+
+        assert_eq!(completed.boot_id, "boot-a");
+        assert_eq!(completed.request_id, "request-a");
+        assert!(matches!(completed.result, Ok(ResponseResult::Ok {})));
+        assert!(commands.in_flight.is_none(), "the lane is released");
+    }
+
+    #[test]
+    fn a_fleet_answer_for_another_request_never_releases_the_lane() {
+        let mut commands = commands_with_in_flight();
+
+        assert!(commands.complete("request-b", Ok(b"{}".to_vec())).is_none());
+        assert!(
+            commands.in_flight.is_some(),
+            "the request that is actually in flight keeps its lane"
+        );
+    }
+
+    #[test]
+    fn a_fleet_host_failure_completes_the_command_as_an_error() {
+        let mut commands = commands_with_in_flight();
+
+        let completed = commands
+            .complete("request-a", Err("host went away".into()))
+            .expect("a failure still answers the command");
+
+        assert!(matches!(
+            completed.result,
+            Err(ClientShellEndpointError { code: Some(code), message })
+                if code == "endpoint_unavailable" && message == "host went away"
+        ));
+        assert!(commands.in_flight.is_none());
+    }
+
+    #[test]
+    fn an_answer_with_no_command_in_flight_is_ignored() {
+        let mut commands = EndpointCommands::default();
+
+        assert!(commands.complete("request-a", Ok(b"{}".to_vec())).is_none());
+    }
+
+    #[test]
     fn response_from_another_boot_is_rejected() {
         let mut commands = commands_with_in_flight();
 
@@ -279,5 +371,84 @@ mod tests {
         };
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod fleet_tests {
+    use super::*;
+
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use crate::api::schema::{Method, PingParams, Request};
+    use crate::fleet::connector::test_support::{
+        connected_with_snapshot, drain_until, fake_connector, scratch_dir, snapshot,
+        snapshot_message, wait_for, Behaviour, FakeHost,
+    };
+    use crate::fleet::connector::FleetConnectorOptions;
+    use crate::fleet::hosts::HostId;
+    use crate::fleet::state::FleetState;
+    use crate::protocol::ClientMessage;
+
+    use super::super::link::{FleetLink, ServerLink};
+
+    /// A queued request sent through a fleet link reaches the host as an
+    /// endpoint request on that host's own lane, correlated by request id.
+    #[test]
+    fn send_next_routes_an_endpoint_request_through_the_active_host() {
+        let dir = scratch_dir("endpoint-commands-fleet");
+        let alpha = FakeHost::start(
+            &dir,
+            "alpha",
+            Behaviour::Answer {
+                messages: vec![snapshot_message(&snapshot("boot-alpha", 1))],
+                reply_boot: None,
+            },
+        );
+        let mut connector = fake_connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        let mut state = FleetState::new(vec![alpha.spec("alpha")]);
+        drain_until(
+            &mut connector,
+            &mut state,
+            Duration::from_secs(10),
+            |state| connected_with_snapshot(state, "alpha"),
+        );
+        let mut link = ServerLink::Fleet(FleetLink::new(
+            Rc::new(connector),
+            HostId::new("alpha").expect("valid host id"),
+        ));
+
+        let mut commands = EndpointCommands::default();
+        commands.enqueue(
+            "boot-alpha".into(),
+            Box::new(Request {
+                id: "request-1".into(),
+                method: Method::Ping(PingParams::default()),
+            }),
+        );
+        commands.send_next(&mut link).expect("request sent");
+
+        assert_eq!(
+            commands
+                .in_flight
+                .as_ref()
+                .map(|command| command.request_id.clone()),
+            Some("request-1".to_string()),
+            "the lane tracks the request the host was given"
+        );
+        assert!(
+            wait_for(Duration::from_secs(5), || {
+                alpha.received().iter().any(|message| {
+                    matches!(
+                        message,
+                        ClientMessage::ClientShellEndpointRequest { request, .. }
+                            if request.contains("\"request-1\"")
+                    )
+                })
+            }),
+            "the active host received the request: {:?}",
+            alpha.received()
+        );
     }
 }

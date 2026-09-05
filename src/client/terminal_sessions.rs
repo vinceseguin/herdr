@@ -12,13 +12,14 @@ use crate::protocol::{
 };
 use crate::server::socket_paths::client_socket_path;
 
-use super::{do_handshake, init_logging, write_to_server, ClientError};
+use super::link::write_stream_message;
+use super::{do_handshake, init_logging, ClientError};
 
 /// Runs a read-only terminal session observer and prints one JSON envelope per frame.
 pub fn run_terminal_session_observe(target: String, cols: u16, rows: u16) -> io::Result<()> {
     let mut stream =
         connect_terminal_session_stream(target.clone(), cols, rows, "observing terminal session")?;
-    write_to_server(&mut stream, &ClientMessage::ObserveTerminal { target })?;
+    write_stream_message(&mut stream, &ClientMessage::ObserveTerminal { target })?;
     write_terminal_session_output(stream)
 }
 
@@ -35,7 +36,7 @@ pub fn run_terminal_session_control(
         rows,
         "controlling terminal session",
     )?;
-    write_to_server(
+    write_stream_message(
         &mut stream,
         &ClientMessage::ControlTerminal { target, takeover },
     )?;
@@ -53,7 +54,7 @@ pub fn run_terminal_session_control(
             match terminal_control_command_from_json(&line) {
                 Ok(message) => {
                     let release = matches!(message, ClientMessage::Detach);
-                    if write_to_server(&mut write_stream, &message).is_err() {
+                    if write_stream_message(&mut write_stream, &message).is_err() {
                         return;
                     }
                     if release {
@@ -63,7 +64,7 @@ pub fn run_terminal_session_control(
                 Err(err) => eprintln!("herdr: terminal session control input ignored: {err}"),
             }
         }
-        let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
+        let _ = write_stream_message(&mut write_stream, &ClientMessage::Detach);
     });
 
     write_terminal_session_output(stream)

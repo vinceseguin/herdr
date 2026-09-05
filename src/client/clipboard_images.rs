@@ -2,16 +2,16 @@ use std::path::PathBuf;
 
 use tracing::{info, warn};
 
-use crate::ipc::LocalStream;
 #[cfg(windows)]
 use crate::protocol::ClientInputEvent;
 use crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD;
 use crate::protocol::{ClientClipboardImageTarget, ClientMessage};
 
+use super::link::ServerLink;
 use super::{is_remote_client_process, write_to_server, ClientError};
 
 pub(super) fn write_remote_image_to_server(
-    stream: &mut LocalStream,
+    stream: &mut ServerLink,
     target: ClientClipboardImageTarget,
     image: crate::platform::ClipboardImage,
     source: &'static str,
