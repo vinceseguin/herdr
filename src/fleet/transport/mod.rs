@@ -2,8 +2,8 @@
 //!
 //! A transport is the smallest thing a supervisor thread needs: something that
 //! hands back an open, blocking [`LocalStream`] carrying the endpoint protocol.
-//! Local hosts connect to a session socket; ssh hosts (PR 6) connect to a
-//! private forward socket fed by the shared stdio bridge. Everything above this
+//! Local hosts connect to a session socket; ssh hosts connect to a private
+//! forward socket fed by the shared stdio bridge. Everything above this
 //! trait — handshake, snapshots, frames, reconnect — is identical for both.
 
 use std::io;
@@ -13,14 +13,10 @@ use crate::fleet::hosts::{HostKind, HostSpec};
 use crate::ipc::LocalStream;
 
 pub mod local;
+pub mod ssh;
 
 pub use local::LocalTransport;
-
-/// Reason reported for an ssh host until PR 6 lands its transport.
-///
-/// PR 6 replaces the `HostKind::Ssh` arm of [`transport_for`] with the real
-/// [`crate::fleet::transport`]`::ssh::SshTransport` and deletes this constant.
-const SSH_PENDING_REASON: &str = "ssh hosts land in PR 6";
+pub use ssh::SshTransport;
 
 /// One host's connection factory.
 ///
@@ -37,16 +33,23 @@ pub trait HostTransport: Send {
 
 /// Build the transport for one host spec.
 ///
-/// `Err` is a host-local reason string: the supervisor reports it as
-/// `Unavailable` and keeps backing off, exactly as it does for a refused
-/// socket. It never aborts the fleet.
+/// `Err` is a host-local reason string the supervisor reports **once** before
+/// it stops: it means no transport for this host exists in this build, which a
+/// retry cannot change. Everything that a retry *could* fix — an unreachable
+/// host, a missing remote herdr, a dead bridge — is an `Err` from `connect`
+/// instead, so the host keeps its backoff and reconnects.
 pub fn transport_for(
     spec: &HostSpec,
-    _options: &crate::fleet::connector::FleetConnectorOptions,
+    options: &crate::fleet::connector::FleetConnectorOptions,
 ) -> Result<Box<dyn HostTransport>, String> {
     match &spec.kind {
         HostKind::Local { session } => Ok(Box::new(LocalTransport::new(session.clone()))),
-        HostKind::Ssh { .. } => Err(SSH_PENDING_REASON.to_string()),
+        HostKind::Ssh { target, session } => Ok(Box::new(SshTransport::new(
+            spec.id.clone(),
+            target.clone(),
+            session.clone(),
+            options.manage_ssh_config,
+        ))),
     }
 }
 
@@ -77,17 +80,21 @@ mod tests {
     }
 
     #[test]
-    fn ssh_hosts_are_reported_unavailable_until_pr_6() {
+    fn ssh_hosts_get_an_ssh_transport() {
         let options = FleetConnectorOptions::default();
-        let error = transport_for(
+        // Building a transport must do no I/O: nothing here reaches ssh.
+        let transport = transport_for(
             &spec(HostKind::Ssh {
                 target: "workbox".to_string(),
-                session: None,
+                session: Some("agents".to_string()),
             }),
             &options,
         )
-        .err()
-        .expect("ssh transport is not implemented yet");
-        assert_eq!(error, SSH_PENDING_REASON);
+        .expect("every configured ssh host gets a transport");
+        assert_eq!(transport.describe(), "ssh workbox (session agents)");
+        assert_eq!(
+            transport.read_timeout(),
+            crate::fleet::handshake::REMOTE_HANDSHAKE_READ_TIMEOUT
+        );
     }
 }
