@@ -54,11 +54,17 @@ macro_rules! fleet_ref {
             }
 
             /// Host half of the reference.
+            // The fields are public, so nothing in the fork needs the
+            // accessors yet; E2's sidebar and E3's API read references
+            // through them, and a reference is exactly the type where a
+            // uniform call site is worth keeping.
+            #[allow(dead_code)]
             pub fn host(&self) -> &HostId {
                 &self.host
             }
 
             /// Server-side half of the reference.
+            #[allow(dead_code)]
             pub fn id(&self) -> &str {
                 &self.$field
             }

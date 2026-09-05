@@ -28,6 +28,7 @@ pub(super) fn command() -> Command {
         .subcommand(completion_command())
         .subcommand(update_command())
         .subcommand(status_command())
+        .subcommand(fleet_command())
         .subcommand(config_command())
         .subcommand(channel_command())
         .subcommand(server_command())
@@ -140,6 +141,18 @@ fn status_command() -> Command {
             Command::new("client")
                 .about("Show local client status")
                 .arg(json_flag()),
+        )
+}
+
+fn fleet_command() -> Command {
+    Command::new("fleet")
+        .about("Inspect the configured fleet of herdr hosts")
+        .subcommand(
+            Command::new("status")
+                .about("Show every configured fleet host and its agents")
+                .arg(json_flag())
+                .arg(option("timeout-ms", "MS").help("Wait at most MS for hosts to answer"))
+                .arg(flag("watch").help("Keep running and print one line per change")),
         )
 }
 

@@ -129,6 +129,9 @@ pub struct AgentRollup {
 }
 
 impl AgentRollup {
+    // The status report carries the per-status counts and lets its readers
+    // add them up; E2's host rows show one number.
+    #[allow(dead_code)]
     pub fn total(&self) -> usize {
         self.blocked
             .saturating_add(self.working)

@@ -608,6 +608,7 @@ fn main() -> io::Result<()> {
         println!("       herdr server reload-config");
         println!("       herdr api <subcommand> ...");
         println!("       herdr completion <shell>");
+        println!("       herdr fleet status [--json] [--watch]");
         println!("       herdr config <subcommand> ...");
         println!("       herdr channel <subcommand> ...");
         println!("       herdr workspace <subcommand> ...");
@@ -754,6 +755,7 @@ fn main() -> io::Result<()> {
                 "status",
                 "config",
                 "channel",
+                "fleet",
                 "workspace",
                 "worktree",
                 "pane",
