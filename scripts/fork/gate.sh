@@ -39,9 +39,8 @@ fi
 start=$(date +%s)
 (
   cd "$worktree" || exit 2
-  # Build the fork identity in; keep cargo from re-spawning its own parallelism
-  # storms across agents (nextest still parallelises within one run).
-  export HERDR_BUILD_CHANNEL="${HERDR_BUILD_CHANNEL:-fork}"
+  # Do not set HERDR_BUILD_CHANNEL here: upstream tests assert the plain
+  # version string, and the fork channel (E0) ships with its own test updates.
   export CARGO_TERM_COLOR=never
   # shellcheck disable=SC2086
   just $recipe "$@"
