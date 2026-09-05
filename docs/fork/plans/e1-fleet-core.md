@@ -268,7 +268,8 @@ integration test that boots two named sessions and asserts the merged status.
 
 - **Upstream files touched, and by which PR only:** `src/config/model.rs`,
   `src/config/io.rs`, `src/config.rs`, `src/main.rs` (`mod fleet;` +
-  `DEFAULT_CONFIG` block) — PR 1. `src/remote/attach.rs` — PR 3 only.
+  `DEFAULT_CONFIG` block) and `scripts/config_reference_check.py`
+  (one `SKIPPED_SUBTREES` entry, see PR 1) — PR 1. `src/remote/attach.rs` — PR 3 only.
   `src/cli.rs`, `src/cli/spec.rs`, `src/main.rs` (help text + bare-command
   list) — PR 5. `tests/cli/mod.rs` — PR 5. Nothing else upstream is edited;
   `src/protocol/**`, `tests/fixtures/endpoint-*.json`, `justfile`,
@@ -302,7 +303,7 @@ integration test that boots two named sessions and asserts the merged status.
 
 | # | Title | Group | Depends on | Status |
 | --- | --- | --- | --- | --- |
-| 1 | feat: add fleet config section and host specs | A · Foundations | — | ⬜ |
+| 1 | feat: add fleet config section and host specs | A · Foundations | — | ✅ |
 | 2 | feat: pure fleet state merges host snapshots and renders a status report | A · Foundations | 1 | ⬜ |
 | 3 | refactor: expose ssh stdio bridge and remote discovery for reuse | B · Transport | 4 | ⬜ |
 | 4 | feat: ssh lab script runs a user-space sshd against the fleet lab | B · Transport | — | ⬜ |
@@ -555,6 +556,51 @@ two expected diagnostics. `rm -rf /tmp/herdr-e1-pr1`.
   is the implicit host's id everywhere (CLI, JSON, E2 sidebar).
 - `resolve_hosts` is the only place config becomes specs; E2's `herdr fleet`
   launch and E3's gateway call it, never `FleetConfig` directly.
+
+**As built (merged)** — differences later PRs must know about:
+
+- **`src/fleet/mod.rs` has no re-exports yet and carries
+  `#[allow(dead_code)] pub mod hosts;`** with a reason comment: nothing in
+  production calls the module until the connector lands, and test-only use
+  does not satisfy the lint. The allow is on the `hosts` module only, *not* an
+  inner `#![allow]` on `mod.rs`, so `state.rs`/`report.rs`/the connector are
+  not silently covered. **PR 5 removes the allow from `hosts` once the
+  connector consumes it**, and PRs 2/5/6 must add their own narrow allow (or
+  none) rather than widening this one. Consumers use the
+  `crate::fleet::hosts::…` path; add `pub use` lines when a consumer exists.
+- **`scripts/config_reference_check.py` gained `"fleet"` in
+  `SKIPPED_SUBTREES`.** `just ci`'s `maintenance-test` runs
+  `scripts/test_config_reference_check.py` against the *real* config model,
+  and it (a) refuses an un-skipped `Vec<struct>` like `fleet.hosts` and
+  (b) demands a row in `docs/next/website/src/data/config-reference.json` for
+  every other key. Fork rules forbid editing `docs/next/**`, so the whole
+  `[fleet]` subtree is skipped and documented in prose under `docs/fork/`
+  (PR 7). The skip is an exact match on the dotted path, so it masks no
+  upstream drift outside `[fleet]`. **Any new `[fleet]` key is invisible to
+  that check** — PR 7's reference doc is the only place it is documented.
+- **`src/config/io.rs` also wires the live-reload path.**
+  `load_live_config_from_str` builds a `Config::default()` and applies
+  sections one at a time; without a `load_live_section(table, "fleet", …)`
+  call plus `diagnostics.extend(config.fleet.diagnostics())`, `[fleet]`
+  parsed at startup but silently reverted to defaults on
+  `herdr server reload-config`. Both are now wired, so E2 can rely on
+  `[fleet]` surviving a live reload and on a bad `[fleet]` being isolated to
+  `invalid_sections == ["fleet"]`.
+- **Extra diagnostics beyond the plan's list:** a `target` on a
+  `kind = "local"` host (it is silently dropped by `host_spec`, so a typo
+  would attach to a same-named *local* session instead of the machine named),
+  and a `target` that is empty, whitespace-only or contains control
+  characters (an ssh destination is one argv element). `HostId::new`'s error
+  messages are `session::validate_name`'s with the leading `session name`
+  rewritten to `host name`; a test pins all four messages so an upstream
+  rewording is caught.
+- **Config keys are `[fleet] include_local` and `[[fleet.hosts]]`
+  `name`/`kind`/`target`/`session`/`enabled` exactly as specified**;
+  `kind` defaults to `"ssh"`, `enabled` to `true`, and an unknown `kind`
+  value fails the section (isolated per section on the live path).
+- `resolve_hosts` is all-or-nothing: any diagnostic → `Err(diagnostics)`,
+  including for `enabled = false` hosts, so ids stay unique and typos surface.
+  PR 5's CLI exits 1 on `Err` (decision (h)).
 
 ### PR 2 — feat: pure fleet state merges host snapshots and renders a status report · deps: 1
 
@@ -972,7 +1018,9 @@ proves it against real servers. SSH hosts are reported `Unavailable { reason:
   `HostCommand`, `HostSendError`, per-host supervisor/reader threads.
 - `src/fleet/endpoint_lane.rs` (new): per-host request/response reassembly.
 - `src/fleet/oneshot.rs` (new): `collect_status` / `watch`.
-- `src/fleet/mod.rs`: add the modules.
+- `src/fleet/mod.rs`: add the modules, and **drop the
+  `#[allow(dead_code)]` PR 1 put on `pub mod hosts;`** — the connector is
+  its first production consumer.
 - `src/cli/fleet.rs` (new); `src/cli.rs` *(upstream — one `mod fleet;` and one
   match arm)*; `src/cli/spec.rs` *(upstream — `fleet_command()` +
   `.subcommand(fleet_command())`)*; `src/main.rs` *(upstream — one usage line

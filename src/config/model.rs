@@ -320,6 +320,7 @@ pub struct Config {
     pub advanced: AdvancedConfig,
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
+    pub fleet: FleetConfig,
 }
 
 #[derive(Debug)]
@@ -973,6 +974,183 @@ impl Default for RemoteConfig {
             manage_ssh_config: true,
         }
     }
+}
+
+/// `[fleet]` — hosts aggregated by the fork's fleet runtime.
+///
+/// Field names are the user-facing contract: add fields, never rename them.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct FleetConfig {
+    /// Include this machine's default session as host "local". Default: true.
+    pub include_local: bool,
+    /// Additional hosts; see `[[fleet.hosts]]` in `herdr --default-config`.
+    pub hosts: Vec<FleetHostConfig>,
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        Self {
+            include_local: true,
+            hosts: Vec::new(),
+        }
+    }
+}
+
+/// One `[[fleet.hosts]]` entry.
+///
+/// Every field has a default so a malformed entry is reported as a
+/// diagnostic instead of failing the whole config parse, matching how the
+/// other sections behave.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct FleetHostConfig {
+    /// Display name and id prefix (`workbox/w1:p1`). Required.
+    pub name: String,
+    /// Transport used to reach the host. Default: "ssh".
+    pub kind: FleetHostKind,
+    /// ssh destination (alias, `user@host`, `ssh://host:2222`). Required for
+    /// `kind = "ssh"`.
+    pub target: Option<String>,
+    /// Named session on that host. Required for `kind = "local"`.
+    pub session: Option<String>,
+    /// Whether the fleet connects to this host. Default: true.
+    pub enabled: bool,
+}
+
+impl Default for FleetHostConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            kind: FleetHostKind::default(),
+            target: None,
+            session: None,
+            enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FleetHostKind {
+    #[default]
+    Ssh,
+    Local,
+}
+
+impl FleetConfig {
+    /// Validate `[fleet]` without touching the network or the filesystem.
+    ///
+    /// Every problem is reported; the caller decides whether to keep going
+    /// (the TUI shows the diagnostic banner) or to refuse (`herdr fleet`).
+    pub fn diagnostics(&self) -> Vec<String> {
+        let mut diagnostics = Vec::new();
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+
+        for (index, host) in self.hosts.iter().enumerate() {
+            let field = |key: &str| format!("fleet.hosts[{index}].{key}");
+
+            match validate_fleet_host_name(&host.name) {
+                Err(reason) => diagnostics.push(format!(
+                    "invalid fleet host name: {} = {:?}; {reason}; ignoring [fleet] hosts",
+                    field("name"),
+                    host.name
+                )),
+                Ok(()) => {
+                    if self.include_local && host.name == FLEET_LOCAL_HOST_NAME {
+                        diagnostics.push(format!(
+                            "reserved fleet host name: {} = {:?} names this machine's default session; set fleet.include_local = false or rename the host; ignoring [fleet] hosts",
+                            field("name"),
+                            host.name
+                        ));
+                    }
+                    if !seen.insert(host.name.as_str()) {
+                        diagnostics.push(format!(
+                            "duplicate fleet host name: {} = {:?}; host names must be unique; ignoring [fleet] hosts",
+                            field("name"),
+                            host.name
+                        ));
+                    }
+                }
+            }
+
+            match host.kind {
+                FleetHostKind::Ssh => match host.target.as_deref() {
+                    None => diagnostics.push(format!(
+                        "missing fleet host target: {} is required for kind = \"ssh\"; ignoring [fleet] hosts",
+                        field("target")
+                    )),
+                    Some(target) => {
+                        if let Err(reason) = validate_fleet_host_target(target) {
+                            diagnostics.push(format!(
+                                "invalid fleet host target: {} = {target:?}; {reason}; ignoring [fleet] hosts",
+                                field("target")
+                            ));
+                        }
+                    }
+                },
+                FleetHostKind::Local => {
+                    if host.session.is_none() {
+                        diagnostics.push(format!(
+                            "missing fleet host session: {} is required for kind = \"local\"; ignoring [fleet] hosts",
+                            field("session")
+                        ));
+                    }
+                    if host.target.is_some() {
+                        // Refused rather than ignored: silently dropping the
+                        // target would attach the user to a same-named local
+                        // session instead of the machine they named.
+                        diagnostics.push(format!(
+                            "unused fleet host target: {} is only used for kind = \"ssh\"; remove it or set kind = \"ssh\"; ignoring [fleet] hosts",
+                            field("target")
+                        ));
+                    }
+                }
+            }
+
+            if let Some(session) = host.session.as_deref() {
+                if let Err(reason) = crate::session::validate_name(session) {
+                    diagnostics.push(format!(
+                        "invalid fleet host session: {} = {session:?}; {reason}; ignoring [fleet] hosts",
+                        field("session")
+                    ));
+                }
+            }
+        }
+
+        diagnostics
+    }
+}
+
+/// Reserved id of this machine's default session.
+pub const FLEET_LOCAL_HOST_NAME: &str = "local";
+
+/// Fleet host names follow session-name rules so they can be used verbatim as
+/// the `host/` prefix of a fleet id; `session::validate_name` stays the single
+/// source of truth for the character class.
+pub(crate) fn validate_fleet_host_name(name: &str) -> Result<(), String> {
+    crate::session::validate_name(name).map_err(|err| err.replacen("session name", "host name", 1))
+}
+
+/// Same rule `--remote` applies to its target, so a target can never be read
+/// as an ssh flag, plus a shape check `--remote` gets from the shell: an ssh
+/// destination is one argv element, so whitespace or control characters mean
+/// the value is malformed (and ` -oProxyCommand=...` would otherwise slip past
+/// the leading-dash check).
+pub(crate) fn validate_fleet_host_target(target: &str) -> Result<(), String> {
+    if target.is_empty() {
+        return Err("ssh target cannot be empty".to_string());
+    }
+    if target.starts_with('-') {
+        return Err("ssh target must not start with '-'".to_string());
+    }
+    if target
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err("ssh target must not contain whitespace or control characters".to_string());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1985,5 +2163,276 @@ scrollback_lines = 12345
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.advanced.scrollback_limit_bytes, 12345);
+    }
+
+    fn fleet_config(toml: &str) -> Config {
+        toml::from_str::<Config>(toml).expect("fleet fixture parses")
+    }
+
+    fn fleet_diagnostics(toml: &str) -> Vec<String> {
+        fleet_config(toml).fleet.diagnostics()
+    }
+
+    #[test]
+    fn fleet_config_defaults_when_the_section_is_absent() {
+        for config in [Config::default(), fleet_config("[advanced]\n")] {
+            assert!(config.fleet.include_local);
+            assert!(config.fleet.hosts.is_empty());
+            assert!(config.fleet.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn fleet_config_parses_a_full_multi_host_sample_without_diagnostics() {
+        let config = fleet_config(
+            r#"
+[fleet]
+include_local = false
+
+[[fleet.hosts]]
+name = "workbox"
+kind = "ssh"
+target = "ssh://workbox:2222"
+session = "agents"
+enabled = true
+
+[[fleet.hosts]]
+name = "side"
+kind = "local"
+session = "side"
+enabled = false
+"#,
+        );
+
+        assert!(!config.fleet.include_local);
+        assert_eq!(config.fleet.hosts.len(), 2);
+        assert_eq!(config.fleet.hosts[0].name, "workbox");
+        assert_eq!(config.fleet.hosts[0].kind, FleetHostKind::Ssh);
+        assert_eq!(
+            config.fleet.hosts[0].target.as_deref(),
+            Some("ssh://workbox:2222")
+        );
+        assert_eq!(config.fleet.hosts[0].session.as_deref(), Some("agents"));
+        assert!(config.fleet.hosts[0].enabled);
+        assert_eq!(config.fleet.hosts[1].kind, FleetHostKind::Local);
+        assert_eq!(config.fleet.hosts[1].target, None);
+        assert!(!config.fleet.hosts[1].enabled);
+        assert_eq!(config.fleet.diagnostics(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn fleet_host_entry_defaults_are_ssh_enabled_and_unnamed() {
+        let config = fleet_config("[[fleet.hosts]]\ntarget = \"workbox\"\n");
+        let host = &config.fleet.hosts[0];
+        assert_eq!(host.name, "");
+        assert_eq!(host.kind, FleetHostKind::Ssh);
+        assert_eq!(host.session, None);
+        assert!(host.enabled);
+    }
+
+    #[test]
+    fn fleet_diagnostic_reports_a_missing_or_invalid_host_name() {
+        assert_eq!(
+            fleet_diagnostics("[[fleet.hosts]]\ntarget = \"workbox\"\n"),
+            vec![
+                "invalid fleet host name: fleet.hosts[0].name = \"\"; host name cannot be empty; \
+                 ignoring [fleet] hosts"
+                    .to_string()
+            ]
+        );
+
+        for name in ["bad/name", "has space", "..", "n\u{e4}me"] {
+            let diagnostics = fleet_diagnostics(&format!(
+                "[[fleet.hosts]]\nname = {name:?}\ntarget = \"t\"\n"
+            ));
+            assert_eq!(diagnostics.len(), 1, "{name:?}: {diagnostics:?}");
+            assert!(
+                diagnostics[0].starts_with("invalid fleet host name: fleet.hosts[0].name = "),
+                "{name:?}: {diagnostics:?}"
+            );
+            assert!(
+                !diagnostics[0].contains("session name"),
+                "host diagnostics must not talk about sessions: {diagnostics:?}"
+            );
+        }
+
+        let long = "a".repeat(65);
+        let diagnostics = fleet_diagnostics(&format!(
+            "[[fleet.hosts]]\nname = \"{long}\"\ntarget = \"t\"\n"
+        ));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("host name cannot be longer than"));
+    }
+
+    #[test]
+    fn fleet_diagnostic_reports_duplicate_host_names() {
+        let diagnostics = fleet_diagnostics(
+            r#"
+[[fleet.hosts]]
+name = "workbox"
+target = "workbox"
+
+[[fleet.hosts]]
+name = "workbox"
+target = "other"
+"#,
+        );
+        assert_eq!(
+            diagnostics,
+            vec![
+                "duplicate fleet host name: fleet.hosts[1].name = \"workbox\"; host names must be \
+                 unique; ignoring [fleet] hosts"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn fleet_diagnostic_reports_the_reserved_local_name_only_while_include_local() {
+        let reserved = fleet_diagnostics(
+            "[[fleet.hosts]]\nname = \"local\"\nkind = \"local\"\nsession = \"agents\"\n",
+        );
+        assert_eq!(reserved.len(), 1, "{reserved:?}");
+        assert!(
+            reserved[0].starts_with("reserved fleet host name: fleet.hosts[0].name = \"local\""),
+            "{reserved:?}"
+        );
+        assert!(reserved[0].contains("fleet.include_local = false"));
+
+        assert!(fleet_diagnostics(
+            "[fleet]\ninclude_local = false\n\n[[fleet.hosts]]\nname = \"local\"\nkind = \"local\"\nsession = \"agents\"\n",
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn fleet_diagnostic_reports_ssh_target_problems() {
+        assert_eq!(
+            fleet_diagnostics("[[fleet.hosts]]\nname = \"workbox\"\n"),
+            vec![
+                "missing fleet host target: fleet.hosts[0].target is required for kind = \"ssh\"; \
+                 ignoring [fleet] hosts"
+                    .to_string()
+            ]
+        );
+
+        for (target, reason) in [
+            ("", "ssh target cannot be empty"),
+            ("-oProxyCommand=id", "ssh target must not start with '-'"),
+            (
+                " -oProxyCommand=id",
+                "ssh target must not contain whitespace or control characters",
+            ),
+            (
+                "   ",
+                "ssh target must not contain whitespace or control characters",
+            ),
+            (
+                "workbox\nProxyCommand id",
+                "ssh target must not contain whitespace or control characters",
+            ),
+        ] {
+            let diagnostics = fleet_diagnostics(&format!(
+                "[[fleet.hosts]]\nname = \"workbox\"\ntarget = {target:?}\n"
+            ));
+            assert_eq!(diagnostics.len(), 1, "{target:?}: {diagnostics:?}");
+            assert!(
+                diagnostics[0].starts_with("invalid fleet host target: fleet.hosts[0].target = "),
+                "{target:?}: {diagnostics:?}"
+            );
+            assert!(diagnostics[0].contains(reason), "{diagnostics:?}");
+        }
+
+        for target in ["workbox", "user@host", "ssh://host:2222", "10.0.0.2"] {
+            assert!(
+                fleet_diagnostics(&format!(
+                    "[[fleet.hosts]]\nname = \"workbox\"\ntarget = {target:?}\n"
+                ))
+                .is_empty(),
+                "{target:?} is a valid ssh destination"
+            );
+        }
+    }
+
+    #[test]
+    fn fleet_diagnostic_reports_local_host_session_problems() {
+        assert_eq!(
+            fleet_diagnostics("[[fleet.hosts]]\nname = \"side\"\nkind = \"local\"\n"),
+            vec![
+                "missing fleet host session: fleet.hosts[0].session is required for kind = \
+                 \"local\"; ignoring [fleet] hosts"
+                    .to_string()
+            ]
+        );
+
+        let diagnostics = fleet_diagnostics(
+            "[[fleet.hosts]]\nname = \"side\"\nkind = \"local\"\nsession = \"side\"\ntarget = \"workbox\"\n",
+        );
+        assert_eq!(
+            diagnostics,
+            vec![
+                "unused fleet host target: fleet.hosts[0].target is only used for kind = \"ssh\"; \
+                 remove it or set kind = \"ssh\"; ignoring [fleet] hosts"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn fleet_diagnostic_reports_an_invalid_session_name_for_either_kind() {
+        for kind in ["ssh", "local"] {
+            let diagnostics = fleet_diagnostics(&format!(
+                "[[fleet.hosts]]\nname = \"workbox\"\nkind = {kind:?}\ntarget = \"workbox\"\nsession = \"bad name\"\n"
+            ));
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.starts_with(
+                        "invalid fleet host session: fleet.hosts[0].session = \"bad name\"",
+                    )
+                }),
+                "{kind}: {diagnostics:?}"
+            );
+        }
+
+        let diagnostics = fleet_diagnostics(
+            "[[fleet.hosts]]\nname = \"workbox\"\ntarget = \"workbox\"\nsession = \"\"\n",
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("session name cannot be empty"));
+    }
+
+    #[test]
+    fn fleet_diagnostics_still_validate_disabled_hosts_and_stay_ordered() {
+        let diagnostics = fleet_diagnostics(
+            r#"
+[[fleet.hosts]]
+name = "workbox"
+enabled = false
+
+[[fleet.hosts]]
+name = "bad/name"
+target = "other"
+"#,
+        );
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("fleet.hosts[0].target"));
+        assert!(diagnostics[1].contains("fleet.hosts[1].name"));
+    }
+
+    #[test]
+    fn collect_diagnostics_includes_fleet_diagnostics() {
+        let config = fleet_config(
+            r#"
+[[fleet.hosts]]
+name = "workbox"
+target = "workbox"
+
+[[fleet.hosts]]
+name = "workbox"
+target = "workbox"
+"#,
+        );
+        assert_eq!(config.collect_diagnostics(), config.fleet.diagnostics());
+        assert!(Config::default().collect_diagnostics().is_empty());
     }
 }
