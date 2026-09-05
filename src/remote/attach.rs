@@ -198,7 +198,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RemotePlatform {
+pub(crate) struct RemotePlatform {
     os: &'static str,
     arch: &'static str,
 }
@@ -218,7 +218,7 @@ impl RemotePlatform {
         Some(Self { os, arch })
     }
 
-    fn local() -> Self {
+    pub(crate) fn local() -> Self {
         let os = if cfg!(target_os = "linux") {
             "linux"
         } else if cfg!(target_os = "macos") {
@@ -244,14 +244,14 @@ impl RemotePlatform {
 }
 
 #[derive(Debug, Clone)]
-struct RemoteHerdr {
+pub(crate) struct RemoteHerdr {
     install_suffix: String,
-    shell_path: String,
+    pub(crate) shell_path: String,
     platform: RemotePlatform,
 }
 
 impl RemoteHerdr {
-    fn for_platform(platform: RemotePlatform) -> Self {
+    pub(crate) fn for_platform(platform: RemotePlatform) -> Self {
         let install_suffix = ".local/bin/herdr".to_string();
         let shell_path = format!("\"$HOME/{install_suffix}\"");
         Self {
@@ -261,7 +261,7 @@ impl RemoteHerdr {
         }
     }
 
-    fn with_shell_path(mut self, shell_path: String) -> Self {
+    pub(crate) fn with_shell_path(mut self, shell_path: String) -> Self {
         self.shell_path = shell_path;
         self
     }
@@ -398,7 +398,7 @@ struct PreparedRemoteHerdr {
 }
 
 #[derive(Clone)]
-struct ManagedSshOptions {
+pub(crate) struct ManagedSshOptions {
     config_path: PathBuf,
     control_path: Option<PathBuf>,
 }
@@ -415,13 +415,13 @@ impl Drop for ManagedSshConfig {
     }
 }
 
-struct RemoteSsh {
+pub(crate) struct RemoteSsh {
     target: String,
     managed_config: Option<ManagedSshConfig>,
 }
 
 impl RemoteSsh {
-    fn new(target: String, manage_ssh_config: bool) -> Self {
+    pub(crate) fn new(target: String, manage_ssh_config: bool) -> Self {
         let managed_config = if manage_ssh_config {
             write_managed_ssh_config()
                 .inspect_err(|err| {
@@ -438,27 +438,27 @@ impl RemoteSsh {
         }
     }
 
-    fn target(&self) -> &str {
+    pub(crate) fn target(&self) -> &str {
         &self.target
     }
 
-    fn options(&self) -> Option<&ManagedSshOptions> {
+    pub(crate) fn options(&self) -> Option<&ManagedSshOptions> {
         self.managed_config.as_ref().map(|config| &config.options)
     }
 
-    fn command(&self) -> Command {
+    pub(crate) fn command(&self) -> Command {
         let mut command = self.base_command();
         command.arg("-T").arg(&self.target);
         command
     }
 
-    fn base_command(&self) -> Command {
+    pub(crate) fn base_command(&self) -> Command {
         let mut command = Command::new("ssh");
         apply_managed_ssh_options(&mut command, self.options());
         command
     }
 
-    fn sh_output(&self, script: &str) -> io::Result<Output> {
+    pub(crate) fn sh_output(&self, script: &str) -> io::Result<Output> {
         let mut child = self
             .command()
             .arg("/bin/sh -s")
@@ -480,7 +480,7 @@ impl RemoteSsh {
         Ok(output)
     }
 
-    fn user_shell_output(&self, command: &str) -> io::Result<Output> {
+    pub(crate) fn user_shell_output(&self, command: &str) -> io::Result<Output> {
         self.command().arg(command).output()
     }
 
@@ -650,17 +650,11 @@ fn prepare_remote_herdr(
     let remote_binary_candidates = remote_binary_candidates(ssh, &remote_herdr)?;
 
     if override_binary.is_none() {
-        for candidate in &remote_binary_candidates {
-            if remote_binary_supports_endpoint(ssh, candidate).unwrap_or(false) {
-                return Ok(PreparedRemoteHerdr {
-                    remote_herdr: candidate.clone(),
-                    stop_after_install_approved: false,
-                });
-            }
-        }
-        if remote_binary_supports_endpoint(ssh, &remote_herdr)? {
+        if let Some(discovered) =
+            first_remote_herdr_supporting_endpoint(ssh, &remote_herdr, &remote_binary_candidates)?
+        {
             return Ok(PreparedRemoteHerdr {
-                remote_herdr,
+                remote_herdr: discovered,
                 stop_after_install_approved: false,
             });
         }
@@ -703,7 +697,45 @@ fn prepare_remote_herdr(
     })
 }
 
-fn detect_remote_platform(ssh: &RemoteSsh) -> io::Result<RemotePlatform> {
+/// The discovery half of [`prepare_remote_herdr`]: the first remote herdr on
+/// `ssh`'s host that reports this client's endpoint generation.
+///
+/// Never reads `HERDR_REMOTE_BINARY`, never installs or uploads a binary,
+/// never stops or hands off a remote server, and never prompts. A host with
+/// no compatible herdr is `Ok(None)`; only transport failures are `Err`.
+// Consumed by `src/fleet/transport/ssh.rs` (E1 PR 6); `herdr --remote` keeps
+// using `prepare_remote_herdr`, which shares the probe helper below.
+#[allow(dead_code)]
+pub(crate) fn discover_remote_herdr(ssh: &RemoteSsh) -> io::Result<Option<RemoteHerdr>> {
+    let platform = detect_remote_platform(ssh)?;
+    let remote_herdr = RemoteHerdr::for_platform(platform);
+    let candidates = remote_binary_candidates(ssh, &remote_herdr)?;
+    first_remote_herdr_supporting_endpoint(ssh, &remote_herdr, &candidates)
+}
+
+/// Probe `candidates` in order, then the default install path, for a remote
+/// herdr speaking this client's endpoint generation.
+///
+/// Candidate probe failures are treated as "not compatible" (a candidate can
+/// disappear between discovery and the probe); a failure probing the default
+/// install path propagates, matching `prepare_remote_herdr` before the split.
+fn first_remote_herdr_supporting_endpoint(
+    ssh: &RemoteSsh,
+    default_herdr: &RemoteHerdr,
+    candidates: &[RemoteHerdr],
+) -> io::Result<Option<RemoteHerdr>> {
+    for candidate in candidates {
+        if remote_binary_supports_endpoint(ssh, candidate).unwrap_or(false) {
+            return Ok(Some(candidate.clone()));
+        }
+    }
+    if remote_binary_supports_endpoint(ssh, default_herdr)? {
+        return Ok(Some(default_herdr.clone()));
+    }
+    Ok(None)
+}
+
+pub(crate) fn detect_remote_platform(ssh: &RemoteSsh) -> io::Result<RemotePlatform> {
     let output = ssh.sh_output("uname -s\nuname -m\n")?;
     if !output.status.success() {
         return Err(command_failed("remote platform detection failed", &output));
@@ -722,7 +754,7 @@ fn detect_remote_platform(ssh: &RemoteSsh) -> io::Result<RemotePlatform> {
     })
 }
 
-fn remote_binary_candidates(
+pub(crate) fn remote_binary_candidates(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<Vec<RemoteHerdr>> {
@@ -859,7 +891,7 @@ fn is_mise_shim_path(path: &str) -> bool {
     path.ends_with("/mise/shims/herdr")
 }
 
-fn remote_client_status(
+pub(crate) fn remote_client_status(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<Option<RemoteClientStatusJson>> {
@@ -876,7 +908,7 @@ fn remote_client_status(
     )))
 }
 
-fn remote_binary_supports_endpoint(
+pub(crate) fn remote_binary_supports_endpoint(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<bool> {
@@ -1206,7 +1238,7 @@ fn remote_server_status(
 }
 
 #[derive(Debug, Deserialize)]
-struct RemoteClientStatusJson {
+pub(crate) struct RemoteClientStatusJson {
     #[serde(default)]
     version: Option<String>,
     #[serde(default)]
@@ -1614,7 +1646,7 @@ fn confirm_remote_install(
     Ok(())
 }
 
-fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> String {
+pub(crate) fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> String {
     let mut command = format!("exec {}", remote_herdr.shell_path);
     if session_name != crate::session::DEFAULT_SESSION_NAME {
         command.push_str(" --session ");
@@ -1658,7 +1690,7 @@ fn command_failed(context: &str, output: &Output) -> io::Error {
     }
 }
 
-struct SshStdioBridge {
+pub(crate) struct SshStdioBridge {
     local_socket: PathBuf,
     socket_identity: crate::ipc::SocketFileIdentity,
     should_stop: Arc<AtomicBool>,
@@ -1666,12 +1698,32 @@ struct SshStdioBridge {
 }
 
 impl SshStdioBridge {
-    fn start(
+    pub(crate) fn start(
         target: String,
         remote_herdr: RemoteHerdr,
         local_socket: PathBuf,
         session_name: String,
         ssh_options: Option<&ManagedSshOptions>,
+    ) -> io::Result<Self> {
+        Self::start_with(
+            target,
+            remote_herdr,
+            local_socket,
+            session_name,
+            ssh_options,
+            BridgeErrorSink::Stderr,
+        )
+    }
+
+    /// `start`, with the accept thread's per-connection failures routed to
+    /// `errors` instead of the process stderr.
+    pub(crate) fn start_with(
+        target: String,
+        remote_herdr: RemoteHerdr,
+        local_socket: PathBuf,
+        session_name: String,
+        ssh_options: Option<&ManagedSshOptions>,
+        errors: BridgeErrorSink,
     ) -> io::Result<Self> {
         crate::ipc::prepare_socket_path(&local_socket, |path| {
             format!("remote bridge is already listening at {}", path.display())
@@ -1714,14 +1766,14 @@ impl SshStdioBridge {
                             thread_ssh_options.as_ref(),
                             &thread_stop,
                         ) {
-                            eprintln!("herdr: remote bridge failed: {err}");
+                            errors.report(format!("remote bridge failed: {err}"));
                         }
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(BRIDGE_ACCEPT_POLL);
                     }
                     Err(err) => {
-                        eprintln!("herdr: remote bridge listener failed: {err}");
+                        errors.report(format!("remote bridge listener failed: {err}"));
                         break;
                     }
                 }
@@ -1734,6 +1786,36 @@ impl SshStdioBridge {
             should_stop,
             thread: Some(thread),
         })
+    }
+}
+
+/// Where [`SshStdioBridge`]'s accept thread reports per-connection failures.
+///
+/// `Stderr` keeps `herdr --remote`'s output byte-for-byte unchanged. `Report`
+/// lets a long-lived caller turn a bridge failure into host-local state
+/// instead of terminal noise. The callback runs on the bridge's accept thread
+/// between connections, so it must return promptly; a panic inside it is
+/// contained and logged rather than allowed to kill the listener.
+#[derive(Clone)]
+pub(crate) enum BridgeErrorSink {
+    Stderr,
+    // Constructed by `src/fleet/transport/ssh.rs` (E1 PR 6).
+    #[allow(dead_code)]
+    Report(Arc<dyn Fn(String) + Send + Sync>),
+}
+
+impl BridgeErrorSink {
+    fn report(&self, message: String) {
+        match self {
+            Self::Stderr => eprintln!("herdr: {message}"),
+            Self::Report(report) => {
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report(message)));
+                if outcome.is_err() {
+                    tracing::error!("remote bridge error sink panicked; report dropped");
+                }
+            }
+        }
     }
 }
 
@@ -2141,14 +2223,45 @@ fn run_client_process(
     }
 }
 
-fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
+pub(crate) fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
+    local_forward_socket_path_scoped("", target, session_name)
+}
+
+/// `local_forward_socket_path`, disambiguated by `scope` so two callers that
+/// share a target and session (two fleet hosts pointing at the same machine)
+/// do not fight over one socket file.
+///
+/// An empty `scope` reproduces `--remote`'s names byte-for-byte: the scope is
+/// folded into the readable name and the hash only when it is non-empty. The
+/// readable form is not injective (`scope` `a` + target `b-c` reads like
+/// scope `a-b` + target `c`); the hashed form is what keeps distinct inputs
+/// apart, and a same-process clash surfaces as `prepare_socket_path`'s
+/// "already listening" error rather than a shared socket.
+pub(crate) fn local_forward_socket_path_scoped(
+    scope: &str,
+    target: &str,
+    session_name: &str,
+) -> PathBuf {
     let pid = std::process::id();
     let target_clean = sanitize_path_component(target);
     let session_clean = sanitize_path_component(session_name);
-    let readable_name = format!("herdr-remote-{pid}-{target_clean}-{session_clean}.sock");
     let target_prefix: String = target_clean.chars().take(8).collect();
-    let hash = short_socket_hash(target, session_name);
-    let short_name = format!("herdr-r-{pid}-{target_prefix}-{hash}.sock");
+    let hash = short_socket_hash_scoped(scope, target, session_name);
+    // Branch on the raw scope, exactly like the hash does, so a scope that
+    // sanitizes to nothing still yields a scoped (and consistent) name.
+    let (readable_name, short_name) = if scope.is_empty() {
+        (
+            format!("herdr-remote-{pid}-{target_clean}-{session_clean}.sock"),
+            format!("herdr-r-{pid}-{target_prefix}-{hash}.sock"),
+        )
+    } else {
+        let scope_clean = sanitize_path_component(scope);
+        let scope_prefix: String = scope_clean.chars().take(8).collect();
+        (
+            format!("herdr-remote-{pid}-{scope_clean}-{target_clean}-{session_clean}.sock"),
+            format!("herdr-r-{pid}-{scope_prefix}-{target_prefix}-{hash}.sock"),
+        )
+    };
     crate::platform::remote_bridge_endpoint_path(&readable_name, &short_name)
 }
 
@@ -2159,10 +2272,15 @@ fn fits_unix_socket_path(path: &Path) -> bool {
     path.as_os_str().as_bytes().len() <= 103
 }
 
-fn short_socket_hash(target: &str, session: &str) -> String {
+fn short_socket_hash_scoped(scope: &str, target: &str, session: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
+    // An empty scope must hash exactly as it did before the scope existed.
+    if !scope.is_empty() {
+        scope.hash(&mut hasher);
+        0u8.hash(&mut hasher);
+    }
     target.hash(&mut hasher);
     0u8.hash(&mut hasher);
     session.hash(&mut hasher);
@@ -3361,5 +3479,610 @@ mod tests {
         InstallSource::temporary(path, dir.clone()).cleanup();
 
         assert!(!dir.exists());
+    }
+
+    // --- Characterization tests for the E1 PR 3 SSH transport refactor ---
+    //
+    // These pin `herdr --remote`'s observable SSH behaviour (bridge command
+    // string, forward socket names, discovery vs. `HERDR_REMOTE_BINARY`
+    // ordering, and a real byte round-trip through the stdio bridge) so the
+    // reuse refactor cannot change it.
+
+    #[test]
+    fn remote_bridge_command_appends_named_session() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        assert_eq!(
+            remote_bridge_command(&remote_herdr, "lab-1"),
+            "exec \"$HOME/.local/bin/herdr\" --session lab-1 remote-client-bridge"
+        );
+    }
+
+    #[test]
+    fn remote_bridge_command_quotes_unusual_session_and_binary() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        })
+        .with_shell_path("'/opt/h e/herdr'".to_string());
+        assert_eq!(
+            remote_bridge_command(&remote_herdr, "a b"),
+            "exec '/opt/h e/herdr' --session 'a b' remote-client-bridge"
+        );
+    }
+
+    /// Sets (or unsets) one process env var and restores the prior value on
+    /// drop, so a panicking test cannot leak it into the next one. Callers
+    /// must hold `remote_env_lock()`.
+    #[cfg(unix)]
+    struct EnvVarGuard {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: Option<&std::ffi::OsStr>) -> Self {
+            let prior = std::env::var_os(key);
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            Self { key, prior }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn with_tmpdir<R>(dir: &Path, body: impl FnOnce() -> R) -> R {
+        let _tmpdir = EnvVarGuard::set("TMPDIR", Some(dir.as_os_str()));
+        body()
+    }
+
+    /// A directory name long enough that no socket name fits under it, unique
+    /// to this process so parallel test runs never share it. Nothing checks
+    /// that it exists; `remote_bridge_endpoint_path` only measures the path.
+    #[cfg(unix)]
+    fn overlong_tmpdir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "herdr-{tag}-{}-{}",
+            std::process::id(),
+            "x".repeat(64)
+        ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_forward_socket_path_names_match_pre_refactor_goldens() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let pid = std::process::id();
+        // Golden strings captured from `master` before the refactor; the
+        // readable form is used when TMPDIR is short, the hashed short form
+        // when it is not.
+        let cases = [
+            (
+                "user@example.com",
+                "work",
+                format!("herdr-remote-{pid}-user-example.com-work.sock"),
+                format!("herdr-r-{pid}-user-exa-6bd0228ee4bfbc7e.sock"),
+            ),
+            (
+                "dev",
+                "default",
+                format!("herdr-remote-{pid}-dev-default.sock"),
+                format!("herdr-r-{pid}-dev-eda958cb6a858d62.sock"),
+            ),
+            (
+                "herdr-ssh-lab",
+                "lab-1",
+                format!("herdr-remote-{pid}-herdr-ssh-lab-lab-1.sock"),
+                format!("herdr-r-{pid}-herdr-ss-92acab754136d732.sock"),
+            ),
+            (
+                "longish-host.example.com",
+                "a-fairly-long-session-name-here",
+                format!(
+                    "herdr-remote-{pid}-longish-host.example.com-a-fairly-long-session-name-here.sock"
+                ),
+                format!("herdr-r-{pid}-longish--cca164f07943a811.sock"),
+            ),
+        ];
+
+        let long_dir = overlong_tmpdir("golden");
+        let observed: Vec<(PathBuf, PathBuf)> = cases
+            .iter()
+            .map(|(target, session, _, _)| {
+                (
+                    with_tmpdir(Path::new("/tmp"), || {
+                        local_forward_socket_path(target, session)
+                    }),
+                    with_tmpdir(&long_dir, || local_forward_socket_path(target, session)),
+                )
+            })
+            .collect();
+
+        for ((target, session, readable, short), (readable_path, short_path)) in
+            cases.iter().zip(observed.iter())
+        {
+            assert_eq!(
+                readable_path,
+                &PathBuf::from(format!("/tmp/{readable}")),
+                "readable socket name for {target}/{session}"
+            );
+            assert_eq!(
+                short_path,
+                &PathBuf::from(format!("/tmp/{short}")),
+                "hashed socket name for {target}/{session}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    struct FakeSsh {
+        dir: PathBuf,
+        trace: PathBuf,
+        prior_path: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl FakeSsh {
+        /// Write an `ssh` shim into a private directory and prepend it to
+        /// `PATH`. Callers must hold `remote_env_lock()`.
+        fn install(name: &str, body: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let dir =
+                std::env::temp_dir().join(format!("herdr-fake-ssh-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("create fake ssh dir");
+            let trace = dir.join("argv.log");
+            let script = body.replace("__TRACE__", &trace.display().to_string());
+            let ssh = dir.join("ssh");
+            fs::write(&ssh, script).expect("write fake ssh");
+            fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).expect("chmod fake ssh");
+
+            let prior_path = std::env::var_os("PATH");
+            let joined = match &prior_path {
+                Some(value) => {
+                    let mut entries = vec![dir.clone()];
+                    entries.extend(std::env::split_paths(value));
+                    std::env::join_paths(entries).expect("join PATH")
+                }
+                None => dir.clone().into_os_string(),
+            };
+            std::env::set_var("PATH", joined);
+
+            Self {
+                dir,
+                trace,
+                prior_path,
+            }
+        }
+
+        fn trace(&self) -> String {
+            fs::read_to_string(&self.trace).unwrap_or_default()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeSsh {
+        fn drop(&mut self) {
+            match self.prior_path.take() {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// An `ssh` shim that answers herdr's remote discovery probes. `status
+    /// client --json` reports `generation`; `status server --json` always
+    /// fails so the interactive install path stops before prompting.
+    #[cfg(unix)]
+    fn discovery_shim(generation: Option<u32>, on_path: bool) -> String {
+        let client_status = match generation {
+            Some(generation) => format!(
+                "printf '%s\\n' '{{\"version\":\"0.0.0-test\",\"protocol\":22,\"endpoint_protocol_generation\":{generation}}}'; exit 0"
+            ),
+            None => "exit 1".to_string(),
+        };
+        let path_probe = if on_path {
+            "printf '/opt/herdr/bin/herdr\\n'; exit 0"
+        } else {
+            "exit 1"
+        };
+        format!(
+            r#"#!/bin/sh
+trace='__TRACE__'
+printf 'ARGV %s\n' "$*" >> "$trace"
+last=''
+for arg in "$@"; do last="$arg"; done
+payload="$last"
+if [ "$last" = '/bin/sh -s' ]; then
+  payload=$(cat)
+fi
+printf 'PAYLOAD %s\n' "$payload" >> "$trace"
+case "$payload" in
+  *'uname -s'*) printf 'Linux\nx86_64\n'; exit 0 ;;
+  *'status client --json'*) {client_status} ;;
+  *'status server --json'*) printf 'no server\n' >&2; exit 3 ;;
+  *'command -v herdr'*) {path_probe} ;;
+  *) exit 0 ;;
+esac
+"#
+        )
+    }
+
+    #[cfg(unix)]
+    fn without_remote_binary_override<R>(body: impl FnOnce() -> R) -> R {
+        let _override = EnvVarGuard::set(REMOTE_BINARY_ENV_VAR, None);
+        body()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_remote_herdr_returns_first_generation_one_candidate() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let ssh_shim = FakeSsh::install("prepare-ok", &discovery_shim(Some(1), true));
+
+        let prepared = without_remote_binary_override(|| {
+            let ssh = RemoteSsh::new("charact-host".to_string(), false);
+            prepare_remote_herdr(&ssh, false)
+        })
+        .expect("discovery finds the generation-1 binary");
+
+        assert_eq!(prepared.remote_herdr.shell_path, "/opt/herdr/bin/herdr");
+        assert!(!prepared.stop_after_install_approved);
+        let trace = ssh_shim.trace();
+        assert!(
+            trace.contains("ARGV -T charact-host /bin/sh -s"),
+            "trace: {trace}"
+        );
+        assert!(
+            trace.contains(
+                "PAYLOAD test -x /opt/herdr/bin/herdr && /opt/herdr/bin/herdr status client --json"
+            ),
+            "trace: {trace}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_remote_herdr_applies_binary_override_before_discovery() {
+        let _guard = remote_env_lock().lock().unwrap();
+        if io::stdin().is_terminal() {
+            // The install path this test walks prompts on a tty. nextest runs
+            // tests without one; skip rather than block an interactive run.
+            return;
+        }
+        let ssh_shim = FakeSsh::install("prepare-override", &discovery_shim(Some(1), true));
+        let override_binary = ssh_shim.dir.join("override-herdr");
+        fs::write(&override_binary, b"not a real binary").expect("write override binary");
+
+        let result = {
+            let _override =
+                EnvVarGuard::set(REMOTE_BINARY_ENV_VAR, Some(override_binary.as_os_str()));
+            let ssh = RemoteSsh::new("charact-host".to_string(), false);
+            prepare_remote_herdr(&ssh, false)
+        };
+
+        let err = result.err().expect("override skips the discovery shortcut");
+        assert!(
+            err.to_string()
+                .contains("could not inspect the running remote herdr server on charact-host"),
+            "unexpected error: {err}"
+        );
+        let trace = ssh_shim.trace();
+        assert!(
+            !trace.contains("status client --json"),
+            "override must skip endpoint discovery probes; trace: {trace}"
+        );
+        assert!(
+            trace.contains("status server --json"),
+            "override must reach the install path; trace: {trace}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_proxies_a_local_connection_through_ssh_stdio() {
+        use std::io::Read as _;
+
+        let _guard = remote_env_lock().lock().unwrap();
+        let ssh_shim = FakeSsh::install(
+            "bridge-echo",
+            "#!/bin/sh\nprintf 'ARGV %s\\n' \"$*\" >> '__TRACE__'\nexec cat\n",
+        );
+
+        let socket = std::env::temp_dir().join(format!(
+            "herdr-bridge-proxy-test-{}.sock",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&socket);
+        let bridge = SshStdioBridge::start(
+            "bridge-host".to_string(),
+            RemoteHerdr::for_platform(RemotePlatform::local()),
+            socket.clone(),
+            "lab-1".to_string(),
+            None,
+        )
+        .expect("start bridge listener");
+
+        let mut client = crate::ipc::connect_local_stream(&socket).expect("connect to bridge");
+        client.write_all(b"ping").expect("write to bridge");
+        client.flush().expect("flush bridge write");
+        let mut echoed = [0_u8; 4];
+        client.read_exact(&mut echoed).expect("read bridge echo");
+        assert_eq!(&echoed, b"ping");
+
+        drop(client);
+        drop(bridge);
+
+        assert!(!socket.exists(), "bridge socket was not unlinked");
+        let trace = ssh_shim.trace();
+        assert!(
+            trace.contains(
+                "ARGV -T bridge-host exec \"$HOME/.local/bin/herdr\" --session lab-1 remote-client-bridge"
+            ),
+            "trace: {trace}"
+        );
+    }
+
+    // --- Reuse surface added by E1 PR 3 (consumed by src/fleet in PR 6) ---
+
+    #[test]
+    fn local_forward_socket_path_scoped_is_unscoped_for_the_empty_scope() {
+        for (target, session) in [
+            ("user@example.com", "work"),
+            ("dev", "default"),
+            ("herdr-ssh-lab", "lab-1"),
+            (
+                "longish-host.example.com",
+                "a-fairly-long-session-name-here",
+            ),
+        ] {
+            assert_eq!(
+                local_forward_socket_path_scoped("", target, session),
+                local_forward_socket_path(target, session),
+                "scoped path for {target}/{session} must match the unscoped name"
+            );
+        }
+    }
+
+    #[test]
+    fn local_forward_socket_path_scoped_separates_hosts_sharing_a_target() {
+        let unscoped = local_forward_socket_path("herdr-ssh-lab", "lab-1");
+        let first = local_forward_socket_path_scoped("box-a", "herdr-ssh-lab", "lab-1");
+        let second = local_forward_socket_path_scoped("box-b", "herdr-ssh-lab", "lab-1");
+
+        assert_ne!(first, second);
+        assert_ne!(first, unscoped);
+        assert_ne!(second, unscoped);
+
+        // A scope that sanitizes to nothing is still a scope: only the empty
+        // string means "unscoped", in the readable name and the hash alike.
+        let punctuation = local_forward_socket_path_scoped("///", "herdr-ssh-lab", "lab-1");
+        assert_ne!(punctuation, unscoped);
+        assert_ne!(punctuation, first);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_forward_socket_path_scoped_keeps_the_scope_in_both_name_forms() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let pid = std::process::id();
+
+        let readable = with_tmpdir(Path::new("/tmp"), || {
+            local_forward_socket_path_scoped("box-a", "herdr-ssh-lab", "lab-1")
+        });
+        let long_dir = overlong_tmpdir("scoped");
+        let short = with_tmpdir(&long_dir, || {
+            local_forward_socket_path_scoped("box-a", "herdr-ssh-lab", "lab-1")
+        });
+
+        assert_eq!(
+            readable,
+            PathBuf::from(format!(
+                "/tmp/herdr-remote-{pid}-box-a-herdr-ssh-lab-lab-1.sock"
+            ))
+        );
+        let short_name = short
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            short_name.starts_with(&format!("herdr-r-{pid}-box-a-herdr-ss-")),
+            "hashed name lost the scope: {short_name}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_remote_herdr_returns_the_generation_one_binary() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let ssh_shim = FakeSsh::install("discover-ok", &discovery_shim(Some(1), true));
+
+        let ssh = RemoteSsh::new("discover-host".to_string(), false);
+        let discovered = discover_remote_herdr(&ssh).expect("discovery succeeds");
+
+        assert_eq!(
+            discovered.map(|herdr| herdr.shell_path),
+            Some("/opt/herdr/bin/herdr".to_string())
+        );
+        let trace = ssh_shim.trace();
+        assert!(
+            !trace.contains("status server --json"),
+            "discovery must not inspect the remote server; trace: {trace}"
+        );
+        assert!(
+            !trace.contains("mkdir -p"),
+            "discovery must not prepare an install; trace: {trace}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_remote_herdr_rejects_an_incompatible_generation() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let ssh_shim = FakeSsh::install("discover-gen2", &discovery_shim(Some(2), true));
+
+        let ssh = RemoteSsh::new("discover-host".to_string(), false);
+        let discovered = discover_remote_herdr(&ssh).expect("discovery succeeds");
+
+        assert!(discovered.is_none());
+        let trace = ssh_shim.trace();
+        assert!(
+            !trace.contains("status server --json") && !trace.contains("mkdir -p"),
+            "discovery must not fall through to the install path; trace: {trace}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_remote_herdr_reports_no_binary_as_none() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let _ssh_shim = FakeSsh::install("discover-missing", &discovery_shim(None, false));
+
+        let ssh = RemoteSsh::new("discover-host".to_string(), false);
+
+        assert!(discover_remote_herdr(&ssh)
+            .expect("discovery succeeds")
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_remote_herdr_ignores_the_binary_override() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let ssh_shim = FakeSsh::install("discover-override", &discovery_shim(Some(1), true));
+        let override_binary = ssh_shim.dir.join("override-herdr");
+        fs::write(&override_binary, b"not a real binary").expect("write override binary");
+
+        let discovered = {
+            let _override =
+                EnvVarGuard::set(REMOTE_BINARY_ENV_VAR, Some(override_binary.as_os_str()));
+            let ssh = RemoteSsh::new("discover-host".to_string(), false);
+            discover_remote_herdr(&ssh)
+        };
+
+        assert_eq!(
+            discovered
+                .expect("discovery succeeds")
+                .map(|herdr| herdr.shell_path),
+            Some("/opt/herdr/bin/herdr".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_error_sink_reports_a_failing_ssh_child() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let _ssh_shim = FakeSsh::install(
+            "bridge-fail",
+            "#!/bin/sh\nprintf 'ARGV %s\\n' \"$*\" >> '__TRACE__'\nexit 7\n",
+        );
+
+        let reported: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_reported = Arc::clone(&reported);
+        let socket = std::env::temp_dir().join(format!(
+            "herdr-bridge-sink-test-{}.sock",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&socket);
+        let bridge = SshStdioBridge::start_with(
+            "bridge-host".to_string(),
+            RemoteHerdr::for_platform(RemotePlatform::local()),
+            socket.clone(),
+            "lab-1".to_string(),
+            None,
+            BridgeErrorSink::Report(Arc::new(move |message| {
+                if let Ok(mut messages) = sink_reported.lock() {
+                    messages.push(message);
+                }
+            })),
+        )
+        .expect("start bridge listener");
+
+        let client = crate::ipc::connect_local_stream(&socket).expect("connect to bridge");
+        drop(client);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen = reported.lock().expect("sink lock").clone();
+            if !seen.is_empty() {
+                assert_eq!(
+                    seen,
+                    vec!["remote bridge failed: ssh bridge exited with exit status: 7".to_string()]
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "bridge never reported a failure");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        drop(bridge);
+        assert!(!socket.exists(), "bridge socket was not unlinked");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_survives_a_panicking_error_sink() {
+        use std::sync::atomic::AtomicUsize;
+
+        let _guard = remote_env_lock().lock().unwrap();
+        let _ssh_shim = FakeSsh::install(
+            "bridge-sink-panic",
+            "#!/bin/sh\nprintf 'ARGV %s\\n' \"$*\" >> '__TRACE__'\nexit 7\n",
+        );
+
+        let reports = Arc::new(AtomicUsize::new(0));
+        let sink_reports = Arc::clone(&reports);
+        let socket = std::env::temp_dir().join(format!(
+            "herdr-bridge-sink-panic-test-{}.sock",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&socket);
+        let bridge = SshStdioBridge::start_with(
+            "bridge-host".to_string(),
+            RemoteHerdr::for_platform(RemotePlatform::local()),
+            socket.clone(),
+            "lab-1".to_string(),
+            None,
+            BridgeErrorSink::Report(Arc::new(move |_message| {
+                sink_reports.fetch_add(1, Ordering::SeqCst);
+                panic!("sink panicked on purpose");
+            })),
+        )
+        .expect("start bridge listener");
+
+        // Two connections: the second is only accepted if the accept thread
+        // outlived the first report's panic.
+        for _ in 0..2 {
+            let seen_before = reports.load(Ordering::SeqCst);
+            let client = crate::ipc::connect_local_stream(&socket).expect("connect to bridge");
+            drop(client);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while reports.load(Ordering::SeqCst) == seen_before {
+                assert!(Instant::now() < deadline, "bridge stopped reporting");
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        assert_eq!(reports.load(Ordering::SeqCst), 2);
+
+        drop(bridge);
+        assert!(!socket.exists(), "bridge socket was not unlinked");
     }
 }
