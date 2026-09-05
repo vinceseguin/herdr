@@ -1,4 +1,11 @@
-# herdr fork — `vinceseguin/herdr`
+<p align="center"><img src="../../assets/fork/logo-192.png" width="96" height="96" alt="Herdr Fleet logo"></p>
+
+# Herdr Fleet — the `vinceseguin/herdr` fork
+
+**Herdr Fleet** (short name *Fleet*) is the product name of this fork. The
+binary, crate, config directories and protocol stay `herdr` so stock and fork
+servers remain interchangeable; the name and the mark in
+[`assets/fork/`](../../assets/fork/) appear only on fork-owned surfaces.
 
 A fork of [herdrdev/herdr](https://github.com/herdrdev/herdr) that adds a
 multi-machine console, a phone app, and private remote access. The plan is
