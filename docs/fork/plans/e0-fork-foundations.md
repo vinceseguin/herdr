@@ -210,7 +210,7 @@ epic dependency.
 | 2 | chore: add mise-based fork dev setup script and verify the gate | A · Repository | 1 | ✅ |
 | 3 | feat: fork build channel disables self-update and shows in version | B · Identity | 1 | ✅ |
 | 4 | feat: fleet lab script boots isolated named herdr sessions | C · Fleet lab | 1 | ✅ |
-| 5 | docs: fork readme for dev setup, ci, fleet lab; review adr 0001 | D · Docs | 2, 3, 4 | ⬜ |
+| 5 | docs: fork readme for dev setup, ci, fleet lab; review adr 0001 | D · Docs | 2, 3, 4 | ✅ |
 
 **Wave preview (2-agent cap):** W1 `[1]` → W2 `[2, 3]` → W3 `[4]` → W4 `[5]`.
 PR 4 only needs PR 1, so a wider cap could run it in W2; under the cap it
@@ -953,6 +953,65 @@ re-derive it.
 "Keeping up with upstream" block is dry-run up to `git merge upstream/master`
 (drift is 0, so the merge is a no-op) on a throwaway branch that is deleted
 afterwards without pushing.
+
+**Outcome (as merged)**
+
+- `docs/fork/README.md` was rewritten around the artifacts PRs 1-4 actually
+  shipped, not the plan text: *Development setup* now leads with
+  `bash scripts/fork/dev-setup.sh` and its three modes (plain / `--skip-ci` /
+  `--check`, plus `--help`), with a *The gate* subsection and a *Testing a debug
+  build by hand* subsection. New top-level sections: **Fork build identity**,
+  **Fleet lab**, **Continuous integration**. *Keeping up with upstream* and
+  *Repository notes* were rewritten; the *What the fork adds* table and the
+  skills table are unchanged.
+- Facts the README now carries that only exist because of PRs 1-4's *As built*
+  notes: the exact fork strings (`herdr 0.8.2-fork`, `self-update is disabled
+  for fork builds; see docs/fork/README.md`, `err="fork build: self-update
+  disabled; see docs/fork/README.md"`); the `HERDR_FLEET_LAB_TIMEOUT_MS` knob
+  and the short-root/`sun_path` (~104 byte) guard; that `env` exports
+  `HERDR_FLEET_LAB_RUNTIME_DIR` and deliberately **not** `XDG_RUNTIME_DIR`; the
+  three fork-CI check names (`conventional-commits`, `check (ubuntu-latest)`,
+  `shellcheck`) and both divergences from `ci.yml`; that the two dynamic
+  workflow entries never existed on this fork, so *ten* file-backed workflows
+  are `disabled_manually`; that `result.snapshot` (not `result`) holds the
+  snapshot; and the `herdr-dev` vs `herdr` config-dir split.
+- **The README's upstream-file list was corrected against reality**
+  (`git diff upstream/master origin/master`): the pre-E0 list named
+  `src/cli/spec.rs`, `src/config/model.rs` and `Cargo.toml`, none of which the
+  fork touches yet. It now names the twelve files that really carry fork
+  wiring, and states that `src/protocol/wire.rs`, `src/protocol/endpoint.rs`
+  and `tests/fixtures/endpoint-*.json` take upstream's side of any conflict.
+- **One documented command was wrong and was fixed by executing it.** The gate
+  example `bash scripts/fork/gate.sh . "test-one fleet_state"` matches no test
+  today, and nextest exits 4 on an empty filter, so the gate printed `EXIT=4`.
+  It now reads `"test-one fleet_lab"` (4 tests, `EXIT=0`) with a sentence
+  warning that an empty filter is `EXIT=4`, and the worktree example uses an
+  obvious `<branch-slug>` placeholder. **Later plans: a `test-one` filter must
+  name a test that exists.**
+- ADR 0001 gained an **E0 review** subsection under *Consequences* only; the
+  *Decision* is unamended. It records four verified facts: `--remote`
+  compatibility is decided by `endpoint_protocol_generation` +
+  `detached_server_daemon` with no version string involved (so a fork client
+  attaches to a stock server); `resolve_install_source` uploads the local
+  binary only for the same platform *and* a non-package-manager exe, otherwise
+  the stable-manifest lookup fails on `0.8.2-fork` with a message that does not
+  name `HERDR_REMOTE_BINARY` (E1 must surface it as a host-local
+  `Unavailable { reason }`); named local sessions are a real second host kind;
+  and `HERDR_CONFIG_PATH` outranks `XDG_CONFIG_HOME` for the config *file*
+  while session dirs follow `XDG_CONFIG_HOME` under `app_dir_name()`.
+- Validation was the README itself, executed verbatim on a clean shell:
+  `dev-setup.sh --check|--skip-ci|--help` → 0 (mise config byte-identical
+  before/after); `gate.sh` (no args) → `EXIT=0`; `gate.sh /nonexistent` →
+  `EXIT=2`; `herdr --version` → `herdr 0.8.2-fork`; `herdr update` → exit 1 with
+  the documented string; the debug-server block (`status server --json` →
+  `"version":"0.8.2-fork"`, socket under `.../herdr-dev/sessions/scratch/`);
+  `fleet-lab.sh up 2` → both sessions `running: true`, `status`/`status --json`/
+  `env` as documented, the snapshot one-liner → `0.8.2-fork ['lab-2']`,
+  `pane read` → `herdr-fleet-lab:lab-2`, a non-eval'd shell's
+  `herdr session list` → `['default']` only, `down` → root gone and no lab
+  process, `down` again → exit 0; and the upstream-sync block dry-run to
+  `git merge upstream/master` → `Already up to date.` on a throwaway branch that
+  was deleted without pushing.
 
 **Downstream**
 
