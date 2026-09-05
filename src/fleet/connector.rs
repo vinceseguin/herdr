@@ -43,14 +43,31 @@ use crate::protocol::{
 
 /// Surface size announced for a host nobody is looking at.
 ///
-/// The endpoint protocol has no "stop sending surfaces" message and this fork
-/// adds none, so an inactive host is asked for the smallest surface the server
-/// accepts instead. 20×5 was verified against a live 0.8.2-fork server: the
-/// welcome, the snapshot and the surface frames all arrive normally, and the
-/// frames are ~1/40th of a full-screen one. The server rejects 0 in either
-/// dimension (`client_transport::client_shell_geometry_error`), so this cannot
-/// shrink to zero.
-pub const INACTIVE_SURFACE: ClientSurfaceSize = ClientSurfaceSize { cols: 20, rows: 5 };
+/// Not "as small as the server accepts", which is what the plan's decision (e)
+/// assumed: validating against a live 0.8.2-fork server showed that a
+/// connecting client shell becomes that host's *foreground* client
+/// (`server::headless`'s `ClientShellConnected` arm), and the foreground
+/// client's surface is the host's effective geometry. A 20x5 fleet client
+/// therefore reflowed every pane on every configured host and sent each agent
+/// a 20x5 SIGWINCH — for a read-only `herdr fleet status`. The endpoint
+/// protocol has no observer mode and E1 changes no server code, so the fix is
+/// the value: herdr's own default headless geometry, which a host with no
+/// attached client is *already* using, making the common fleet case (headless
+/// servers running agents) a no-op resize.
+///
+/// The residual is unavoidable without a protocol change: a host that already
+/// has an attached client, or one whose `headless_size` is configured
+/// differently, is resized for as long as the fleet client is connected and
+/// restored when it disconnects. E2 should keep a fleet connection open only
+/// while the fleet console is in use.
+///
+/// The cost decision (e) was protecting is still paid where it matters: this
+/// client drops an inactive host's frames in the reader thread before anything
+/// reaches the event channel.
+pub const INACTIVE_SURFACE: ClientSurfaceSize = ClientSurfaceSize {
+    cols: crate::config::DEFAULT_HEADLESS_COLS,
+    rows: crate::config::DEFAULT_HEADLESS_ROWS,
+};
 
 /// How long the reconnect sleep waits between stop-flag checks.
 const STOP_CHECK_INTERVAL: Duration = Duration::from_millis(100);
@@ -1530,9 +1547,10 @@ mod tests {
             "beta",
             Behaviour::Serve(vec![snapshot_message(&snapshot("boot-beta", 1))]),
         );
+        // Deliberately different from `INACTIVE_SURFACE` in both dimensions.
         let active_surface = ClientSurfaceSize {
-            cols: 120,
-            rows: 40,
+            cols: 200,
+            rows: 60,
         };
         let options = FleetConnectorOptions {
             active_surface,
