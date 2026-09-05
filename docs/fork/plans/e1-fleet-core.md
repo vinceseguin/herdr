@@ -306,7 +306,7 @@ integration test that boots two named sessions and asserts the merged status.
 | 1 | feat: add fleet config section and host specs | A · Foundations | — | ✅ |
 | 2 | feat: pure fleet state merges host snapshots and renders a status report | A · Foundations | 1 | ⬜ |
 | 3 | refactor: expose ssh stdio bridge and remote discovery for reuse | B · Transport | 4 | ⬜ |
-| 4 | feat: ssh lab script runs a user-space sshd against the fleet lab | B · Transport | — | ⬜ |
+| 4 | feat: ssh lab script runs a user-space sshd against the fleet lab | B · Transport | — | ✅ |
 | 5 | feat: fleet connector streams local hosts and herdr fleet status reports them | C · Connector and CLI | 2 | ⬜ |
 | 6 | feat: fleet connector reaches ssh hosts through the shared bridge | C · Connector and CLI | 3, 5 | ⬜ |
 | 7 | docs: fleet core reference, ssh lab guide, adr review | D · Docs | 6 | ⬜ |
@@ -870,6 +870,15 @@ Evidence: `MARKER_SEEN`, unchanged checksums, one pid, exit 1 with the
 up` reports `sshd not found`, record it and validate steps 2–3 of the unit
 suite only — and say so in the PR body.
 
+*From PR 4 (shipped):* always run `ssh-lab.sh down` **before**
+`fleet-lab.sh down` — the fleet lab's `down` deletes `<root>/ssh` and the sshd
+pid file, after which the sshd cannot be identified. `ssh-lab.sh down` sweeps
+the listener's per-connection processes too, so the `ControlMaster`/
+`ControlPersist` master `RemoteSsh` opens does not keep the lab alive; there
+is no need to `ssh -O exit` by hand. `HERDR_SSH_LAB_SSHD` overrides the sshd
+binary and a bad value fails hard (exit 1), so a typo can never be mistaken
+for `sshd not found`.
+
 **Downstream**
 
 - PR 6 consumes exactly: `RemoteSsh::new(target, manage_ssh_config)`,
@@ -989,14 +998,44 @@ bash scripts/fork/ssh-lab.sh status --json; bash scripts/fork/ssh-lab.sh down; p
 bash scripts/fork/fleet-lab.sh down
 ```
 
-**Downstream**
+**Downstream** *(as shipped)*
 
-- `HERDR_SSH_LAB_HOME`, `HERDR_SSH_LAB_TARGET`, `HERDR_SSH_LAB_SSH_CONFIG`
-  and the alias `herdr-ssh-lab` are the fixture E1 PR 3/6, E5 and the E2E
-  validation rely on; add fields, never rename.
-- The remote side runs the same `HERDR_BIN` as the fleet lab, so `--remote`
-  and fleet SSH validations always exercise the debug build.
-- `support::fleet_lab::Lab` is the shared driver for later `tests/fork_*.rs`.
+- `env` exports exactly `HERDR_SSH_LAB_ROOT`, `HERDR_SSH_LAB_HOME`,
+  `HERDR_SSH_LAB_TARGET` (`herdr-ssh-lab`), `HERDR_SSH_LAB_PORT`,
+  `HERDR_SSH_LAB_SSH_CONFIG`; `status --json` has `root`, `port`, `running`,
+  `pid`, `target`, `home`, `ssh_config`. These are the fixture E1 PR 3/6, E5
+  and the E2E validation rely on; add fields, never rename. `up` exits 3 with
+  `sshd not found` only when the machine has no sshd.
+- The remote side runs the herdr binary recorded in the fleet lab's
+  `.herdr-fleet-lab` marker (`bin=`), not whatever `HERDR_BIN` happens to be
+  set to when `ssh-lab.sh` runs, so `--remote` and fleet SSH validations
+  always exercise the same build as the lab's servers. `HERDR_BIN` is only a
+  fallback for a marker without a `bin=` line.
+- `support::fleet_lab::Lab` is the shared driver for later `tests/fork_*.rs`
+  (`pub mod fleet_lab` under `tests/support/`, `Lab::new/up/run/run_with_bin/
+  herdr/runtime_dir` plus `stdout_of`/`stderr_of`/`unique_root`).
+- **Tear down `ssh-lab.sh down` *before* `fleet-lab.sh down`.** The fleet
+  lab's `down` deletes the whole root including `<root>/ssh` and the sshd pid
+  file, after which the sshd can no longer be identified; `ssh-lab.sh down`
+  then exits 0 with a hint naming the orphan instead of guessing at a pid.
+- `ssh-lab.sh down` stops the sshd listener **and** the per-connection
+  processes it still had. This is what PR 3/6 depend on: `RemoteSsh` opens a
+  `ControlMaster=auto ControlPersist=yes` master, whose session process
+  outlives the listener's SIGTERM and would otherwise keep the lab alive.
+- `HERDR_SSH_LAB_SSHD` overrides the sshd binary (absolute path). A
+  misconfigured override is a hard error (exit 1), never exit 3 — exit 3
+  makes callers skip SSH validation entirely and a typo must not do that
+  silently.
+- Lab root and herdr binary paths are restricted to `[A-Za-z0-9._/+@-]`:
+  both are embedded unquoted in `sshd_config`, in the remote `/bin/sh`
+  wrapper, and in `env` output callers `eval`.
+- The generated `sshd_config` is `AllowUsers <id -un>`, loopback-only, and
+  sets `PermitUserRC no` / `PermitUserEnvironment no` with an in-lab
+  `AuthorizedKeysFile`, so sshd never opens the caller's `~/.ssh/rc`,
+  `~/.ssh/authorized_keys` or `~/.ssh/environment` (it resolves those through
+  the passwd home, not `$HOME`). All forwarding is off; `attach.rs` only uses
+  `ssh -T <target> <cmd>` over stdio plus its own `-S` control socket, so
+  nothing PR 3/6 needs is blocked.
 
 ### PR 5 — feat: fleet connector streams local hosts and herdr fleet status reports them · deps: 2
 
@@ -1303,6 +1342,11 @@ the `nowhere` host check only, and record the degradation in the PR body.
 - Forward sockets live where `platform::remote_bridge_endpoint_path` puts
   them, one per `(pid, host id)`; E3's long-running gateway must call
   `shutdown` on exit so they are unlinked.
+- *From PR 4 (shipped):* tear the ssh lab down before the fleet lab, and rely
+  on `ssh-lab.sh down` to sweep the `ControlPersist` master's session process
+  — the `bash scripts/fork/ssh-lab.sh down; sleep 5; … up` reconnect step
+  above really does cut every ssh path to the lab, which is what makes the
+  host go `unavailable`.
 
 ### PR 7 — docs: fleet core reference, ssh lab guide, adr review · deps: 6
 

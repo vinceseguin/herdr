@@ -233,6 +233,20 @@ fn ssh_lab_reaches_the_debug_herdr_of_the_fleet_lab() {
         );
     }
 
+    // The remote side runs under the lab's fake HOME (sshd's `SetEnv HOME`),
+    // so nothing herdr resolves through `~` can land in the caller's home.
+    let remote_home = ssh_lab.ssh("printf %s \"$HOME\"");
+    assert!(
+        remote_home.status.success(),
+        "remote `printf $HOME` failed: {}",
+        stderr_of(&remote_home)
+    );
+    assert_eq!(
+        stdout_of(&remote_home),
+        ssh_lab.root().join("home").to_string_lossy(),
+        "remote HOME must be the lab home"
+    );
+
     // The remote side must resolve herdr to the lab's wrapper, not to anything
     // the invoking user has installed.
     let which = ssh_lab.ssh("command -v herdr");
