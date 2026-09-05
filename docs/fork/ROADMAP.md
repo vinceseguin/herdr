@@ -161,7 +161,7 @@ Owned by `implement-roadmap`. Legend: ✅ done · 🔨 in progress · ⬜ not st
 | Epic | Title | Depends on | Status | Plan |
 | --- | --- | --- | --- | --- |
 | E0 | Fork foundations, CI, fleet lab | — | ✅ | `docs/fork/plans/e0-fork-foundations.md` |
-| E1 | Fleet core (multi-host runtime model) | E0 | ⬜ | — |
+| E1 | Fleet core (multi-host runtime model) | E0 | 🔨 | `docs/fork/plans/e1-fleet-core.md` |
 | E2 | Fleet TUI (one console, every machine) | E1 | ⬜ | — |
 | E3 | Fleet gateway (HTTP + WebSocket) | E1 | ⬜ | — |
 | E4 | Phone app (installable PWA) | E3 | ⬜ | — |
