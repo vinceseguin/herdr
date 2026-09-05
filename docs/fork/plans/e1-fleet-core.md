@@ -305,7 +305,7 @@ integration test that boots two named sessions and asserts the merged status.
 | --- | --- | --- | --- | --- |
 | 1 | feat: add fleet config section and host specs | A · Foundations | — | ✅ |
 | 2 | feat: pure fleet state merges host snapshots and renders a status report | A · Foundations | 1 | ✅ |
-| 3 | refactor: expose ssh stdio bridge and remote discovery for reuse | B · Transport | 4 | ⬜ |
+| 3 | refactor: expose ssh stdio bridge and remote discovery for reuse | B · Transport | 4 | ✅ |
 | 4 | feat: ssh lab script runs a user-space sshd against the fleet lab | B · Transport | — | ✅ |
 | 5 | feat: fleet connector streams local hosts and herdr fleet status reports them | C · Connector and CLI | 2 | ⬜ |
 | 6 | feat: fleet connector reaches ssh hosts through the shared bridge | C · Connector and CLI | 3, 5 | ⬜ |
@@ -928,6 +928,58 @@ for `sshd not found`.
 - Any later upstream change to `attach.rs` is merged, never rewritten: keep
   the added items at the end of their sections to minimise conflict surface.
 
+**As shipped** (branch `refactor/e1-pr3-ssh-transport`, two commits: the
+characterization tests first, then the refactor). Exact `pub(crate)` surface
+in `src/remote/attach.rs`, all reachable through `crate::remote::*`:
+
+```rust
+pub(crate) struct RemoteSsh;                       // + new(String, bool), target(), options(),
+                                                   //   command(), base_command(), sh_output(&str),
+                                                   //   user_shell_output(&str)
+pub(crate) struct ManagedSshOptions;               // opaque; only passed back to start_with
+pub(crate) struct RemotePlatform;                  // + local()
+pub(crate) struct RemoteHerdr {                    // + for_platform(RemotePlatform),
+    pub(crate) shell_path: String, /* … */ }       //   with_shell_path(String)
+pub(crate) fn detect_remote_platform(&RemoteSsh) -> io::Result<RemotePlatform>;
+pub(crate) fn remote_binary_candidates(&RemoteSsh, &RemoteHerdr) -> io::Result<Vec<RemoteHerdr>>;
+pub(crate) fn remote_client_status(&RemoteSsh, &RemoteHerdr) -> io::Result<Option<RemoteClientStatusJson>>;
+pub(crate) fn remote_binary_supports_endpoint(&RemoteSsh, &RemoteHerdr) -> io::Result<bool>;
+pub(crate) fn discover_remote_herdr(&RemoteSsh) -> io::Result<Option<RemoteHerdr>>;
+pub(crate) fn remote_bridge_command(&RemoteHerdr, session_name: &str) -> String;
+pub(crate) fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf;
+pub(crate) fn local_forward_socket_path_scoped(scope: &str, target: &str, session_name: &str) -> PathBuf;
+#[derive(Clone)]
+pub(crate) enum BridgeErrorSink { Stderr, Report(Arc<dyn Fn(String) + Send + Sync>) }
+pub(crate) struct SshStdioBridge;
+impl SshStdioBridge {
+    pub(crate) fn start(String, RemoteHerdr, PathBuf, String, Option<&ManagedSshOptions>) -> io::Result<Self>;
+    pub(crate) fn start_with(String, RemoteHerdr, PathBuf, String, Option<&ManagedSshOptions>, BridgeErrorSink) -> io::Result<Self>;
+}
+```
+
+Deltas from the shapes above, all additive:
+
+- `remote_client_status` returning `RemoteClientStatusJson` forced that struct
+  to `pub(crate)` too (`private_interfaces` is denied by `clippy -D warnings`).
+- `RemoteHerdr.shell_path` is a `pub(crate)` **field**, not an accessor.
+- `short_socket_hash` became `short_socket_hash_scoped(scope, target, session)`
+  and folds `scope` into the hash only when it is non-empty, so the unscoped
+  names — readable *and* hashed — are byte-identical to `master`'s.
+- `prepare_remote_herdr` and `discover_remote_herdr` share one private
+  `first_remote_herdr_supporting_endpoint(ssh, default, candidates)` helper
+  instead of `prepare_remote_herdr` calling `discover_remote_herdr`: calling
+  discovery would repeat `detect_remote_platform` + `remote_binary_candidates`
+  (three extra ssh round-trips) because the install path still needs the
+  candidate list. Sharing the helper keeps the ssh calls, their order, and the
+  mixed error handling (candidate probes `unwrap_or(false)`, the default-path
+  probe `?`) exactly as on `master`.
+- `discover_remote_herdr` and `BridgeErrorSink::Report` carry
+  `#[allow(dead_code)]` with a reason comment naming PR 6. **PR 6 must delete
+  both allows** once `src/fleet/transport/ssh.rs` constructs them.
+- The `Stderr` sink still prints `herdr: remote bridge failed: {err}` and
+  `herdr: remote bridge listener failed: {err}`; the sink receives the message
+  without the `herdr: ` prefix.
+
 ### PR 4 — feat: ssh lab script runs a user-space sshd against the fleet lab · deps: —
 
 **Goal:** `scripts/fork/ssh-lab.sh up|down|status [--json]|env` turns the
@@ -1317,6 +1369,12 @@ impl HostTransport for SshTransport {
     fn describe(&self) -> String { format!("ssh {target}{session}") }
 }
 ```
+
+PR 3 shipped this API; see its **As shipped** block for the exact
+signatures. Two follow-ups belong to PR 6: delete the `#[allow(dead_code)]`
+on `discover_remote_herdr` and on `BridgeErrorSink::Report` once the transport
+constructs them, and read `RemoteHerdr.shell_path` as a field (there is no
+accessor).
 
 `session_name` = the host's `session` or `session::DEFAULT_SESSION_NAME`, so
 `remote_bridge_command` appends `--session` exactly as `--remote` does. The
