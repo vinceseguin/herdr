@@ -64,7 +64,13 @@ impl FleetSession {
             if remaining.is_zero() {
                 break;
             }
-            let received = self.connector.events().try_recv();
+            // A status collector never detaches the receiver, so `None` here
+            // would be a bug in this module rather than a host fact; treat it
+            // as "nothing else can arrive" instead of unwrapping.
+            let Some(events) = self.connector.events() else {
+                break;
+            };
+            let received = events.try_recv();
             match received {
                 Ok(event) => changes.extend(self.apply(event)),
                 Err(TryRecvError::Empty) => {
@@ -86,7 +92,7 @@ impl FleetSession {
     /// connector's receiver with `.await` instead.
     pub fn next_changes(&mut self) -> Option<Vec<FleetChange>> {
         loop {
-            let event = self.connector.events().blocking_recv()?;
+            let event = self.connector.events()?.blocking_recv()?;
             let changes = self.apply(event);
             if !changes.is_empty() {
                 return Some(changes);

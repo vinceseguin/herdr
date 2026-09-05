@@ -17,6 +17,11 @@
 //!   a tiny surface, and its surface frames are dropped in the reader thread
 //!   before anything is allocated into the event channel. Activation resizes
 //!   the new host up and the old host back down.
+//!
+//! Three mutexes are taken here, and always in this order:
+//! `active_host` → one host's `HostLinkState` → `active_geometry`. A
+//! supervisor thread never takes `active_host` (it reads its own `active`
+//! atomic instead). Nothing takes two host link locks at once.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,6 +74,46 @@ pub const INACTIVE_SURFACE: ClientSurfaceSize = ClientSurfaceSize {
     rows: crate::config::DEFAULT_HEADLESS_ROWS,
 };
 
+/// The geometry the console announces for whichever host is active.
+///
+/// One value rather than four parameters because every path that resizes the
+/// active host — the activation in [`FleetConnector::set_active`], a terminal
+/// resize through [`FleetConnector::set_active_geometry`], the hello a
+/// reconnecting active host sends — has to announce exactly the same thing.
+/// Splitting it is how the surface and the cell size drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveGeometry {
+    pub surface: ClientSurfaceSize,
+    pub cell_width_px: u32,
+    pub cell_height_px: u32,
+    pub pixel_mouse: bool,
+}
+
+impl ActiveGeometry {
+    /// The resize that announces this geometry.
+    fn resize_message(&self) -> ClientMessage {
+        ClientMessage::ClientShellResize {
+            cell_width_px: self.cell_width_px,
+            cell_height_px: self.cell_height_px,
+            surface_size: self.surface,
+            pixel_mouse: self.pixel_mouse,
+        }
+    }
+}
+
+impl Default for ActiveGeometry {
+    /// A read-only collector's geometry: the inactive size, no cell metrics,
+    /// no pixel mouse — what `herdr fleet status` announces.
+    fn default() -> Self {
+        Self {
+            surface: INACTIVE_SURFACE,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_mouse: false,
+        }
+    }
+}
+
 /// How long the reconnect sleep waits between stop-flag checks.
 const STOP_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 /// How long [`FleetConnector::shutdown`] waits for the supervisor threads.
@@ -81,8 +126,11 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 pub struct FleetConnectorOptions {
     /// Hello parameters, whose `surface_size` is the *inactive* size.
     pub handshake: HandshakeParams,
-    /// Surface size for whichever host is active.
-    pub active_surface: ClientSurfaceSize,
+    /// Geometry announced to whichever host is active, at start.
+    ///
+    /// Only the starting value: the connector owns it from then on, so
+    /// [`FleetConnector::set_active_geometry`] can follow the terminal.
+    pub active: ActiveGeometry,
     /// Whether ssh transports use herdr's managed ssh config (`[remote]`'s
     /// `manage_ssh_config`): keepalive fallbacks and a private control master,
     /// exactly as `herdr --remote` uses them.
@@ -106,13 +154,34 @@ impl FleetConnectorOptions {
             ..Self::default()
         }
     }
+
+    /// Options for a full-screen console.
+    ///
+    /// `handshake` is the console's hello for every host (see
+    /// [`HandshakeParams::for_client`]) and `active` is the geometry the one
+    /// active host renders at; both are the console terminal's, and the
+    /// connector keeps `active` current from there.
+    // Constructed by the fleet console (E2 PR 4); this PR only ships the
+    // constructor it will call.
+    #[allow(dead_code)]
+    pub fn for_client(
+        config: &crate::config::Config,
+        handshake: HandshakeParams,
+        active: ActiveGeometry,
+    ) -> Self {
+        Self {
+            handshake,
+            active,
+            ..Self::for_config(config)
+        }
+    }
 }
 
 impl Default for FleetConnectorOptions {
     fn default() -> Self {
         Self {
             handshake: HandshakeParams::read_only(INACTIVE_SURFACE),
-            active_surface: INACTIVE_SURFACE,
+            active: ActiveGeometry::default(),
             manage_ssh_config: false,
             max_frame_size: MAX_FRAME_SIZE,
             endpoint_timeout: ENDPOINT_REQUEST_TIMEOUT,
@@ -249,8 +318,8 @@ struct HostLinkState {
     pending: Option<LocalStream>,
     /// Boot of the projection the host is currently serving.
     boot_id: Option<String>,
-    /// Surface size this client last announced to the host.
-    surface: Option<ClientSurfaceSize>,
+    /// Geometry this client last announced to the host.
+    announced: Option<ActiveGeometry>,
     lane: EndpointLane,
 }
 
@@ -266,7 +335,9 @@ struct HostLink {
 /// N host connections behind one event stream.
 pub struct FleetConnector {
     hosts: Vec<HostLink>,
-    events: mpsc::Receiver<FleetEvent>,
+    /// `None` once [`FleetConnector::take_events`] handed the receiver to the
+    /// caller, which then owns closing it.
+    events: Option<mpsc::Receiver<FleetEvent>>,
     /// For failures `send` discovers on the caller's thread (an expired
     /// request). Weak so the channel still closes once every supervisor has
     /// exited, which is how a consumer learns nothing else can arrive.
@@ -275,6 +346,10 @@ pub struct FleetConnector {
     events_tx: mpsc::WeakSender<FleetEvent>,
     options: Arc<FleetConnectorOptions>,
     active_host: Mutex<Option<HostId>>,
+    /// Geometry for whichever host is active, shared with the supervisors so
+    /// a host that reconnects while active handshakes at the *latest* size
+    /// rather than the one the console started with.
+    active_geometry: Arc<Mutex<ActiveGeometry>>,
     stop: Arc<AtomicBool>,
     /// One message per supervisor thread that has exited.
     finished: std::sync::mpsc::Receiver<HostId>,
@@ -290,11 +365,12 @@ impl FleetConnector {
         Self::start_with(specs, options, Arc::new(transport_for))
     }
 
-    fn start_with(
+    pub(crate) fn start_with(
         specs: Vec<HostSpec>,
         options: FleetConnectorOptions,
         factory: TransportFactory,
     ) -> Self {
+        let active_geometry = Arc::new(Mutex::new(options.active));
         let options = Arc::new(options);
         let stop = Arc::new(AtomicBool::new(false));
         let (events_tx, events) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -340,6 +416,7 @@ impl FleetConnector {
                 factory: Arc::clone(&factory),
                 state,
                 active,
+                active_geometry: Arc::clone(&active_geometry),
                 events: events_tx.clone(),
                 stop: Arc::clone(&stop),
                 finished: finished_tx.clone(),
@@ -353,10 +430,11 @@ impl FleetConnector {
 
         Self {
             hosts,
-            events,
+            events: Some(events),
             events_tx: events_tx_weak,
             options,
             active_host: Mutex::new(active_host),
+            active_geometry,
             stop,
             finished,
             supervisors,
@@ -366,9 +444,25 @@ impl FleetConnector {
     /// The merged event stream.
     ///
     /// Closes once every supervisor has exited, which is how a consumer knows
-    /// no host can produce another event.
-    pub fn events(&mut self) -> &mut mpsc::Receiver<FleetEvent> {
-        &mut self.events
+    /// no host can produce another event. `None` once [`Self::take_events`]
+    /// handed the receiver to the caller.
+    pub fn events(&mut self) -> Option<&mut mpsc::Receiver<FleetEvent>> {
+        self.events.as_mut()
+    }
+
+    /// Detach the event stream so the caller can own it.
+    ///
+    /// A `select!` loop needs the receiver by value while it still calls
+    /// [`Self::send`] on the connector; borrowing both at once would not
+    /// compile. The second call returns `None`.
+    ///
+    /// The caller then owns closing it: [`Self::shutdown`] can no longer wake
+    /// a supervisor parked on a full channel, so **drop the receiver before
+    /// calling `shutdown`**.
+    // Called by the fleet console (E2 PR 3/4), which owns the loop.
+    #[allow(dead_code)]
+    pub fn take_events(&mut self) -> Option<mpsc::Receiver<FleetEvent>> {
+        self.events.take()
     }
 
     /// Point the fleet at one host, or at none.
@@ -397,13 +491,44 @@ impl FleetConnector {
 
         if let Some(previous) = previous.as_ref().and_then(|id| self.link(id)) {
             previous.active.store(false, Ordering::Release);
-            self.announce_surface(previous, self.options.handshake.surface_size);
+            if let Err(error) = self.announce(previous, false) {
+                tracing::warn!(host = %previous.id, error = %error, "failed to resize a fleet host");
+            }
         }
         if let Some(next) = host.and_then(|id| self.link(id)) {
             next.active.store(true, Ordering::Release);
-            self.announce_surface(next, self.options.active_surface);
+            if let Err(error) = self.announce(next, true) {
+                tracing::warn!(host = %next.id, error = %error, "failed to resize a fleet host");
+            }
         }
         Ok(())
+    }
+
+    /// Follow the console terminal: announce `geometry` to whichever host is
+    /// active now, and use it for whichever host becomes active later.
+    ///
+    /// Called on every terminal resize. A host that is *not* connected needs
+    /// nothing: the supervisor reads the same cell when it handshakes, so a
+    /// host that drops and reconnects while active comes back at the size the
+    /// console has now — not the one it started with.
+    // Called by the fleet console (E2 PR 3/4) on `ClientLoopEvent::Resize`.
+    #[allow(dead_code)]
+    pub fn set_active_geometry(&self, geometry: ActiveGeometry) -> Result<(), HostSendError> {
+        // Lock order: active_host → link state → active_geometry. Holding the
+        // active-host lock serializes this against `set_active`, so a resize
+        // racing a switch cannot leave the two hosts at swapped sizes.
+        let active = lock(&self.active_host);
+        let Some(link) = active.as_ref().and_then(|id| self.link(id)) else {
+            *lock(&self.active_geometry) = geometry;
+            return Ok(());
+        };
+        let mut state = lock(&link.state);
+        *lock(&self.active_geometry) = geometry;
+        if state.stream.is_none() || state.announced == Some(geometry) {
+            return Ok(());
+        }
+        state.announced = Some(geometry);
+        write_locked(&mut state, &geometry.resize_message())
     }
 
     /// Stop every host and wait, briefly, for the threads to notice.
@@ -420,7 +545,14 @@ impl FleetConnector {
         // parked on a full channel because the consumer stopped reading before
         // it called shutdown; otherwise that supervisor could only exit once
         // the receiver was dropped, after the whole wait below.
-        self.events.close();
+        match self.events.as_mut() {
+            Some(events) => events.close(),
+            // The caller took the receiver: dropping it is what closes the
+            // channel, and it is documented to do that before shutting down.
+            // If it still holds it, the bounded wait below detaches instead of
+            // blocking here.
+            None => tracing::debug!("fleet shutdown with a detached event receiver"),
+        }
         self.close_connections();
 
         let deadline = Instant::now() + SHUTDOWN_JOIN_TIMEOUT;
@@ -450,34 +582,59 @@ impl FleetConnector {
         self.hosts.iter().find(|host| &host.id == id)
     }
 
-    fn resize_message(&self, surface_size: ClientSurfaceSize) -> ClientMessage {
-        ClientMessage::ClientShellResize {
-            cell_width_px: self.options.handshake.cell_width_px,
-            cell_height_px: self.options.handshake.cell_height_px,
-            surface_size,
-            pixel_mouse: self.options.handshake.pixel_mouse,
+    /// Tell one host the geometry it should render at, if it is connected.
+    ///
+    /// `active` picks which geometry that is, and it is read *under the host's
+    /// link lock* so an activation racing a reconnect resolves to exactly one
+    /// order. A disconnected host needs nothing: its next handshake reads the
+    /// same values and announces them in the hello.
+    fn announce(&self, link: &HostLink, active: bool) -> Result<(), HostSendError> {
+        let mut state = lock(&link.state);
+        if state.stream.is_none() {
+            return Ok(());
+        }
+        let geometry = if active {
+            *lock(&self.active_geometry)
+        } else {
+            inactive_geometry(&self.options.handshake)
+        };
+        if state.announced == Some(geometry) {
+            return Ok(());
+        }
+        state.announced = Some(geometry);
+        write_locked(&mut state, &geometry.resize_message())
+    }
+
+    /// The geometry `link` is (or would next be) announced at.
+    fn geometry_for(&self, link: &HostLink) -> ActiveGeometry {
+        if link.active.load(Ordering::Acquire) {
+            *lock(&self.active_geometry)
+        } else {
+            inactive_geometry(&self.options.handshake)
         }
     }
 
-    /// Tell one host the size it should render, if it is connected.
-    ///
-    /// A disconnected host needs nothing: its next handshake reads the active
-    /// gate and announces the right size in the hello.
-    fn announce_surface(&self, link: &HostLink, surface_size: ClientSurfaceSize) {
-        let mut state = lock(&link.state);
-        if state.stream.is_none() || state.surface == Some(surface_size) {
-            return;
+    /// Record `geometry` as announced to this host, and — when the host is the
+    /// active one — as the connector's own active geometry, so a later
+    /// activation, a reconnect and the console cannot disagree about the size
+    /// the active host renders at. Returns the resize to write.
+    fn adopt_geometry(
+        &self,
+        link: &HostLink,
+        state: &mut MutexGuard<'_, HostLinkState>,
+        geometry: ActiveGeometry,
+    ) -> ClientMessage {
+        if link.active.load(Ordering::Acquire) {
+            *lock(&self.active_geometry) = geometry;
         }
-        state.surface = Some(surface_size);
-        if let Err(error) = write_locked(&mut state, &self.resize_message(surface_size)) {
-            tracing::warn!(host = %link.id, error = %error, "failed to resize a fleet host");
-        }
+        state.announced = Some(geometry);
+        geometry.resize_message()
     }
 
     fn close_connections(&self) {
         for link in &self.hosts {
             let mut state = lock(&link.state);
-            state.surface = None;
+            state.announced = None;
             for stream in [state.stream.take(), state.pending.take()]
                 .into_iter()
                 .flatten()
@@ -522,8 +679,11 @@ impl FleetConnector {
 
         let message = match command {
             HostCommand::Resize(surface_size) => {
-                state.surface = Some(surface_size);
-                self.resize_message(surface_size)
+                let geometry = ActiveGeometry {
+                    surface: surface_size,
+                    ..self.geometry_for(link)
+                };
+                self.adopt_geometry(link, &mut state, geometry)
             }
             HostCommand::PaneInput { pane_id, events } => {
                 ClientMessage::ClientShellPaneInput { pane_id, events }
@@ -543,12 +703,25 @@ impl FleetConnector {
                         "the endpoint handshake belongs to the connector",
                     ));
                 }
-                // A raw resize is still a resize: the size bookkeeping is what
-                // keeps a later activation from skipping a needed resize.
-                ClientMessage::ClientShellResize { surface_size, .. } => {
-                    state.surface = Some(surface_size);
-                    *message
-                }
+                // A raw resize is still a resize: the bookkeeping is what keeps
+                // a later activation from skipping a needed resize, and what
+                // keeps a reconnecting active host at the size the console is
+                // actually showing.
+                ClientMessage::ClientShellResize {
+                    cell_width_px,
+                    cell_height_px,
+                    surface_size,
+                    pixel_mouse,
+                } => self.adopt_geometry(
+                    link,
+                    &mut state,
+                    ActiveGeometry {
+                        surface: surface_size,
+                        cell_width_px,
+                        cell_height_px,
+                        pixel_mouse,
+                    },
+                ),
                 other => other,
             },
             HostCommand::Endpoint {
@@ -596,6 +769,19 @@ impl Drop for FleetConnector {
     }
 }
 
+/// The geometry every *inactive* host is announced at: the hello's own values.
+///
+/// One place, so the hello a supervisor sends and the resize an activation
+/// sends cannot describe two different inactive hosts.
+fn inactive_geometry(handshake: &HandshakeParams) -> ActiveGeometry {
+    ActiveGeometry {
+        surface: handshake.surface_size,
+        cell_width_px: handshake.cell_width_px,
+        cell_height_px: handshake.cell_height_px,
+        pixel_mouse: handshake.pixel_mouse,
+    }
+}
+
 /// Write to a host under its link lock, clearing the connection on failure.
 ///
 /// Dropping the write half on error means the next `send` reports
@@ -612,7 +798,7 @@ fn write_locked(
         Ok(()) => Ok(()),
         Err(error) => {
             state.stream = None;
-            state.surface = None;
+            state.announced = None;
             Err(HostSendError::Io(framing_error(error)))
         }
     }
@@ -731,6 +917,7 @@ struct Supervisor {
     factory: TransportFactory,
     state: Arc<Mutex<HostLinkState>>,
     active: Arc<AtomicBool>,
+    active_geometry: Arc<Mutex<ActiveGeometry>>,
     events: mpsc::Sender<FleetEvent>,
     stop: Arc<AtomicBool>,
     finished: std::sync::mpsc::Sender<HostId>,
@@ -823,7 +1010,14 @@ impl Supervisor {
         }
 
         let mut params = self.options.handshake.clone();
-        params.surface_size = self.wanted_surface();
+        // The active host handshakes at the console's *current* geometry, not
+        // the one the connector was started with: that is what makes a
+        // reconnect of the active host come back at the right size.
+        let wanted = self.wanted_geometry();
+        params.surface_size = wanted.surface;
+        params.cell_width_px = wanted.cell_width_px;
+        params.cell_height_px = wanted.cell_height_px;
+        params.pixel_mouse = wanted.pixel_mouse;
         params.read_timeout = transport.read_timeout();
         let handshake = endpoint_handshake(&mut stream, &params);
         let welcome = match handshake {
@@ -866,18 +1060,12 @@ impl Supervisor {
             state.pending = None;
             state.stream = Some(stream);
             state.boot_id = None;
-            state.surface = Some(params.surface_size);
+            state.announced = Some(wanted);
             state.lane = EndpointLane::with_timeout(self.options.endpoint_timeout);
-            let wanted = self.wanted_surface();
-            if wanted != params.surface_size {
-                state.surface = Some(wanted);
-                let resize = ClientMessage::ClientShellResize {
-                    cell_width_px: params.cell_width_px,
-                    cell_height_px: params.cell_height_px,
-                    surface_size: wanted,
-                    pixel_mouse: params.pixel_mouse,
-                };
-                if let Err(error) = write_locked(&mut state, &resize) {
+            let now = self.wanted_geometry();
+            if now != wanted {
+                state.announced = Some(now);
+                if let Err(error) = write_locked(&mut state, &now.resize_message()) {
                     tracing::warn!(host = %host, error = %error, "failed to size a fleet host");
                 }
             }
@@ -1088,7 +1276,7 @@ impl Supervisor {
             state.stream = None;
             state.pending = None;
             state.boot_id = None;
-            state.surface = None;
+            state.announced = None;
             state.lane.fail_all(reason)
         };
         for response in failed {
@@ -1110,11 +1298,16 @@ impl Supervisor {
         lock(&self.state).pending = None;
     }
 
-    fn wanted_surface(&self) -> ClientSurfaceSize {
+    /// The geometry this host should be at right now.
+    ///
+    /// Read under the host's link lock wherever a stream is being published,
+    /// so an activation that runs during a handshake either finds no stream
+    /// (and this re-check sends the resize) or finds one (and sent it itself).
+    fn wanted_geometry(&self) -> ActiveGeometry {
         if self.is_active() {
-            self.options.active_surface
+            *lock(&self.active_geometry)
         } else {
-            self.options.handshake.surface_size
+            inactive_geometry(&self.options.handshake)
         }
     }
 
@@ -1172,14 +1365,23 @@ fn drive_to_ceiling(backoff: &mut Backoff) -> Duration {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) mod test_support {
+    //! A real endpoint server, minus herdr, for tests that must drive the
+    //! connector over a real socket.
+    //!
+    //! Lives here rather than in one test module because the fleet console
+    //! (`src/client/fleet.rs`, E2 PR 3/4) has to test its own routing against
+    //! the same fake: two hosts, one active, and an assertion about which of
+    //! them received a write. Unix-only for the same reason the connector
+    //! tests are: it binds a local socket by path and half-closes it.
+
     use super::*;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicUsize;
 
     use crate::fleet::hosts::HostKind;
-    use crate::fleet::state::{FleetState, HostConnection};
+    use crate::fleet::state::FleetState;
     use crate::fleet::transport::LocalTransport;
     use crate::ipc::{bind_local_listener, connect_local_stream, LocalListener};
     use crate::protocol::endpoint::{
@@ -1189,12 +1391,12 @@ mod tests {
     use interprocess::local_socket::traits::Listener as _;
 
     /// The frozen generation-1 snapshot the endpoint contract pins.
-    const FROZEN_SNAPSHOT: &str = include_str!(concat!(
+    pub(crate) const FROZEN_SNAPSHOT: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/endpoint-snapshot-v1.json"
     ));
 
-    fn scratch_dir(name: &str) -> PathBuf {
+    pub(crate) fn scratch_dir(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
@@ -1205,7 +1407,7 @@ mod tests {
         dir
     }
 
-    fn snapshot(boot_id: &str, revision: u64) -> ClientShellSnapshot {
+    pub(crate) fn snapshot(boot_id: &str, revision: u64) -> ClientShellSnapshot {
         let mut snapshot: ClientShellSnapshot =
             serde_json::from_str(FROZEN_SNAPSHOT).expect("frozen snapshot decodes");
         snapshot.boot_id = boot_id.to_string();
@@ -1213,14 +1415,14 @@ mod tests {
         snapshot
     }
 
-    fn snapshot_message(snapshot: &ClientShellSnapshot) -> ServerMessage {
+    pub(crate) fn snapshot_message(snapshot: &ClientShellSnapshot) -> ServerMessage {
         ServerMessage::EndpointControl {
             kind: ENDPOINT_SNAPSHOT_KIND.to_string(),
             data: serde_json::to_string(snapshot).expect("snapshot encodes"),
         }
     }
 
-    fn surface_message(boot_id: &str, surface_revision: u64) -> ServerMessage {
+    pub(crate) fn surface_message(boot_id: &str, surface_revision: u64) -> ServerMessage {
         ServerMessage::PaneSurface(PaneSurfaceFrame {
             boot_id: boot_id.to_string(),
             projection_revision: 1,
@@ -1242,7 +1444,7 @@ mod tests {
 
     /// What a fake host does once it has read the hello.
     #[derive(Debug, Clone)]
-    enum Behaviour {
+    pub(crate) enum Behaviour {
         /// Welcome, then these messages, then stay connected.
         Serve(Vec<ServerMessage>),
         /// Welcome then hang up on the first connection; serve afterwards.
@@ -1264,15 +1466,15 @@ mod tests {
     /// Speaks the real wire (`protocol::read_message`/`write_message`) over a
     /// real local socket, so the connector under test is not talking to a stub
     /// of itself.
-    struct FakeHost {
-        socket: PathBuf,
+    pub(crate) struct FakeHost {
+        pub(crate) socket: PathBuf,
         received: Arc<Mutex<Vec<ClientMessage>>>,
         connections: Arc<AtomicUsize>,
         stop: Arc<AtomicBool>,
     }
 
     impl FakeHost {
-        fn start(dir: &Path, name: &str, behaviour: Behaviour) -> Self {
+        pub(crate) fn start(dir: &Path, name: &str, behaviour: Behaviour) -> Self {
             let socket = dir.join(format!("{name}.sock"));
             let listener = bind_local_listener(&socket).expect("bind fake host");
             let received = Arc::new(Mutex::new(Vec::new()));
@@ -1290,7 +1492,7 @@ mod tests {
             host
         }
 
-        fn spec(&self, id: &str) -> HostSpec {
+        pub(crate) fn spec(&self, id: &str) -> HostSpec {
             HostSpec {
                 id: HostId::new(id).expect("valid host id"),
                 kind: HostKind::Local {
@@ -1300,11 +1502,11 @@ mod tests {
             }
         }
 
-        fn received(&self) -> Vec<ClientMessage> {
+        pub(crate) fn received(&self) -> Vec<ClientMessage> {
             lock(&self.received).clone()
         }
 
-        fn connections(&self) -> usize {
+        pub(crate) fn connections(&self) -> usize {
             self.connections.load(Ordering::Acquire)
         }
     }
@@ -1318,7 +1520,7 @@ mod tests {
         }
     }
 
-    fn accept_loop(
+    pub(crate) fn accept_loop(
         listener: LocalListener,
         behaviour: Behaviour,
         received: Arc<Mutex<Vec<ClientMessage>>>,
@@ -1345,7 +1547,7 @@ mod tests {
         }
     }
 
-    fn serve_connection(
+    pub(crate) fn serve_connection(
         stream: &mut LocalStream,
         index: usize,
         behaviour: &Behaviour,
@@ -1423,7 +1625,7 @@ mod tests {
 
     /// Answer one endpoint request the way the server does: correlated by the
     /// request's JSON `id`, split into chunks.
-    fn answer_endpoint(stream: &mut LocalStream, boot_id: &str, request: &str) -> bool {
+    pub(crate) fn answer_endpoint(stream: &mut LocalStream, boot_id: &str, request: &str) -> bool {
         let request_id = serde_json::from_str::<serde_json::Value>(request)
             .ok()
             .and_then(|value| value.get("id")?.as_str().map(str::to_string))
@@ -1443,6 +1645,156 @@ mod tests {
         }
         true
     }
+
+    pub(crate) fn fake_connector(
+        hosts: &[(&str, &FakeHost)],
+        options: FleetConnectorOptions,
+    ) -> FleetConnector {
+        let sockets: HashMap<HostId, PathBuf> = hosts
+            .iter()
+            .map(|(id, host)| (HostId::new(id).expect("valid host id"), host.socket.clone()))
+            .collect();
+        let specs = hosts
+            .iter()
+            .map(|(id, host)| host.spec(id))
+            .collect::<Vec<_>>();
+        FleetConnector::start_with(
+            specs,
+            options,
+            Arc::new(move |spec: &HostSpec, _options: &FleetConnectorOptions| {
+                let Some(socket) = sockets.get(&spec.id) else {
+                    return Err("no fake host".to_string());
+                };
+                Ok(Box::new(LocalTransport::with_socket(socket.clone())) as Box<dyn HostTransport>)
+            }),
+        )
+    }
+
+    /// Drain events into a state until `done`, or until the deadline.
+    pub(crate) fn drain_until(
+        connector: &mut FleetConnector,
+        state: &mut FleetState,
+        timeout: Duration,
+        mut done: impl FnMut(&FleetState) -> bool,
+    ) -> Vec<FleetEvent> {
+        let deadline = Instant::now() + timeout;
+        let mut other = Vec::new();
+        while !done(state) && Instant::now() < deadline {
+            let Some(events) = connector.events() else {
+                break;
+            };
+            match events.try_recv() {
+                Ok(FleetEvent::Host { host, event }) => {
+                    state.apply(&host, event);
+                }
+                Ok(event) => other.push(event),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        other
+    }
+
+    pub(crate) fn connected_with_snapshot(state: &FleetState, id: &str) -> bool {
+        let Ok(id) = HostId::new(id) else {
+            return false;
+        };
+        state
+            .host(&id)
+            .is_some_and(|host| host.connection.is_connected() && host.snapshot.is_some())
+    }
+
+    pub(crate) fn wait_for(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        condition()
+    }
+
+    pub(crate) fn hello_surface(messages: &[ClientMessage]) -> Vec<ClientSurfaceSize> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ClientMessage::EndpointControl { kind, data }
+                    if kind == crate::protocol::endpoint::ENDPOINT_HELLO_KIND =>
+                {
+                    serde_json::from_str::<crate::protocol::endpoint::EndpointClientHello>(data)
+                        .ok()
+                        .map(|hello| hello.surface_size)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The full geometry every hello in `messages` announced.
+    pub(crate) fn hello_geometry(messages: &[ClientMessage]) -> Vec<ActiveGeometry> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ClientMessage::EndpointControl { kind, data }
+                    if kind == crate::protocol::endpoint::ENDPOINT_HELLO_KIND =>
+                {
+                    serde_json::from_str::<crate::protocol::endpoint::EndpointClientHello>(data)
+                        .ok()
+                        .map(|hello| ActiveGeometry {
+                            surface: hello.surface_size,
+                            cell_width_px: hello.cell_width_px,
+                            cell_height_px: hello.cell_height_px,
+                            pixel_mouse: hello.pixel_mouse,
+                        })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The full geometry every resize in `messages` announced.
+    pub(crate) fn resize_geometry(messages: &[ClientMessage]) -> Vec<ActiveGeometry> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ClientMessage::ClientShellResize {
+                    cell_width_px,
+                    cell_height_px,
+                    surface_size,
+                    pixel_mouse,
+                } => Some(ActiveGeometry {
+                    surface: *surface_size,
+                    cell_width_px: *cell_width_px,
+                    cell_height_px: *cell_height_px,
+                    pixel_mouse: *pixel_mouse,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn resizes(messages: &[ClientMessage]) -> Vec<ClientSurfaceSize> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ClientMessage::ClientShellResize { surface_size, .. } => Some(*surface_size),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+
+    use crate::fleet::hosts::HostKind;
+    use crate::fleet::state::{FleetState, HostConnection};
+    use crate::fleet::transport::LocalTransport;
 
     fn endpoint_requests(messages: &[ClientMessage]) -> Vec<(String, String)> {
         messages
@@ -1466,7 +1818,8 @@ mod tests {
     ) -> Option<FleetEvent> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            match connector.events().try_recv() {
+            let events = connector.events()?;
+            match events.try_recv() {
                 Ok(FleetEvent::Host { host, event }) => {
                     state.apply(&host, event);
                 }
@@ -1493,97 +1846,6 @@ mod tests {
     }
 
     /// A connector whose hosts are the given fakes, by id.
-    fn connector(hosts: &[(&str, &FakeHost)], options: FleetConnectorOptions) -> FleetConnector {
-        let sockets: HashMap<HostId, PathBuf> = hosts
-            .iter()
-            .map(|(id, host)| (HostId::new(id).expect("valid host id"), host.socket.clone()))
-            .collect();
-        let specs = hosts
-            .iter()
-            .map(|(id, host)| host.spec(id))
-            .collect::<Vec<_>>();
-        FleetConnector::start_with(
-            specs,
-            options,
-            Arc::new(move |spec: &HostSpec, _options: &FleetConnectorOptions| {
-                let Some(socket) = sockets.get(&spec.id) else {
-                    return Err("no fake host".to_string());
-                };
-                Ok(Box::new(LocalTransport::with_socket(socket.clone())) as Box<dyn HostTransport>)
-            }),
-        )
-    }
-
-    /// Drain events into a state until `done`, or until the deadline.
-    fn drain_until(
-        connector: &mut FleetConnector,
-        state: &mut FleetState,
-        timeout: Duration,
-        mut done: impl FnMut(&FleetState) -> bool,
-    ) -> Vec<FleetEvent> {
-        let deadline = Instant::now() + timeout;
-        let mut other = Vec::new();
-        while !done(state) && Instant::now() < deadline {
-            match connector.events().try_recv() {
-                Ok(FleetEvent::Host { host, event }) => {
-                    state.apply(&host, event);
-                }
-                Ok(event) => other.push(event),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-            }
-        }
-        other
-    }
-
-    fn connected_with_snapshot(state: &FleetState, id: &str) -> bool {
-        let Ok(id) = HostId::new(id) else {
-            return false;
-        };
-        state
-            .host(&id)
-            .is_some_and(|host| host.connection.is_connected() && host.snapshot.is_some())
-    }
-
-    fn wait_for(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if condition() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        condition()
-    }
-
-    fn hello_surface(messages: &[ClientMessage]) -> Vec<ClientSurfaceSize> {
-        messages
-            .iter()
-            .filter_map(|message| match message {
-                ClientMessage::EndpointControl { kind, data }
-                    if kind == crate::protocol::endpoint::ENDPOINT_HELLO_KIND =>
-                {
-                    serde_json::from_str::<crate::protocol::endpoint::EndpointClientHello>(data)
-                        .ok()
-                        .map(|hello| hello.surface_size)
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn resizes(messages: &[ClientMessage]) -> Vec<ClientSurfaceSize> {
-        messages
-            .iter()
-            .filter_map(|message| match message {
-                ClientMessage::ClientShellResize { surface_size, .. } => Some(*surface_size),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// An ssh host that cannot be reached must not disturb a healthy local
     /// host: the whole point of a per-host supervisor.
     #[cfg(unix)]
@@ -1638,7 +1900,10 @@ mod tests {
         let mut ssh_failures = 0usize;
         let deadline = Instant::now() + Duration::from_secs(20);
         while ssh_failures < 2 && Instant::now() < deadline {
-            match connector.events().try_recv() {
+            let Some(events) = connector.events() else {
+                break;
+            };
+            match events.try_recv() {
                 Ok(FleetEvent::Host { host, event }) => {
                     if host == box_id && matches!(event, HostEvent::Unavailable { .. }) {
                         ssh_failures += 1;
@@ -1696,7 +1961,7 @@ mod tests {
         );
         let specs = vec![alpha.spec("alpha"), beta.spec("beta")];
         let mut state = FleetState::new(specs);
-        let mut connector = connector(
+        let mut connector = fake_connector(
             &[("alpha", &alpha), ("beta", &beta)],
             FleetConnectorOptions::default(),
         );
@@ -1748,7 +2013,7 @@ mod tests {
             ]),
         );
         let mut state = FleetState::new(vec![alpha.spec("alpha")]);
-        let mut connector = connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        let mut connector = fake_connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
 
         drain_until(
             &mut connector,
@@ -1784,14 +2049,17 @@ mod tests {
             Behaviour::DropFirstConnection(vec![snapshot_message(&snapshot("boot-alpha", 1))]),
         );
         let mut state = FleetState::new(vec![alpha.spec("alpha")]);
-        let mut connector = connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        let mut connector = fake_connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
 
         let id = HostId::new("alpha").expect("valid host id");
         let mut retry_in = None;
         let mut attempts = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline && !connected_with_snapshot(&state, "alpha") {
-            match connector.events().try_recv() {
+            let Some(events) = connector.events() else {
+                break;
+            };
+            match events.try_recv() {
                 Ok(FleetEvent::Host { host, event }) => {
                     state.apply(&host, event);
                     if let Some(host) = state.host(&id) {
@@ -1849,7 +2117,7 @@ mod tests {
         );
         let specs = vec![alpha.spec("alpha"), beta.spec("beta")];
         let mut state = FleetState::new(specs);
-        let mut connector = connector(
+        let mut connector = fake_connector(
             &[("alpha", &alpha), ("beta", &beta)],
             FleetConnectorOptions::default(),
         );
@@ -1906,12 +2174,15 @@ mod tests {
             rows: 60,
         };
         let options = FleetConnectorOptions {
-            active_surface,
+            active: ActiveGeometry {
+                surface: active_surface,
+                ..ActiveGeometry::default()
+            },
             ..FleetConnectorOptions::default()
         };
         let specs = vec![alpha.spec("alpha"), beta.spec("beta")];
         let mut state = FleetState::new(specs);
-        let mut connector = connector(&[("alpha", &alpha), ("beta", &beta)], options);
+        let mut connector = fake_connector(&[("alpha", &alpha), ("beta", &beta)], options);
 
         drain_until(
             &mut connector,
@@ -1961,7 +2232,7 @@ mod tests {
         let dir = scratch_dir("incompatible");
         let alpha = FakeHost::start(&dir, "alpha", Behaviour::Incompatible);
         let mut state = FleetState::new(vec![alpha.spec("alpha")]);
-        let mut connector = connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        let mut connector = fake_connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
         let id = HostId::new("alpha").expect("valid host id");
 
         drain_until(
@@ -1995,7 +2266,7 @@ mod tests {
     fn sending_to_an_unknown_or_disconnected_host_errors_without_panicking() {
         let dir = scratch_dir("send");
         let alpha = FakeHost::start(&dir, "alpha", Behaviour::Silent);
-        let connector = connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        let connector = fake_connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
 
         let unknown = HostId::new("nowhere").expect("valid host id");
         assert!(matches!(
@@ -2117,7 +2388,7 @@ mod tests {
             },
         );
         let mut state = FleetState::new(vec![alpha.spec("alpha")]);
-        let mut connector = connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        let mut connector = fake_connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
         let id = HostId::new("alpha").expect("valid host id");
         drain_until(
             &mut connector,
@@ -2195,7 +2466,7 @@ mod tests {
             },
         );
         let mut state = FleetState::new(vec![alpha.spec("alpha")]);
-        let mut connector = connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        let mut connector = fake_connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
         let id = HostId::new("alpha").expect("valid host id");
         drain_until(
             &mut connector,
@@ -2264,7 +2535,7 @@ mod tests {
             },
         );
         let mut state = FleetState::new(vec![alpha.spec("alpha")]);
-        let mut connector = connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        let mut connector = fake_connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
         let id = HostId::new("alpha").expect("valid host id");
         drain_until(
             &mut connector,
@@ -2348,7 +2619,7 @@ mod tests {
             ..FleetConnectorOptions::default()
         };
         let mut state = FleetState::new(vec![alpha.spec("alpha")]);
-        let mut connector = connector(&[("alpha", &alpha)], options);
+        let mut connector = fake_connector(&[("alpha", &alpha)], options);
         let id = HostId::new("alpha").expect("valid host id");
         drain_until(
             &mut connector,
@@ -2398,7 +2669,7 @@ mod tests {
     fn shutdown_returns_while_a_host_is_mid_handshake() {
         let dir = scratch_dir("shutdown-handshake");
         let alpha = FakeHost::start(&dir, "alpha", Behaviour::Silent);
-        let connector = connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        let connector = fake_connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
         assert!(
             wait_for(Duration::from_secs(5), || alpha.connections() == 1),
             "the host must be mid-handshake"
@@ -2426,7 +2697,7 @@ mod tests {
         // alpha is active (first enabled host), so every frame is forwarded
         // into a channel nobody drains.
         let alpha = FakeHost::start(&dir, "alpha", Behaviour::Serve(messages));
-        let connector = connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        let connector = fake_connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
         assert!(
             wait_for(Duration::from_secs(5), || alpha.connections() == 1),
             "the host must connect"
@@ -2438,6 +2709,330 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "a supervisor parked on a full channel must be released by shutdown: {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A console geometry set while one host is active reaches that host, and
+    /// is the geometry the *next* host is activated at: one value, two paths.
+    #[test]
+    fn the_console_geometry_follows_the_active_host_across_a_switch() {
+        let dir = scratch_dir("geometry");
+        let alpha = FakeHost::start(
+            &dir,
+            "alpha",
+            Behaviour::Serve(vec![snapshot_message(&snapshot("boot-alpha", 1))]),
+        );
+        let beta = FakeHost::start(
+            &dir,
+            "beta",
+            Behaviour::Serve(vec![snapshot_message(&snapshot("boot-beta", 1))]),
+        );
+        let specs = vec![alpha.spec("alpha"), beta.spec("beta")];
+        let mut state = FleetState::new(specs);
+        let mut connector = fake_connector(
+            &[("alpha", &alpha), ("beta", &beta)],
+            FleetConnectorOptions::default(),
+        );
+        drain_until(
+            &mut connector,
+            &mut state,
+            Duration::from_secs(10),
+            |state| {
+                connected_with_snapshot(state, "alpha") && connected_with_snapshot(state, "beta")
+            },
+        );
+
+        // The console's terminal: a real cell size and pixel mouse, unlike the
+        // read-only collector's zeroes.
+        let console = ActiveGeometry {
+            surface: ClientSurfaceSize {
+                cols: 200,
+                rows: 60,
+            },
+            cell_width_px: 9,
+            cell_height_px: 19,
+            pixel_mouse: true,
+        };
+        connector
+            .set_active_geometry(console)
+            .expect("the active host takes the console geometry");
+
+        assert!(
+            wait_for(Duration::from_secs(2), || resize_geometry(
+                &alpha.received()
+            ) == vec![console]),
+            "the active host must be resized to the console geometry: {:?}",
+            resize_geometry(&alpha.received())
+        );
+        // Setting the same geometry again is not a second resize.
+        connector
+            .set_active_geometry(console)
+            .expect("an unchanged geometry is accepted");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            resize_geometry(&alpha.received()),
+            vec![console],
+            "an unchanged geometry must not be announced twice"
+        );
+        assert!(
+            resize_geometry(&beta.received()).is_empty(),
+            "an inactive host must not hear the console geometry: {:?}",
+            resize_geometry(&beta.received())
+        );
+
+        let beta_id = HostId::new("beta").expect("valid host id");
+        connector
+            .set_active(Some(&beta_id))
+            .expect("beta can be activated");
+        assert!(
+            wait_for(Duration::from_secs(2), || resize_geometry(&beta.received())
+                == vec![console]),
+            "the newly active host must be sized to the console geometry, not the start one: {:?}",
+            resize_geometry(&beta.received())
+        );
+        let inactive = ActiveGeometry::default();
+        assert!(
+            wait_for(Duration::from_secs(2), || resize_geometry(
+                &alpha.received()
+            ) == vec![console, inactive]),
+            "the old active host must go back to the inactive geometry: {:?}",
+            resize_geometry(&alpha.received())
+        );
+        connector.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The E1 gap this PR closes: a host that drops while active used to
+    /// re-handshake at the geometry the connector was *started* with, so the
+    /// console came back to a pane sized for a terminal nobody had any more.
+    #[test]
+    fn an_active_host_reconnects_at_the_latest_console_geometry() {
+        let dir = scratch_dir("reconnect-geometry");
+        let alpha = FakeHost::start(
+            &dir,
+            "alpha",
+            Behaviour::DropFirstConnection(vec![snapshot_message(&snapshot("boot-alpha", 1))]),
+        );
+        let start = ActiveGeometry {
+            surface: ClientSurfaceSize {
+                cols: 100,
+                rows: 30,
+            },
+            cell_width_px: 8,
+            cell_height_px: 16,
+            pixel_mouse: false,
+        };
+        let specs = vec![alpha.spec("alpha")];
+        let mut state = FleetState::new(specs);
+        let mut connector = fake_connector(
+            &[("alpha", &alpha)],
+            FleetConnectorOptions {
+                active: start,
+                ..FleetConnectorOptions::default()
+            },
+        );
+        let id = HostId::new("alpha").expect("valid host id");
+
+        // The first connection is dropped right after the welcome.
+        assert!(
+            wait_for(Duration::from_secs(5), || alpha.connections() == 1),
+            "the host must be reached once"
+        );
+        drain_until(
+            &mut connector,
+            &mut state,
+            Duration::from_secs(5),
+            |state| {
+                state.host(&id).is_some_and(|host| {
+                    matches!(host.connection, HostConnection::Unavailable { .. })
+                })
+            },
+        );
+
+        // The console resized while its only host was down.
+        let resized = ActiveGeometry {
+            surface: ClientSurfaceSize {
+                cols: 180,
+                rows: 50,
+            },
+            cell_width_px: 10,
+            cell_height_px: 21,
+            pixel_mouse: true,
+        };
+        connector
+            .set_active_geometry(resized)
+            .expect("a disconnected active host is not an error");
+
+        drain_until(
+            &mut connector,
+            &mut state,
+            Duration::from_secs(10),
+            |state| connected_with_snapshot(state, "alpha"),
+        );
+        assert!(
+            wait_for(Duration::from_secs(2), || hello_geometry(&alpha.received())
+                == vec![start, resized]),
+            "the reconnect must handshake at the latest console geometry: {:?}",
+            hello_geometry(&alpha.received())
+        );
+        assert!(
+            resize_geometry(&alpha.received()).is_empty(),
+            "the hello already carried the size; no extra resize is needed: {:?}",
+            resize_geometry(&alpha.received())
+        );
+        connector.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A raw `ClientShellResize` (what the console's own loop writes on a
+    /// terminal resize) teaches the connector the same geometry, so a later
+    /// reconnect or activation cannot disagree with what the console showed.
+    #[test]
+    fn a_raw_resize_to_the_active_host_updates_the_console_geometry() {
+        let dir = scratch_dir("raw-resize");
+        let alpha = FakeHost::start(
+            &dir,
+            "alpha",
+            Behaviour::Serve(vec![snapshot_message(&snapshot("boot-alpha", 1))]),
+        );
+        let beta = FakeHost::start(
+            &dir,
+            "beta",
+            Behaviour::Serve(vec![snapshot_message(&snapshot("boot-beta", 1))]),
+        );
+        let specs = vec![alpha.spec("alpha"), beta.spec("beta")];
+        let mut state = FleetState::new(specs);
+        let mut connector = fake_connector(
+            &[("alpha", &alpha), ("beta", &beta)],
+            FleetConnectorOptions::default(),
+        );
+        drain_until(
+            &mut connector,
+            &mut state,
+            Duration::from_secs(10),
+            |state| {
+                connected_with_snapshot(state, "alpha") && connected_with_snapshot(state, "beta")
+            },
+        );
+
+        let typed = ActiveGeometry {
+            surface: ClientSurfaceSize {
+                cols: 132,
+                rows: 43,
+            },
+            cell_width_px: 7,
+            cell_height_px: 15,
+            pixel_mouse: true,
+        };
+        let alpha_id = HostId::new("alpha").expect("valid host id");
+        connector
+            .send(
+                &alpha_id,
+                HostCommand::Raw(Box::new(typed.resize_message())),
+            )
+            .expect("a raw resize reaches the active host");
+
+        let beta_id = HostId::new("beta").expect("valid host id");
+        connector
+            .set_active(Some(&beta_id))
+            .expect("beta can be activated");
+        assert!(
+            wait_for(Duration::from_secs(2), || resize_geometry(&beta.received())
+                == vec![typed]),
+            "activation must use the geometry the raw resize announced: {:?}",
+            resize_geometry(&beta.received())
+        );
+        connector.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The console owns the receiver, so it also owns closing it: `shutdown`
+    /// must still return promptly once it has been dropped.
+    #[test]
+    fn taken_events_are_handed_out_once_and_shutdown_still_returns() {
+        let dir = scratch_dir("take-events");
+        let mut messages = vec![snapshot_message(&snapshot("boot-alpha", 1))];
+        messages.extend(
+            (1..=(EVENT_CHANNEL_CAPACITY as u64 + 50))
+                .map(|revision| surface_message("boot-alpha", revision)),
+        );
+        let alpha = FakeHost::start(&dir, "alpha", Behaviour::Serve(messages));
+        let mut connector = fake_connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+
+        let mut events = connector.take_events().expect("the receiver is attached");
+        assert!(
+            connector.take_events().is_none(),
+            "the receiver is handed out exactly once"
+        );
+        assert!(
+            connector.events().is_none(),
+            "a detached receiver cannot also be borrowed"
+        );
+        // It is a working receiver, not an empty one.
+        let first = events.blocking_recv().expect("the host reports itself");
+        assert!(matches!(first, FleetEvent::Host { .. }));
+
+        // Let the supervisor park on a full channel, then do what the console
+        // does on the way out: drop the receiver, then shut down.
+        assert!(
+            wait_for(Duration::from_secs(5), || alpha.connections() == 1),
+            "the host must connect"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        drop(events);
+        let started = Instant::now();
+        connector.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown must join once the caller dropped the receiver: {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same, with the host in backoff rather than mid-write.
+    #[test]
+    fn shutdown_returns_with_taken_events_and_a_host_mid_backoff() {
+        let dir = scratch_dir("take-events-backoff");
+        let missing = dir.join("missing.sock");
+        let spec = HostSpec {
+            id: HostId::new("gone").expect("valid host id"),
+            kind: HostKind::Local {
+                session: Some("gone".to_string()),
+            },
+            enabled: true,
+        };
+        let mut connector = FleetConnector::start_with(
+            vec![spec],
+            FleetConnectorOptions::default(),
+            Arc::new(move |_spec: &HostSpec, _options: &FleetConnectorOptions| {
+                Ok(Box::new(LocalTransport::with_socket(missing.clone()))
+                    as Box<dyn HostTransport>)
+            }),
+        );
+        let mut events = connector.take_events().expect("the receiver is attached");
+        let mut unavailable = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !unavailable && Instant::now() < deadline {
+            match events.blocking_recv() {
+                Some(FleetEvent::Host {
+                    event: HostEvent::Unavailable { .. },
+                    ..
+                }) => unavailable = true,
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(unavailable, "the host must reach a backoff");
+        drop(events);
+
+        let started = Instant::now();
+        connector.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown must not wait out the backoff: {:?}",
             started.elapsed()
         );
         let _ = std::fs::remove_dir_all(&dir);
