@@ -63,6 +63,38 @@ impl HandshakeParams {
             read_timeout: LOCAL_HANDSHAKE_READ_TIMEOUT,
         }
     }
+
+    /// A full-screen console's hello for every host.
+    ///
+    /// The cell geometry and mouse policy are the console terminal's real
+    /// ones, because whichever host becomes active renders into that
+    /// terminal. The size is deliberately the *inactive* one
+    /// ([`crate::fleet::connector::INACTIVE_SURFACE`]): a host is handshaken
+    /// small and resized up only when it is activated, so N-1 hosts never
+    /// reflow their panes for a console that is not looking at them. The
+    /// connector overrides the size (and the cell geometry) for whichever host
+    /// is active when it handshakes.
+    ///
+    /// `read_timeout` is the local deadline; `transport.read_timeout()`
+    /// replaces it for an ssh host.
+    // Called by the fleet console (E2 PR 4), which owns the terminal these
+    // values describe; this PR only ships the constructor it will call.
+    #[allow(dead_code)]
+    pub fn for_client(
+        cell_width_px: u32,
+        cell_height_px: u32,
+        pixel_mouse: bool,
+        mouse_capture: bool,
+    ) -> Self {
+        Self {
+            cell_width_px,
+            cell_height_px,
+            surface_size: crate::fleet::connector::INACTIVE_SURFACE,
+            pixel_mouse,
+            mouse_capture,
+            read_timeout: LOCAL_HANDSHAKE_READ_TIMEOUT,
+        }
+    }
 }
 
 /// How one host answered the hello.
@@ -381,6 +413,54 @@ mod socket_tests {
         assert_eq!(hello.surface_codecs, vec![SURFACE_CODEC_V1.to_string()]);
         assert_eq!(hello.input_codecs, vec![INPUT_CODEC_V1.to_string()]);
         assert_eq!(hello.blob_codecs, vec![BLOB_CODEC_V1.to_string()]);
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    /// The console's hello: the terminal's real cell geometry and mouse
+    /// policy, but the *inactive* surface size, and never direct graphics or
+    /// endpoint keybindings.
+    #[test]
+    fn the_client_hello_carries_the_terminal_geometry_at_the_inactive_size() {
+        let socket = scratch_socket("client-hello");
+        let listener = bind_local_listener(&socket).expect("bind");
+        let server = std::thread::spawn(move || {
+            let mut stream = listener.accept().expect("accept");
+            let hello = protocol::read_message::<_, ClientMessage>(&mut stream, MAX_FRAME_SIZE)
+                .expect("hello");
+            let welcome = ServerMessage::EndpointControl {
+                kind: ENDPOINT_WELCOME_KIND.to_string(),
+                data: serde_json::to_string(&EndpointServerWelcome::compatible(Vec::new()))
+                    .expect("welcome encodes"),
+            };
+            protocol::write_message(&mut stream, &welcome).expect("welcome");
+            hello
+        });
+
+        let mut stream = connect_local_stream(&socket).expect("connect");
+        let params = HandshakeParams::for_client(9, 19, true, true);
+        assert_eq!(params.read_timeout, LOCAL_HANDSHAKE_READ_TIMEOUT);
+        let outcome = endpoint_handshake(&mut stream, &params).expect("handshake");
+        assert!(matches!(outcome, HandshakeOutcome::Connected(_)));
+
+        let hello = server.join().expect("server thread");
+        let ClientMessage::EndpointControl { data, .. } = hello else {
+            panic!("expected an endpoint hello, got {hello:?}");
+        };
+        let hello: EndpointClientHello = serde_json::from_str(&data).expect("hello decodes");
+        assert_eq!(hello.cell_width_px, 9);
+        assert_eq!(hello.cell_height_px, 19);
+        assert!(hello.pixel_mouse);
+        assert!(hello.mouse_capture);
+        assert_eq!(
+            hello.surface_size,
+            crate::fleet::connector::INACTIVE_SURFACE,
+            "a console handshakes every host at the inactive size"
+        );
+        assert!(!hello.direct_graphics, "fleet v1 draws no direct graphics");
+        assert!(
+            !hello.endpoint_keybindings,
+            "every fleet host uses local keybindings"
+        );
         let _ = std::fs::remove_file(&socket);
     }
 

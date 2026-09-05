@@ -33,7 +33,8 @@ the binary, commands and paths stay `herdr`.
 `0.8.2-fork`). E2 assumes exactly these E1 contracts (verified in the code):
 
 - `src/fleet/connector.rs`: `FleetConnector::start(specs, options)`,
-  `events(&mut self) -> &mut mpsc::Receiver<FleetEvent>`,
+  `events(&mut self) -> Option<&mut mpsc::Receiver<FleetEvent>>` (PR 1
+  changed this from `&mut …`; `None` once `take_events` moved it out),
   `set_active(&self, Option<&HostId>)`, `active_host()`,
   `send(&self, &HostId, HostCommand)`, `shutdown(self)`;
   `FleetEvent::{Host, Surface, SurfacePatch, Notification, EndpointResponse,
@@ -42,8 +43,9 @@ the binary, commands and paths stay `herdr`.
   `Raw` refuses `ClientShellEndpointRequest` and `EndpointControl`, accepts and
   bookkeeps `ClientShellResize`; `HostSendError::{UnknownHost, NotConnected,
   Io, Refused}`; `FleetConnectorOptions { handshake: HandshakeParams,
-  active_surface, manage_ssh_config, max_frame_size, endpoint_timeout }` with
-  `for_config(&Config)`; `INACTIVE_SURFACE` = `DEFAULT_HEADLESS_COLS ×
+  active: ActiveGeometry, manage_ssh_config, max_frame_size,
+  endpoint_timeout }` with `for_config(&Config)` (PR 1 replaced the bare
+  `active_surface: ClientSurfaceSize` with `active: ActiveGeometry`); `INACTIVE_SURFACE` = `DEFAULT_HEADLESS_COLS ×
   DEFAULT_HEADLESS_ROWS` (120×40). Frames from inactive hosts are dropped in
   the reader thread; `set_active` deactivates the old host before activating
   the new one and resizes both. `send(Endpoint)` accepted ⇒ exactly one
@@ -75,8 +77,10 @@ the binary, commands and paths stay `herdr`.
   *foreground* client (its surface is the host's effective pane geometry), so
   E2 holds fleet connections only while the console runs; the ssh child
   inherits stderr, so a full-screen consumer must redirect it;
-  `FleetConnectorOptions.active_surface` is fixed at `start` (a reconnect of
-  the active host re-handshakes at that size — E2 owns the fix);
+  `FleetConnectorOptions.active_surface` was fixed at `start`, so a reconnect
+  of the active host re-handshook at that size — **PR 1 fixed this**: the
+  connector owns an `ActiveGeometry` that `set_active_geometry` updates and
+  every handshake re-reads;
   `HandshakeParams::read_only` sends cell size 0, `pixel_mouse: false`,
   `mouse_capture: false`, `direct_graphics: false`, `endpoint_keybindings:
   false`.
@@ -363,7 +367,7 @@ the binary, commands and paths stay `herdr`.
 
 | # | Title | Group | Depends on | Status |
 | --- | --- | --- | --- | --- |
-| 1 | feat(fleet): connector client options, active-surface tracking and takeable events | A · Foundations | — | ⬜ |
+| 1 | feat(fleet): connector client options, active-surface tracking and takeable events | A · Foundations | — | ✅ |
 | 2 | feat(fleet): pure sidebar and host picker models | A · Foundations | — | ✅ |
 | 3 | refactor: route client writes and fleet events through a server link seam | B · Console loop | 1 | ⬜ |
 | 4 | feat: herdr fleet opens the client shell over the fleet connector | B · Console loop | 2, 3 | ⬜ |
@@ -564,6 +568,57 @@ received messages, connection count) and `FleetConnector::start_with` behind
 comments that named E2 as the consumer only where this PR consumes them; the
 new items carry their own allow naming PR 3/4.
 
+**As built (PR 1, merged).** Deviations from the shapes above, all
+deliberate:
+
+- `FleetConnectorOptions.active_surface: ClientSurfaceSize` became
+  `active: ActiveGeometry`. The connector then owns that value in an
+  `Arc<Mutex<ActiveGeometry>>` shared with every supervisor, so
+  `wanted_geometry()` (ex-`wanted_surface`) reads the *current* console
+  geometry when a host handshakes. A host that drops while active therefore
+  re-handshakes at the latest geometry, hello included — the E1 gap, closed
+  in the hello rather than with a post-handshake resize.
+- `ActiveGeometry` carries the cell metrics and `pixel_mouse` as well as the
+  surface, and `HostLinkState.surface: Option<ClientSurfaceSize>` became
+  `announced: Option<ActiveGeometry>`, so a cell-size-only change (font
+  change, a different terminal) is still announced. `ActiveGeometry::default()`
+  is the read-only collector's geometry (`INACTIVE_SURFACE`, zero cells, no
+  pixel mouse), which is what `for_config` keeps using.
+- `FleetConnector::events()` returns `Option<&mut Receiver>` (it cannot hand
+  back a reference once `take_events` moved the receiver out). `oneshot.rs`
+  treats `None` as "nothing else can arrive". `shutdown` closes the receiver
+  when it still owns it and logs a `debug!` when it does not; **the caller
+  must drop a taken receiver before `shutdown`**, or a supervisor parked on a
+  full channel is only detached after the 2 s wait.
+- `HostCommand::Resize` and a raw `ClientShellResize` aimed at the *active*
+  host also update the shared `ActiveGeometry`, so PR 3/4's existing
+  `ClientShellResize` write through the link and `set_active_geometry` cannot
+  disagree.
+- Lock order, documented in the module header and relied on by every path:
+  `active_host` → one host's `HostLinkState` → `active_geometry`. A
+  supervisor never takes `active_host` (it reads its own `active` atomic), and
+  nothing takes two host link locks at once.
+- The fake endpoint server is `connector::test_support` — module and items
+  `pub(crate)`, gated `#[cfg(all(test, unix))]` like the tests it came from
+  (it binds a local socket by path and half-closes it). The type kept its
+  existing name **`FakeHost`** (the plan said `FakeEndpoint`), and the
+  connector builder is `fake_connector(&[(id, &FakeHost)], options)`.
+  `FleetConnector::start_with` is `pub(crate)`. Also exported: `Behaviour`,
+  `scratch_dir`, `snapshot`, `snapshot_message`, `surface_message`,
+  `drain_until`, `connected_with_snapshot`, `wait_for`, `hello_surface`,
+  `hello_geometry`, `resizes`, `resize_geometry`.
+- `src/fleet/oneshot.rs` is a fourth edited file (two `events()` call sites),
+  beyond this PR's Files list. Fork-owned and benign.
+- Two things the review deferred, for later PRs to own: (1) a supervisor
+  parked in `blocking_send` can only be released by the *receiver*, so a
+  console that shuts down while still holding a taken receiver leaks those
+  threads (bounded 2 s wait, `warn!`, detach — pinned by a test); PR 4 must
+  drop the receiver first, as the cross-cutting constraints already say.
+  (2) `set_active` and `set_active_geometry` write to a socket while holding
+  the active-host and link locks (pre-existing from E1), so a host that stops
+  reading could stall the console loop — **PR 8** owns "the active host is
+  down" and should decide whether a write timeout is needed.
+
 **Tests**
 
 - `set_active_geometry` before `set_active`: the activation resize carries the
@@ -585,13 +640,19 @@ H="env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH -u HERDR_ENV target/debu
 # [fleet] with lab-1, lab-2 as kind = "local" (see Verification); status must be unchanged by this PR:
 $H fleet status --json | python3 -c 'import json,sys;r=json.load(sys.stdin);print([(h["id"],h["connection"]["state"]) for h in r["hosts"]])'
 # geometry is a no-op for a read-only status run: a 120-col line in lab-1's pane stays unwrapped
-$H --session lab-1 pane run "$HERDR_FLEET_LAB_PANE_1" 'printf "%0120d\n" 0'; $H fleet status >/dev/null
-$H --session lab-1 pane read "$HERDR_FLEET_LAB_PANE_1" --source recent | grep -c '^0\{120\}$'   # 1
+# NOTE (from PR 1's run): the marker pane `exec`s `sh -c 'while :; do sleep 60; done'`,
+# so `pane run` types into a sleeping shell and nothing executes. Measure the host's
+# grid directly instead — `pane layout` reports the server-side area, and `stty size`
+# in a pane that *does* have a shell (`workspace create`) reports the pty:
+$H --session lab-1 workspace create --label probe   # -> w2:p1, a real shell
+$H --session lab-1 pane layout --pane w2:p1         # area 120x40 (herdr's headless default)
+$H fleet status --watch &                           # hold the fleet connections open
+$H --session lab-1 pane run w2:p1 'stty size'       # 40 119 with and without the fleet client
 bash scripts/fork/fleet-lab.sh down
 ```
 
-Evidence: unchanged status output, the unwrapped line, green
-`test-one fleet::connector`.
+Evidence: unchanged status output, an unreflowed host grid while a fleet
+client is connected, green `test-one fleet::connector`.
 
 **Downstream**
 
@@ -795,8 +856,10 @@ must pass unchanged — commit them green on the pre-refactor tree in the
 branch's first commit if any needed touching, which they should not)
 
 - `link.rs`: `Single` writes exactly `write_message` bytes (compare against a
-  reader on a socketpair); `Fleet` against `test_support::FakeEndpoint`
-  through a real `FleetConnector`: `ClientShellPaneInput` reaches the active
+  reader on a socketpair); `Fleet` against `test_support::FakeHost`
+  through a real `FleetConnector` (`fake_connector(&[("alpha", &alpha),
+  ("beta", &beta)], options)`; the module is `#[cfg(all(test, unix))]`, so
+  those tests are unix-gated): `ClientShellPaneInput` reaches the active
   fake host and **not** the other one; `Detach` → `Detached`; a write while
   the active host is `NotConnected` returns `Ok` and logs; `set_active`
   redirects the next write.
