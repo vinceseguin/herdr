@@ -364,7 +364,7 @@ the binary, commands and paths stay `herdr`.
 | # | Title | Group | Depends on | Status |
 | --- | --- | --- | --- | --- |
 | 1 | feat(fleet): connector client options, active-surface tracking and takeable events | A · Foundations | — | ⬜ |
-| 2 | feat(fleet): pure sidebar and host picker models | A · Foundations | — | ⬜ |
+| 2 | feat(fleet): pure sidebar and host picker models | A · Foundations | — | ✅ |
 | 3 | refactor: route client writes and fleet events through a server link seam | B · Console loop | 1 | ⬜ |
 | 4 | feat: herdr fleet opens the client shell over the fleet connector | B · Console loop | 2, 3 | ⬜ |
 | 5 | feat(fleet): sidebar host groups with live status and click-to-switch | C · Fleet UX | 4 | ⬜ |
@@ -618,24 +618,33 @@ renderer does no formatting per frame.
 ```rust
 pub enum HostRowState { Connected, Connecting { attempt: u32 }, Unavailable, Incompatible }
 pub struct HostHeaderRow { pub host: HostId, pub active: bool, pub collapsed: bool,
-    pub state: HostRowState, pub label: String /* "▸ lab-2 · 2 blocked · 3 working" */,
+    pub state: HostRowState, pub enabled: bool /* see "As built" */,
+    pub label: String /* "▸ lab-2 · 2 blocked · 3 working" */,
     pub reason: Option<String> /* dimmed second line when not connected */, pub rollup: AgentRollup }
 pub struct WorkspaceRow { pub workspace: FleetWorkspaceRef, pub label: String,
     pub status: AgentStatus, pub focused: bool }
 pub struct AgentRow { pub pane: FleetPaneRef, pub label: String /* name or title */,
     pub status: AgentStatus, pub focused: bool, pub state_change_seq: u64 }
-pub enum FleetSidebarRow { HostHeader(HostHeaderRow), Workspace(WorkspaceRow), Agent(AgentRow) }
+// Borrows (deviation from the sketch below): `visible_rows` is walked per frame,
+// and cloning a String per visible row per frame is the allocation this model exists
+// to avoid.
+pub enum FleetSidebarRow<'a> { HostHeader(&'a HostHeaderRow), Workspace(&'a WorkspaceRow), Agent(&'a AgentRow) }
 pub struct HostGroup { pub host: HostId, pub header: HostHeaderRow,
     pub workspaces: Vec<WorkspaceRow>, pub agents: Vec<AgentRow> }
 pub struct FleetSidebarModel { pub groups: Vec<HostGroup> /* config order, local first */,
     pub generation: u64 }
 impl FleetSidebarModel {
-    pub fn rebuild(&mut self, state: &FleetState, collapsed: &HashSet<HostId>);
+    // `sort` is upstream's live agent-panel preference; see "As built" below.
+    pub fn rebuild(&mut self, state: &FleetState, collapsed: &HashSet<HostId>,
+        sort: AgentPanelSortConfig);
     pub fn group(&self, host: &HostId) -> Option<&HostGroup>;
     pub fn agent_status(&self, pane: &FleetPaneRef) -> Option<AgentStatus>;   // PR 7 uses it
+    pub fn visible_rows(&self) -> impl Iterator<Item = FleetSidebarRow<'_>>;  // header, then body unless collapsed
+    pub fn visible_row_count(&self) -> usize;                                 // O(hosts), for scroll metrics
 }
 pub struct HostPickerRow { pub host: HostId, pub active: bool, pub state: HostRowState,
-    pub label: String /* "lab-2   connected 0.8.2-fork   2 blocked" */, pub kind: &'static str }
+    pub enabled: bool /* see "As built" */,
+    pub label: String /* "lab-2  connected 0.8.2-fork  2 blocked" */, pub kind: &'static str }
 pub fn host_picker_rows(state: &FleetState) -> Vec<HostPickerRow>;
 pub fn host_status_rank(status: AgentStatus) -> u8;   // Blocked 4, Done 3, Working 2, Idle 1, Unknown 0 — upstream's status_priority
 ```
@@ -649,6 +658,45 @@ is honoured when `agent_view_label` is set). Workspaces keep snapshot order;
 plain strings (no colour); glyphs come from `status` at draw time through the
 existing `status_icon`. `generation` increments on every rebuild so the
 renderer can cache derived heights per generation.
+
+**As built** (merged; 24 unit tests in `src/fleet/sidebar.rs`)
+
+- **`rebuild` takes a fourth argument, `sort: AgentPanelSortConfig`.** Locked
+  decision (k) says agents keep upstream's `ordered_agent_pane_ids` order, and
+  that order is a *function of* the user's `[ui] agent_panel_sort`: upstream
+  applies the `(Reverse(status_priority), Reverse(state_change_seq))` sort only
+  under `Priority` and leaves the snapshot's own workspace grouping alone under
+  `Spaces` — which is the shipped default (`src/config/model.rs` `#[default]`).
+  A named view (`agent_view_label` set) still wins over both. The preference is
+  a parameter, not something a pure module reads for itself, because the user
+  can also toggle it live by clicking the agent panel's sort label
+  (`src/client/shell/mouse.rs:1938`).
+- **`FleetSidebarRow` borrows** (`FleetSidebarRow<'a>`, and `row.host()`
+  returns `&'a HostId`), so `visible_rows` is allocation-free per frame and
+  PR 5 needs no clone to build a host-qualified hit rect.
+- **`enabled: bool` added to `HostHeaderRow` and `HostPickerRow`**, from
+  `HostSpec.enabled`. A disabled host is still listed (it is configuration the
+  user can see, and dropping it would desynchronize the picker's `1-9` indices
+  from the sidebar's groups), but `FleetState::set_active_host` refuses it —
+  so PR 5's click-to-switch and PR 6's picker must ignore a row with
+  `enabled == false` rather than route to it.
+- **Header labels** are `"{▾|▸} {host} · {detail}"`, where detail is the
+  non-zero counts (`"2 blocked · 1 working"`), `"no agents"` for a connected
+  host whose snapshot has none, `"loading"` for a connected host with no
+  snapshot yet, and otherwise the connection summary (`"connecting"`,
+  `"reconnecting (attempt 2)"`, `"unavailable"`, `"incompatible"`).
+  `host_picker_rows` labels are `"{host}  {connection summary}[  {counts|reason}]"`.
+- **Workspaces are filtered through `is_valid_resource_id`** at row-building
+  time. Agents are filtered once at ingestion (`retain_addressable_agents`);
+  workspaces are not, so a workspace id holding `/` would otherwise mint a
+  reference whose string form parses back into a *different* host.
+- `host_status_rank` is a copy of upstream's private `status_priority` (the
+  purity guard forbids `crate::client` in this module); a test `include_str!`s
+  `src/client/shell.rs` and asserts each arm, so upstream renumbering the table
+  fails the gate instead of silently reordering fleet groups.
+- `HostId::as_str` lost its `#[allow(dead_code)]`; `is_local` keeps its own
+  (PR 6's ssh socket scope). The module carries one `#![allow(dead_code)]`
+  whose comment says PR 5 deletes it.
 
 **Tests**
 
@@ -674,6 +722,14 @@ guard test.
   uses `agent_status`. E4's phone list uses `merged_agents()`, not this model.
 - Rows carry `FleetPaneRef`/`FleetWorkspaceRef`: every hit rect built from
   them is host-qualified.
+- PR 5 must pass `config.agent_panel_sort` into `rebuild` and treat the agent
+  panel's sort toggle as a model-invalidating event, alongside `FleetChange`
+  and collapse/active changes.
+- `visible_row_count()` counts a header as **one** row. `HostHeaderRow.reason`
+  is a *second* dimmed line, so PR 5 either folds the reason into the header
+  line or makes its own height cache treat a header as 1-or-2; the
+  cross-cutting "inactive-host row heights are constant (1)" wording assumes
+  the former.
 
 ### PR 3 — refactor: route client writes and fleet events through a server link seam · deps: 1
 
@@ -962,7 +1018,14 @@ focuses the target there). Profiled at 1 vs 5 hosts × 15 agents.
   host)*; `src/client/shell/mouse.rs` *(upstream — one `fleet_rows` hit test
   before the workspace/agent hit tests)*.
 - `src/client/fleet.rs`: `switch_host`, `apply_changes` (rebuild model →
-  `shell.fleet_sidebar_update`), handle `ClientShellAction::Fleet`.
+  `shell.fleet_sidebar_update`), handle `ClientShellAction::Fleet`. **PR 2
+  as-built:** `FleetSidebarModel::rebuild(&state, &collapsed, sort)` takes the
+  live `config.agent_panel_sort`, and the agent panel's sort toggle
+  (`src/client/shell/mouse.rs:1938`) invalidates the model like a
+  `FleetChange` does. Ignore a hit on a header/row whose
+  `HostHeaderRow.enabled` is `false` — `set_active_host` refuses a disabled
+  host. Header rows count as one row in `visible_row_count()`; if the
+  `reason` line is drawn separately, the height cache owns that second line.
 - `src/client/shell/tests/fleet_sidebar.rs` (new) and
   `src/client/shell/tests/fleet_scale.rs` (new, `#[ignore]` profile);
   `justfile` *(upstream — `bench-fleet-scale` recipe after
@@ -1112,7 +1175,9 @@ mode.
   `HostPicker` arm), `mouse.rs` *(upstream — one arm/delegation each)*;
   `src/client/shell.rs` *(`mod fleet_overlay;`)*.
 - `src/client/shell/tests/fleet_picker.rs` (new); `tests/fork_fleet_tui.rs`:
-  `host_picker_switches_hosts_from_the_keyboard`.
+  `host_picker_switches_hosts_from_the_keyboard`. **PR 2 as-built:**
+  `HostPickerRow` carries `enabled`; a disabled host is listed (so `1-9`
+  indices match the sidebar's groups) but selecting it must be a no-op.
 
 **Shapes/approach**
 

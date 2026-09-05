@@ -27,6 +27,7 @@ use std::cmp::Reverse;
 use std::collections::HashSet;
 
 use crate::api::schema::AgentStatus;
+use crate::config::AgentPanelSortConfig;
 use crate::fleet::hosts::HostId;
 use crate::fleet::refs::{is_valid_resource_id, FleetPaneRef, FleetWorkspaceRef};
 use crate::fleet::state::{AgentRollup, FleetState, HostConnection, HostState};
@@ -138,9 +139,12 @@ pub enum FleetSidebarRow<'a> {
     Agent(&'a AgentRow),
 }
 
-impl FleetSidebarRow<'_> {
+impl<'a> FleetSidebarRow<'a> {
     /// The host this row belongs to — the routing target of a click on it.
-    pub fn host(&self) -> &HostId {
+    ///
+    /// Borrowed from the model, not from the row, so a caller that copied a
+    /// row out of [`FleetSidebarModel::visible_rows`] can still hold the id.
+    pub fn host(&self) -> &'a HostId {
         match self {
             Self::HostHeader(header) => &header.host,
             Self::Workspace(row) => &row.workspace.host,
@@ -184,14 +188,25 @@ pub struct FleetSidebarModel {
 impl FleetSidebarModel {
     /// Derive every row from `state`.
     ///
-    /// Call this in response to a [`FleetChange`](crate::fleet::state::FleetChange)
-    /// or a collapse/active change — never per frame. Cost is O(hosts ×
-    /// (workspaces + agents log agents)) per call.
+    /// Call this in response to a [`FleetChange`](crate::fleet::state::FleetChange),
+    /// a collapse/active change, or a change of `sort` — never per frame. Cost
+    /// is O(hosts × (workspaces + agents log agents)) per call.
+    ///
+    /// `sort` is the console's live agent-panel preference, the same value
+    /// upstream's `ordered_agent_pane_ids` takes: it is configuration
+    /// (`[ui] agent_panel_sort`) that the user can also toggle by clicking the
+    /// agent panel's sort label, so it is a parameter rather than something
+    /// this module reads for itself.
     ///
     /// A host that is not `Connected` keeps the rows of its last snapshot
     /// (with zeroed counts) so the console dims a host instead of blanking it,
     /// which is the same rule `herdr fleet status` follows.
-    pub fn rebuild(&mut self, state: &FleetState, collapsed: &HashSet<HostId>) {
+    pub fn rebuild(
+        &mut self,
+        state: &FleetState,
+        collapsed: &HashSet<HostId>,
+        sort: AgentPanelSortConfig,
+    ) {
         let active = state.active_host();
         self.groups.clear();
         self.groups.reserve(state.hosts().len());
@@ -201,6 +216,7 @@ impl FleetSidebarModel {
                 host,
                 active.is_some_and(|active| active == id),
                 collapsed.contains(id),
+                sort,
             ));
         }
         // Saturating rather than wrapping: at u64::MAX a renderer's cache goes
@@ -319,13 +335,18 @@ pub fn host_status_rank(status: AgentStatus) -> u8 {
     }
 }
 
-fn host_group(host: &HostState, active: bool, collapsed: bool) -> HostGroup {
+fn host_group(
+    host: &HostState,
+    active: bool,
+    collapsed: bool,
+    sort: AgentPanelSortConfig,
+) -> HostGroup {
     let id = host.id().clone();
     let state = HostRowState::from_connection(&host.connection);
     let snapshot = host.snapshot.as_deref();
     HostGroup {
         workspaces: workspace_rows(&id, snapshot),
-        agents: agent_rows(&id, snapshot),
+        agents: agent_rows(&id, snapshot, sort),
         header: HostHeaderRow {
             active,
             collapsed,
@@ -440,33 +461,48 @@ fn workspace_rows(host: &HostId, snapshot: Option<&ClientShellSnapshot>) -> Vec<
         .collect()
 }
 
-fn agent_rows(host: &HostId, snapshot: Option<&ClientShellSnapshot>) -> Vec<AgentRow> {
+/// One host's agents in upstream's agent-panel order.
+///
+/// Mirrors `ordered_agent_pane_ids` in `src/client/shell/agent_sidebar.rs`
+/// arm for arm: a named view's `agent_order` wins outright, otherwise
+/// `Priority` sorts and `Spaces` (the default) keeps the snapshot's own
+/// workspace grouping.
+fn agent_rows(
+    host: &HostId,
+    snapshot: Option<&ClientShellSnapshot>,
+    sort: AgentPanelSortConfig,
+) -> Vec<AgentRow> {
     let Some(snapshot) = snapshot else {
         return Vec::new();
     };
-    let mut agents = snapshot.agents.iter().collect::<Vec<_>>();
     if snapshot.agent_view_label.is_some() {
         // The endpoint is presenting a named view; its `agent_order` is the
         // order, and an id it names that no longer exists is skipped —
-        // upstream's `ordered_agent_pane_ids`.
+        // upstream's `ordered_agent_pane_ids`. The scan is O(order × agents),
+        // which at an agent panel's cardinality (tens at most, once per
+        // change) costs less than building an index would.
         return snapshot
             .agent_order
             .iter()
             .filter_map(|pane_id| {
-                agents
+                snapshot
+                    .agents
                     .iter()
                     .find(|agent| &agent.pane_id == pane_id)
                     .map(|agent| agent_row(host, agent))
             })
             .collect();
     }
-    // Stable, so equal-priority agents keep snapshot order — upstream again.
-    agents.sort_by_key(|agent| {
-        (
-            Reverse(host_status_rank(agent.agent_status)),
-            Reverse(agent.state_change_seq),
-        )
-    });
+    let mut agents = snapshot.agents.iter().collect::<Vec<_>>();
+    if sort == AgentPanelSortConfig::Priority {
+        // Stable, so equal-priority agents keep snapshot order — upstream again.
+        agents.sort_by_key(|agent| {
+            (
+                Reverse(host_status_rank(agent.agent_status)),
+                Reverse(agent.state_change_seq),
+            )
+        });
+    }
     agents
         .into_iter()
         .map(|agent| agent_row(host, agent))
@@ -603,9 +639,11 @@ mod tests {
         );
     }
 
+    /// A model of `state` in priority order — what every test below that does
+    /// not name a sort expects. `Spaces` has its own test.
     fn model_of(state: &FleetState) -> FleetSidebarModel {
         let mut model = FleetSidebarModel::default();
-        model.rebuild(state, &HashSet::new());
+        model.rebuild(state, &HashSet::new(), AgentPanelSortConfig::Priority);
         model
     }
 
@@ -777,13 +815,13 @@ mod tests {
         );
 
         let mut model = FleetSidebarModel::default();
-        model.rebuild(&state, &HashSet::new());
+        model.rebuild(&state, &HashSet::new(), AgentPanelSortConfig::Priority);
         assert_eq!(model.visible_row_count(), 4);
         assert!(!model.groups[0].header.collapsed);
         assert_eq!(model.groups[0].header.label, "▾ local · 1 working");
 
         let collapsed = HashSet::from([local.clone()]);
-        model.rebuild(&state, &collapsed);
+        model.rebuild(&state, &collapsed, AgentPanelSortConfig::Priority);
         let group = &model.groups[0];
         assert!(group.header.collapsed);
         assert_eq!(group.header.label, "▸ local · 1 working");
@@ -1032,12 +1070,12 @@ mod tests {
         let mut state = FleetState::new(vec![local_spec()]);
         let mut model = FleetSidebarModel::default();
         assert_eq!(model.generation, 0);
-        model.rebuild(&state, &HashSet::new());
+        model.rebuild(&state, &HashSet::new(), AgentPanelSortConfig::Priority);
         assert_eq!(model.generation, 1);
         assert_eq!(model.groups.len(), 1);
 
         connect(&mut state, &HostId::local(), "0.8.2-fork");
-        model.rebuild(&state, &HashSet::new());
+        model.rebuild(&state, &HashSet::new(), AgentPanelSortConfig::Priority);
         assert_eq!(model.generation, 2);
         assert_eq!(model.groups.len(), 1, "a rebuild replaces, never appends");
         assert_eq!(model.groups[0].header.state, HostRowState::Connected);
@@ -1179,5 +1217,143 @@ mod tests {
         );
         assert!(model.groups.iter().all(|group| group.agents.is_empty()));
         assert!(model.groups[0].header.active);
+    }
+
+    #[test]
+    fn the_default_spaces_sort_keeps_the_snapshots_own_order() {
+        let mut state = FleetState::new(vec![local_spec()]);
+        let local = HostId::local();
+        connect(&mut state, &local, "0.8.2-fork");
+        state.apply(
+            &local,
+            HostEvent::Snapshot(snapshot(
+                "boot-1",
+                1,
+                vec![workspace("w1", "repo")],
+                vec![
+                    agent("w1:p1", AgentStatus::Idle, 10),
+                    agent("w1:p2", AgentStatus::Blocked, 1),
+                    agent("w1:p3", AgentStatus::Working, 5),
+                ],
+            )),
+        );
+
+        // `Spaces` is the shipped default and upstream leaves the snapshot's
+        // own workspace grouping alone under it; sorting here anyway would
+        // make a fleet group disagree with the single-host sidebar it stands
+        // in for.
+        let mut model = FleetSidebarModel::default();
+        model.rebuild(&state, &HashSet::new(), AgentPanelSortConfig::default());
+        assert_eq!(
+            AgentPanelSortConfig::default(),
+            AgentPanelSortConfig::Spaces
+        );
+        assert_eq!(
+            labels(&model.groups[0].agents),
+            vec!["agent-w1:p1", "agent-w1:p2", "agent-w1:p3"]
+        );
+
+        model.rebuild(&state, &HashSet::new(), AgentPanelSortConfig::Priority);
+        assert_eq!(
+            labels(&model.groups[0].agents),
+            vec!["agent-w1:p2", "agent-w1:p3", "agent-w1:p1"],
+            "the same state under the other sort"
+        );
+    }
+
+    #[test]
+    fn a_named_view_wins_over_either_sort() {
+        let mut state = FleetState::new(vec![local_spec()]);
+        let local = HostId::local();
+        connect(&mut state, &local, "0.8.2-fork");
+        let mut projection = snapshot(
+            "boot-1",
+            1,
+            vec![workspace("w1", "repo")],
+            vec![
+                agent("w1:p1", AgentStatus::Idle, 1),
+                agent("w1:p2", AgentStatus::Blocked, 2),
+            ],
+        );
+        projection.agent_view_label = Some("recent".to_string());
+        projection.agent_order = vec!["w1:p1".to_string(), "w1:p2".to_string()];
+        state.apply(&local, HostEvent::Snapshot(projection));
+        for sort in [AgentPanelSortConfig::Spaces, AgentPanelSortConfig::Priority] {
+            let mut model = FleetSidebarModel::default();
+            model.rebuild(&state, &HashSet::new(), sort);
+            assert_eq!(
+                labels(&model.groups[0].agents),
+                vec!["agent-w1:p1", "agent-w1:p2"],
+                "{sort:?} must not reorder a named view"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fleet_with_no_hosts_has_nothing_to_draw() {
+        let state = FleetState::new(Vec::new());
+        let model = model_of(&state);
+        assert!(model.groups.is_empty());
+        assert_eq!(model.visible_row_count(), 0);
+        assert_eq!(model.visible_rows().count(), 0);
+        assert!(model.group(&HostId::local()).is_none());
+        assert!(model
+            .agent_status(&FleetPaneRef::new(HostId::local(), "w1:p1"))
+            .is_none());
+        assert!(host_picker_rows(&state).is_empty());
+    }
+
+    #[test]
+    fn row_state_names_match_the_connection_they_came_from() {
+        for connection in [
+            HostConnection::Connected {
+                server_version: "0.8.2-fork".to_string(),
+                methods: Vec::new(),
+            },
+            HostConnection::Connecting { attempt: 3 },
+            HostConnection::Unavailable {
+                reason: "connection refused".to_string(),
+                retry_in: None,
+            },
+            HostConnection::Incompatible {
+                generation: Some(2),
+                reason: "endpoint generation 2".to_string(),
+            },
+        ] {
+            let row = HostRowState::from_connection(&connection);
+            assert_eq!(row.state_name(), connection.state_name());
+            assert_eq!(row.is_connected(), connection.is_connected());
+        }
+    }
+
+    #[test]
+    fn host_status_rank_still_matches_upstreams_source() {
+        // `host_status_rank` is a copy: the purity guard forbids this module
+        // from reaching into `crate::client`, and upstream's `status_priority`
+        // is private to `src/client/shell.rs`. Read the table out of that file
+        // instead, so upstream renumbering it fails here rather than silently
+        // reordering a fleet group.
+        const UPSTREAM: &str = include_str!("../client/shell.rs");
+        let start = UPSTREAM
+            .find("fn status_priority(")
+            .expect("upstream still has status_priority");
+        let body = &UPSTREAM[start..];
+        let end = body.find("\n}").expect("status_priority has a body");
+        let body = &body[..end];
+        for (status, rank) in [
+            (AgentStatus::Blocked, 4),
+            (AgentStatus::Done, 3),
+            (AgentStatus::Working, 2),
+            (AgentStatus::Idle, 1),
+            (AgentStatus::Unknown, 0),
+        ] {
+            let arm = format!("AgentStatus::{status:?} => {rank},");
+            assert!(
+                body.contains(&arm),
+                "upstream status_priority no longer maps {arm:?}; \
+                 host_status_rank must be updated with it:\n{body}"
+            );
+            assert_eq!(host_status_rank(status), rank);
+        }
     }
 }
