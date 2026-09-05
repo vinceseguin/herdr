@@ -8,23 +8,27 @@
 //! Layering: [`hosts`] turns `[fleet]` configuration into typed host specs,
 //! [`refs`] gives every server-side id a host-qualified form, [`state`] merges
 //! the hosts' snapshots into one ordered view and [`report`] serializes that
-//! view. All four are pure (no sockets, no async, no ratatui); a later PR adds
-//! the connector that feeds [`state::FleetState`] from real servers.
+//! view. Those four are pure (no sockets, no async, no ratatui). On top of
+//! them, [`transport`] opens one host, [`handshake`] speaks endpoint
+//! generation 1, [`endpoint_lane`] correlates one host's requests,
+//! [`connector`] runs a supervisor thread per host and merges their events,
+//! and [`oneshot`] drives all of it from a plain blocking caller.
 
-// These layers land before their first production consumer (the fleet
-// connector and `herdr fleet status`). Unit tests exercise every item, but
-// test-only use does not satisfy the dead-code lint, so it is allowed here
-// until the connector calls into them; that PR removes these attributes.
-// Scoped per module so a later module makes the same choice deliberately
-// instead of inheriting a crate-module-wide allow.
-#[allow(dead_code)]
+// No module-wide allows: the connector ships the whole host lane — commands
+// out, responses back — because that routing is what makes "this frame
+// belongs to that host" true, and E2 (input) and E7 (requests) must not invent
+// a second one. `herdr fleet status` is read-only, so the write half has no
+// production caller until those epics land; each such item carries its own
+// narrow allow with that reason next to it.
+pub mod connector;
+pub mod endpoint_lane;
+pub mod handshake;
 pub mod hosts;
-#[allow(dead_code)]
+pub mod oneshot;
 pub mod refs;
-#[allow(dead_code)]
 pub mod report;
-#[allow(dead_code)]
 pub mod state;
+pub mod transport;
 
 #[cfg(test)]
 mod tests {

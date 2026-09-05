@@ -307,7 +307,7 @@ integration test that boots two named sessions and asserts the merged status.
 | 2 | feat: pure fleet state merges host snapshots and renders a status report | A · Foundations | 1 | ✅ |
 | 3 | refactor: expose ssh stdio bridge and remote discovery for reuse | B · Transport | 4 | ✅ |
 | 4 | feat: ssh lab script runs a user-space sshd against the fleet lab | B · Transport | — | ✅ |
-| 5 | feat: fleet connector streams local hosts and herdr fleet status reports them | C · Connector and CLI | 2 | ⬜ |
+| 5 | feat: fleet connector streams local hosts and herdr fleet status reports them | C · Connector and CLI | 2 | ✅ |
 | 6 | feat: fleet connector reaches ssh hosts through the shared bridge | C · Connector and CLI | 3, 5 | ⬜ |
 | 7 | docs: fleet core reference, ssh lab guide, adr review | D · Docs | 6 | ⬜ |
 
@@ -1345,6 +1345,107 @@ vs 3 hosts — wall time must not scale with hosts (parallel supervisors).
 - `herdr fleet status --json` and the `--watch` NDJSON lines are frozen
   additive shapes (`schema: herdr.fleet.status.v1`).
 
+**As built (merged)**
+
+Shipped as `src/fleet/handshake.rs`, `src/fleet/transport/{mod,local}.rs`,
+`src/fleet/endpoint_lane.rs`, `src/fleet/connector.rs`,
+`src/fleet/oneshot.rs`, `src/cli/fleet.rs` and `tests/cli/fleet.rs`, with the
+upstream wiring limited to `src/cli.rs` (one `mod fleet;`, one match arm),
+`src/cli/spec.rs` (`fleet_command()`), `src/main.rs` (one usage line, `"fleet"`
+in the bare-command list) and `tests/cli/mod.rs`. Deviations and discovered
+constraints, all deliberate:
+
+- **`INACTIVE_SURFACE` is herdr's default headless geometry (120x40), not the
+  20x5 decision (e) suggested.** Validating against a live 0.8.2-fork server
+  showed what the decision did not anticipate: a connecting client shell
+  becomes that host's *foreground* client
+  (`server::headless`'s `ClientShellConnected` arm sets
+  `foreground_client_id` unconditionally), and the foreground client's surface
+  is the host's **effective pane geometry**. A 20x5 fleet client therefore
+  reflowed every pane on every configured host and sent every agent running
+  there a 20x5 SIGWINCH — during a read-only `herdr fleet status`. Evidence: a
+  120-column line in a lab pane came back wrapped at 19 columns after one
+  status run. `crate::config::DEFAULT_HEADLESS_COLS/ROWS` is the size a host
+  with no attached client is *already* using, so the fleet's main case
+  (headless servers running agents) is a no-op resize; the same run with the
+  new constant leaves the pane unwrapped. The residual cannot be fixed in E1:
+  a host that already has an attached client, or one with a configured
+  `headless_size`, is resized while the fleet client is connected and restored
+  when it disconnects. **E2 must therefore hold fleet connections only while
+  the fleet console is in use**, and a future epic that wants a truly passive
+  reader needs an endpoint observer capability (a server change, out of E1's
+  scope). The cost decision (e) was protecting is still paid where it matters:
+  an inactive host's frames are dropped in the reader thread before anything is
+  allocated into the event channel.
+- **`transport_for` returns `Result<Box<dyn HostTransport>, String>`**, where
+  `Err` is the host-local `Unavailable` reason. `HostKind::Ssh` returns the
+  `SSH_PENDING_REASON` constant in `transport/mod.rs`. A host whose transport
+  cannot be built is reported `Unavailable { reason, retry_in: None }` **once**
+  and its supervisor exits: retrying cannot change which transports this build
+  has. One consequence for the CLI: `--watch` ends when every supervisor has
+  exited, so watching a fleet of only ssh hosts prints the report and returns.
+- **`FleetConnector::start_with(specs, options, TransportFactory)`** is a
+  private constructor that `start` calls with `transport_for` and the tests
+  call with fake endpoint servers, so production always goes through
+  `transport_for` while the tests drive real sockets without depending on the
+  machine's session directory.
+- **`HostLinkState.pending`** holds a clone of a connection that is still
+  handshaking. It is never written to (a resize before the hello would break
+  the handshake) but `shutdown` half-closes it, so a host that accepts and then
+  says nothing cannot hold shutdown for the welcome deadline.
+- **`Connecting { attempt }` is the 1-based number of the attempt in progress**
+  and does not reset on success, so a host that connects, drops and reconnects
+  reports `attempt: 2` as the plan's test expects. It saturates rather than
+  wrapping.
+- **An incompatible host retries at the backoff ceiling**, driven by
+  `Backoff::{next, peek}` (`drive_to_ceiling`) rather than a second schedule,
+  because a host that needs an update may be updated while the fleet runs.
+- **The endpoint lane's 60 s expiry is checked opportunistically** — on any
+  inbound message that is not a surface frame, and on disconnect — not on a
+  timer: the connector owns no clock thread, and a host silent enough to miss
+  the check is reported through its connection state instead.
+- **`herdr fleet status` sets no active host.** The collector renders nothing,
+  so every host stays at the inactive surface and no host is asked for a
+  bigger one; the report's `active_host` is `null`.
+- **CLI details:** `--timeout-ms` accepts `--timeout-ms N` and
+  `--timeout-ms=N` and is capped at 600000 so a typo cannot hang a script;
+  `herdr fleet --help` is answered by the shared clap spec and `herdr fleet
+  help` by the command's own help; `--watch` flushes every line and treats a
+  broken pipe (`| head`) as a normal end.
+- **Dead-code allows:** the four module attributes PRs 1 and 2 left on
+  `hosts`, `refs`, `report` and `state` are gone. `connector` and
+  `endpoint_lane` carry their own module-level allow, with a reason: they ship
+  the whole host lane (commands out, responses back) because that routing is
+  what makes "this frame belongs to that host" true, and E2 (input) and E7
+  (requests) must not invent a second one, while `herdr fleet status` exercises
+  only the read half. The remaining item-level allows are
+  `HostId::{as_str, is_local}`, the three `Fleet*Ref::{host, id}` accessor
+  pairs, `AgentRollup::total`, `handshake::REMOTE_HANDSHAKE_READ_TIMEOUT`
+  (PR 6) and `FleetConnectorOptions.manage_ssh_config` (PR 6).
+- **The endpoint lane is stricter than the sketch**, after the review pass:
+  `HostCommand::Endpoint`'s `request_id` must equal the request's JSON `id`
+  (the server correlates by that field and closes the connection on an
+  envelope it cannot decode), and `HostCommand::Raw` refuses a
+  `ClientShellEndpointRequest` (it would carry a caller-chosen `boot_id`) and
+  an `EndpointControl` (a second handshake). Both come back as the new
+  `HostSendError::Refused(&'static str)` with nothing written. A raw
+  `ClientShellResize` is allowed and updates the size bookkeeping
+  `set_active` reads. `send(Endpoint)` returning `Ok(())` means **exactly one**
+  `FleetEvent::EndpointResponse` will follow — the answer, the host's error,
+  an expiry, or the disconnect that made an answer impossible.
+  `FleetConnectorOptions.endpoint_timeout` (default 60 s) is what the lane
+  expires on.
+- **`shutdown` closes the event receiver before waiting**, so a supervisor
+  parked on a full channel (a consumer that stopped reading before calling
+  `shutdown`) is released immediately rather than at the end of the bounded
+  join.
+- **Deferred for E2:** `FleetConnectorOptions.active_surface` is fixed at
+  `start`, so a *reconnect* of the active host re-handshakes with the size the
+  connector was built with, not the size E2 last sent with
+  `HostCommand::Resize`. Not a routing bug, and E2 owns resize semantics; E2
+  should add a setter (or have the connector remember the last active resize)
+  when it lands.
+
 ### PR 6 — feat: fleet connector reaches ssh hosts through the shared bridge · deps: 3, 5
 
 **Goal:** `HostKind::Ssh` hosts connect through PR 3's bridge — discovery,
@@ -1359,6 +1460,52 @@ the whole chain.
 - `src/fleet/connector.rs`: pass `manage_ssh_config`; remove the
   "ssh hosts land in PR 6" placeholder; use `REMOTE_HANDSHAKE_READ_TIMEOUT`
   (60 s) for ssh transports.
+
+**What PR 5 shipped that PR 6 plugs into** (exact signatures):
+
+```rust
+// src/fleet/transport/mod.rs
+pub trait HostTransport: Send {
+    fn connect(&mut self) -> io::Result<LocalStream>;   // called only on that host's supervisor thread; may block
+    fn read_timeout(&self) -> Duration;                 // welcome deadline; ssh returns REMOTE_HANDSHAKE_READ_TIMEOUT
+    fn describe(&self) -> String;                       // log field and failure-reason prefix
+}
+pub fn transport_for(
+    spec: &HostSpec,
+    _options: &crate::fleet::connector::FleetConnectorOptions,
+) -> Result<Box<dyn HostTransport>, String>;            // Err = the host-local `Unavailable` reason
+
+const SSH_PENDING_REASON: &str = "ssh hosts land in PR 6";   // PR 6 deletes this and the `HostKind::Ssh` arm that returns it
+
+// src/fleet/connector.rs
+pub struct FleetConnectorOptions {
+    pub handshake: HandshakeParams,      // `surface_size` is the *inactive* size
+    pub active_surface: ClientSurfaceSize,
+    pub manage_ssh_config: bool,         // #[allow(dead_code)] until PR 6 reads it here
+    pub max_frame_size: usize,
+    pub endpoint_timeout: Duration,      // lane expiry; default 60 s
+}
+pub const INACTIVE_SURFACE: ClientSurfaceSize;  // 120x40; see PR 5's As built for why
+
+// src/fleet/handshake.rs
+pub const REMOTE_HANDSHAKE_READ_TIMEOUT: Duration;  // 60 s, #[allow(dead_code)] until PR 6 returns it
+pub struct HandshakeParams { pub cell_width_px: u32, pub cell_height_px: u32,
+    pub surface_size: ClientSurfaceSize, pub pixel_mouse: bool, pub mouse_capture: bool, pub read_timeout: Duration }
+impl HandshakeParams { pub fn read_only(surface_size: ClientSurfaceSize) -> Self }
+```
+
+PR 6's `SshTransport` therefore: implements those three methods, is returned
+from the `HostKind::Ssh` arm of `transport_for` (which now reads
+`options.manage_ssh_config`), returns `REMOTE_HANDSHAKE_READ_TIMEOUT` from
+`read_timeout`, and drops the `#[allow(dead_code)]` from that constant and from
+`FleetConnectorOptions.manage_ssh_config` as it becomes their first consumer —
+alongside the two PR 3 left in `src/remote/attach.rs`. A `connect` failure of
+any kind (discovery, bridge start, socket) is just an `io::Error`: the
+supervisor already turns it into `Unavailable { reason, retry_in }` and backs
+off, so `SshTransport` needs no reconnect logic of its own. Note that the
+supervisor reports a `transport_for` **`Err`** once and stops, so PR 6 must
+return `Ok(transport)` for every configured ssh host and report discovery
+failures from `connect` instead.
 
 **Shapes/approach**
 
