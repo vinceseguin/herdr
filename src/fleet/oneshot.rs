@@ -35,7 +35,10 @@ impl FleetSession {
     /// user error the caller reports and exits on, not a host failure.
     pub fn start(config: &Config) -> Result<Self, Vec<String>> {
         let specs = resolve_hosts(&config.fleet)?;
-        Ok(Self::with_specs(specs, FleetConnectorOptions::default()))
+        Ok(Self::with_specs(
+            specs,
+            FleetConnectorOptions::for_config(config),
+        ))
     }
 
     fn with_specs(specs: Vec<HostSpec>, options: FleetConnectorOptions) -> Self {

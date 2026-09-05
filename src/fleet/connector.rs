@@ -83,15 +83,29 @@ pub struct FleetConnectorOptions {
     pub handshake: HandshakeParams,
     /// Surface size for whichever host is active.
     pub active_surface: ClientSurfaceSize,
-    /// Whether ssh transports use herdr's managed ssh config (PR 6).
-    // Read by PR 6's ssh transport; until then only the default constructs it.
-    #[allow(dead_code)]
+    /// Whether ssh transports use herdr's managed ssh config (`[remote]`'s
+    /// `manage_ssh_config`): keepalive fallbacks and a private control master,
+    /// exactly as `herdr --remote` uses them.
     pub manage_ssh_config: bool,
     /// Largest endpoint frame accepted from a host.
     pub max_frame_size: usize,
     /// How long one endpoint request may wait for its answer before it is
     /// failed and the next queued request runs.
     pub endpoint_timeout: Duration,
+}
+
+impl FleetConnectorOptions {
+    /// Read-only options for one `[fleet]` run.
+    ///
+    /// `[remote]`'s `manage_ssh_config` is the same switch `herdr --remote`
+    /// reads, so an operator who turned herdr's managed ssh config off gets
+    /// plain ssh for fleet hosts too.
+    pub fn for_config(config: &crate::config::Config) -> Self {
+        Self {
+            manage_ssh_config: config.remote.manage_ssh_config,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for FleetConnectorOptions {
@@ -1568,6 +1582,103 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// An ssh host that cannot be reached must not disturb a healthy local
+    /// host: the whole point of a per-host supervisor.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_ssh_host_never_changes_a_local_host() {
+        use crate::fleet::transport::ssh::fake_ssh::{ssh_env_lock, FakeSsh};
+
+        let _guard = ssh_env_lock().lock().expect("ssh env lock");
+        // Every ssh command fails, so the ssh host loops connect → unavailable.
+        let shim = FakeSsh::install_unreachable("connector-host-local");
+
+        let dir = scratch_dir("host-local");
+        let alpha = FakeHost::start(
+            &dir,
+            "alpha",
+            Behaviour::Serve(vec![snapshot_message(&snapshot("boot-alpha", 3))]),
+        );
+        let ssh_spec = HostSpec {
+            id: HostId::new("box").expect("valid host id"),
+            kind: HostKind::Ssh {
+                target: "unreachable-host".to_string(),
+                session: Some("agents".to_string()),
+            },
+            enabled: true,
+        };
+        let specs = vec![ssh_spec.clone(), alpha.spec("alpha")];
+        let mut state = FleetState::new(specs.clone());
+        let socket = alpha.socket.clone();
+        let mut connector = FleetConnector::start_with(
+            specs,
+            // `manage_ssh_config: false`: a test must never read the running
+            // user's `~/.ssh/config` into a managed config or start a control
+            // master.
+            FleetConnectorOptions::default(),
+            // The ssh host goes through the real `transport_for`; only the
+            // local host is redirected at the fake endpoint's socket.
+            Arc::new(
+                move |spec: &HostSpec, options: &FleetConnectorOptions| match &spec.kind {
+                    HostKind::Ssh { .. } => transport_for(spec, options),
+                    HostKind::Local { .. } => {
+                        Ok(Box::new(LocalTransport::with_socket(socket.clone()))
+                            as Box<dyn HostTransport>)
+                    }
+                },
+            ),
+        );
+
+        let alpha_id = HostId::new("alpha").expect("valid host id");
+        let box_id = HostId::new("box").expect("valid host id");
+        // Wait until the ssh host has failed at least twice, so the local host
+        // has lived through more than one of its neighbour's failures.
+        let mut ssh_failures = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while ssh_failures < 2 && Instant::now() < deadline {
+            match connector.events().try_recv() {
+                Ok(FleetEvent::Host { host, event }) => {
+                    if host == box_id && matches!(event, HostEvent::Unavailable { .. }) {
+                        ssh_failures += 1;
+                    }
+                    state.apply(&host, event);
+                    // The local host, once connected, never leaves.
+                    if connected_with_snapshot(&state, "alpha") {
+                        assert!(
+                            state
+                                .host(&alpha_id)
+                                .is_some_and(|host| host.connection.is_connected()),
+                            "the local host lost its connection when the ssh host failed"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        assert!(
+            ssh_failures >= 2,
+            "the ssh host must keep retrying, not stop after one failure"
+        );
+        assert!(
+            connected_with_snapshot(&state, "alpha"),
+            "the local host must be connected with a snapshot despite the ssh host"
+        );
+        assert_eq!(alpha.connections(), 1, "the local host reconnected");
+        let trace = shim.trace();
+        assert!(
+            !trace.contains("remote-client-bridge") && !trace.contains("mkdir -p"),
+            "an unreachable ssh host must not be bridged or installed to; trace: {trace}"
+        );
+
+        state.assert_invariants_for_test();
+        connector.shutdown();
     }
 
     #[test]

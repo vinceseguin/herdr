@@ -703,9 +703,8 @@ fn prepare_remote_herdr(
 /// Never reads `HERDR_REMOTE_BINARY`, never installs or uploads a binary,
 /// never stops or hands off a remote server, and never prompts. A host with
 /// no compatible herdr is `Ok(None)`; only transport failures are `Err`.
-// Consumed by `src/fleet/transport/ssh.rs` (E1 PR 6); `herdr --remote` keeps
-// using `prepare_remote_herdr`, which shares the probe helper below.
-#[allow(dead_code)]
+// Consumed by `src/fleet/transport/ssh.rs`; `herdr --remote` keeps using
+// `prepare_remote_herdr`, which shares the probe helper below.
 pub(crate) fn discover_remote_herdr(ssh: &RemoteSsh) -> io::Result<Option<RemoteHerdr>> {
     let platform = detect_remote_platform(ssh)?;
     let remote_herdr = RemoteHerdr::for_platform(platform);
@@ -1799,8 +1798,7 @@ impl SshStdioBridge {
 #[derive(Clone)]
 pub(crate) enum BridgeErrorSink {
     Stderr,
-    // Constructed by `src/fleet/transport/ssh.rs` (E1 PR 6).
-    #[allow(dead_code)]
+    // Constructed by `src/fleet/transport/ssh.rs`.
     Report(Arc<dyn Fn(String) + Send + Sync>),
 }
 

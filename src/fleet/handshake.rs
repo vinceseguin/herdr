@@ -33,10 +33,8 @@ pub const LOCAL_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Welcome deadline for a host behind ssh.
 ///
 /// Mirrors `client::handshake::REMOTE_HANDSHAKE_READ_TIMEOUT`: the first frame
-/// travels behind a cold ssh connection.
-// The ssh transport that returns it from `HostTransport::read_timeout` lands in
-// PR 6; the constant belongs next to the local one it is paired with.
-#[allow(dead_code)]
+/// travels behind a cold ssh connection. Returned by
+/// `transport::ssh::SshTransport::read_timeout`.
 pub const REMOTE_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What the fleet client tells a host about itself.

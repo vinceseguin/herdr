@@ -308,7 +308,7 @@ integration test that boots two named sessions and asserts the merged status.
 | 3 | refactor: expose ssh stdio bridge and remote discovery for reuse | B · Transport | 4 | ✅ |
 | 4 | feat: ssh lab script runs a user-space sshd against the fleet lab | B · Transport | — | ✅ |
 | 5 | feat: fleet connector streams local hosts and herdr fleet status reports them | C · Connector and CLI | 2 | ✅ |
-| 6 | feat: fleet connector reaches ssh hosts through the shared bridge | C · Connector and CLI | 3, 5 | ⬜ |
+| 6 | feat: fleet connector reaches ssh hosts through the shared bridge | C · Connector and CLI | 3, 5 | ✅ |
 | 7 | docs: fleet core reference, ssh lab guide, adr review | D · Docs | 6 | ⬜ |
 
 **Wave preview (2-agent cap):** W1 `[1, 4]` → W2 `[2, 3]` → W3 `[5]` → W4
@@ -1608,6 +1608,71 @@ the `nowhere` host check only, and record the degradation in the PR body.
   above really does cut every ssh path to the lab, which is what makes the
   host go `unavailable`.
 
+**As built (merged)**
+
+Shipped as `src/fleet/transport/ssh.rs`, the `HostKind::Ssh` arm of
+`transport_for`, and the deletion of the four `#[allow(dead_code)]` markers
+PRs 3 and 5 left for this PR (`discover_remote_herdr`,
+`BridgeErrorSink::Report`, `handshake::REMOTE_HANDSHAKE_READ_TIMEOUT`,
+`FleetConnectorOptions.manage_ssh_config`). `SSH_PENDING_REASON` and its arm
+are gone. Deviations and discovered constraints:
+
+- **`[remote].manage_ssh_config` needed one line outside the task's file
+  list.** `FleetSession::start` built `FleetConnectorOptions::default()`, whose
+  `manage_ssh_config` is `false`, so nothing would ever have set it: the
+  option's only producer is the config. PR 6 adds
+  `FleetConnectorOptions::for_config(&Config)` in `connector.rs` and calls it
+  from `src/fleet/oneshot.rs`. Without it every fleet ssh host would run plain
+  `ssh` while `herdr --remote` used the managed config — different keepalives
+  and no shared control master, and the reconnect evidence below depends on the
+  master existing.
+- **A bridge failure costs one attempt, deliberately.** The bridge is a
+  listener: `connect` returns as soon as the local socket accepts, so an ssh
+  child that dies is invisible to that attempt and shows up as the handshake's
+  EOF. `SshTransport` therefore records the sink's message and returns it as
+  the *next* attempt's `io::Error` (`ConnectionAborted`), and retires the ssh
+  session, discovery cache and bridge at the same time, so the attempt after
+  that re-probes the host and reports the real ssh error. Live evidence: a host
+  cut off mid-run reports `host closed the connection` → `remote bridge failed:
+  ssh bridge exited with exit status: 255` → `remote platform detection failed:
+  ssh: Could not resolve hostname …` and then reconnects, at 1 s → 2 s → 4 s →
+  8 s.
+- **Discovery is cached per transport and retired by failure, not by age.** A
+  reconnect after a remote *server* restart pays no ssh round-trip (unit test:
+  three connects, one `status client --json` probe); a discovery failure or a
+  bridge failure clears the cache so the next attempt probes again (unit test:
+  two failed connects, two `uname -s` probes).
+- **The reason for a host with no generation-1 herdr substitutes the real
+  target**: ``no herdr with endpoint generation 1 on host; run `herdr --remote
+  herdr-ssh-lab` once to install it``. Decision (f)'s wording is kept verbatim
+  apart from the placeholder, because the command is what the operator has to
+  run.
+- **`transport_for` returns `Ok` for every configured ssh host.** Building a
+  transport does no I/O at all: `RemoteSsh` (which may write the managed ssh
+  config) is created on the first `connect`, on the supervisor thread. Only the
+  forward socket path is derived eagerly, because the bridge binds it and it
+  must not move under a reconnect.
+- **Teardown order is explicit.** `SshTransport::drop` clears the bridge before
+  the `RemoteSsh`, so the accept thread and its ssh children are gone before
+  `-O exit` closes the control master. A process killed by a signal still
+  leaves its forward socket behind (Rust runs no destructors); the name carries
+  the pid, so nothing collides. E3's gateway must call `shutdown` on exit.
+- **Tests use a fake `ssh` on `PATH`, never a real host.** The shim lives in
+  `#[cfg(all(test, unix))] pub(crate) mod fake_ssh` inside `ssh.rs` (so
+  `connector.rs`'s host-local invariant test can use it too), answers the
+  discovery probes, and either `exec`s a small python3 stdio proxy into the
+  test's fake endpoint socket or fails like an unreachable host. Every such
+  test holds `fake_ssh::ssh_env_lock()` and constructs the transport with
+  `manage_ssh_config: false`, so no test writes anything under `$HOME`.
+- **The lab's panes run no agent**, so `agents[]` is empty in a fleet report of
+  the ssh lab; the host-qualified `workspaces[]` (`lab-ssh/w1`, label `lab-1`)
+  is what proves the snapshot crossed the bridge. PR 5's sketch of the expected
+  output assumed a detected agent.
+- `HostId::as_str` now has a production consumer (the forward-socket scope) but
+  keeps its `#[allow(dead_code)]` from PR 1, because `src/fleet/hosts.rs` was
+  outside this PR's file list. PR 7 (or the first later PR touching `hosts.rs`)
+  should drop it.
+
 ### PR 7 — docs: fleet core reference, ssh lab guide, adr review · deps: 6
 
 **Goal:** a user can configure `[fleet]`, read `herdr fleet status`, and a
@@ -1621,7 +1686,19 @@ developer can run the ssh lab; ADR 0001 records what E1 learned.
   connection states and what each means, the "run `herdr --remote <target>`
   once to install" rule, reconnect behaviour, what the connector never does,
   and the E2/E3 contracts in one short "for developers" section (module map
-  of `src/fleet/`).
+  of `src/fleet/`). *From PR 6 (shipped), the ssh half must also say:* an ssh
+  host needs one prior `herdr --remote <target>` because the fleet never
+  installs, uploads, stops or hands off anything (decision (f)), and the exact
+  reason a host without one reports; that `[remote].manage_ssh_config` governs
+  fleet ssh hosts too (keepalives and the shared control master), and that
+  turning it off means plain `ssh`; that ssh reconnects can take a few attempts
+  while the transport re-probes the host, with the reason string naming the
+  step that failed (`remote bridge failed: …`, `remote platform detection
+  failed: …`); that the private forward socket lives beside `herdr --remote`'s
+  (one per pid and host id) and is unlinked on a clean exit but **not** when
+  the process is killed by a signal, which also leaves the `ControlPersist`
+  ssh master until it times out; and that the ssh child inherits stderr, so a
+  TUI consumer (E2) must redirect it.
 - `docs/fork/README.md`: a *Fleet core* section (config snippet, the status
   command) and an *SSH lab* section (`ssh-lab.sh up|status|env|down`, the
   `HOME=$HERDR_SSH_LAB_HOME` rule, isolation guarantees, `sshd not found`
@@ -1635,6 +1712,10 @@ developer can run the ssh lab; ADR 0001 records what E1 learned.
 - `docs/fork/ROADMAP.md`: no status flip here (`implement-epic` owns it);
   only correct factual drift in the E1 section if any (e.g. the added
   `--timeout-ms`/`--watch` flags).
+- Code janitoring left by PR 6 (do it in the first later PR that touches the
+  file, not in a docs-only commit): `HostId::as_str` in `src/fleet/hosts.rs`
+  still carries PR 1's `#[allow(dead_code)]` although PR 6's forward-socket
+  scope is now a production consumer.
 
 **Tests:** none (docs). Every command block is executed verbatim during
 validation.
