@@ -1,0 +1,124 @@
+name: Fork CI
+
+# Fork CI for vinceseguin/herdr. Upstream's workflows are disabled through
+# repository state (`gh workflow disable`), so this file is the only CI that
+# runs here. It runs exactly the fork gate (`just ci`) plus the upstream
+# conventional-commit check and shellcheck over the fork's own scripts.
+# Action SHAs are kept identical to .github/workflows/ci.yml so upstream
+# Dependabot-style bumps stay mergeable.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+concurrency:
+  group: fork-ci-${{ github.event.pull_request.number || github.ref }}
+  # Superseded pull-request runs are noise; master runs are the fork's record
+  # that a merged commit was green, so they are never cancelled. (ci.yml
+  # cancels both; master pushes are rare enough here to be worth keeping.)
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  conventional-commits:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Deliberate divergence from ci.yml's `--range before..after`: upstream
+      # only ever squash-merges into master, while this fork also lands
+      # `git merge upstream/master` (see .claude/rules/fork.md). A plain range
+      # would then validate upstream's merge commits and its contributors'
+      # subjects, which this fork neither authors nor can fix. Walking only the
+      # first-parent line yields exactly the commits this push added to master
+      # -- the squash commit of a fork PR, or a direct push -- and drops the
+      # merge commit itself, so an upstream sync validates nothing instead of
+      # failing. The SHAs go through env rather than into the script body.
+      - name: Validate commit subjects
+        if: github.event_name == 'push'
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          if ! git rev-parse --verify --quiet "$PUSH_BEFORE^{commit}" >/dev/null; then
+            echo "previous commit $PUSH_BEFORE is unavailable (new or rewritten branch); nothing to validate"
+            exit 0
+          fi
+          subjects_raw="$(git log --no-merges --first-parent --pretty=tformat:%s "$PUSH_BEFORE..$PUSH_AFTER")"
+          if [ -z "$subjects_raw" ]; then
+            echo "no fork-authored commits in $PUSH_BEFORE..$PUSH_AFTER"
+            exit 0
+          fi
+          mapfile -t subjects <<<"$subjects_raw"
+          python3 scripts/conventional_commits.py "${subjects[@]}"
+
+      - name: Validate PR title
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: python3 scripts/conventional_commits.py "$PR_TITLE"
+
+  check:
+    name: check (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          components: rustfmt,clippy
+
+      - name: Install Rust tools
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: just,cargo-nextest
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: false
+          key: fork-ubuntu-latest
+
+      - name: Run the gate
+        run: just ci
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Shellcheck fork scripts
+        run: shellcheck -S warning scripts/fork/*.sh

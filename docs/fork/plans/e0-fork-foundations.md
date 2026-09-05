@@ -204,7 +204,7 @@ epic dependency.
 
 | # | Title | Group | Depends on | Status |
 | --- | --- | --- | --- | --- |
-| 1 | ci: add fork ci workflow and disable upstream workflows | A · Repository | — | ⬜ |
+| 1 | ci: add fork ci workflow and disable upstream workflows | A · Repository | — | ✅ |
 | 2 | chore: add mise-based fork dev setup script and verify the gate | A · Repository | 1 | ⬜ |
 | 3 | feat: fork build channel disables self-update and shows in version | B · Identity | 1 | ⬜ |
 | 4 | feat: fleet lab script boots isolated named herdr sessions | C · Fleet lab | 1 | ⬜ |
@@ -365,6 +365,44 @@ cannot re-enable them.
 URL for the PR head with all three jobs green; `gh workflow list --all`
 output; `gh run list --repo vinceseguin/herdr --workflow=ci.yml --limit 3`
 showing no run for the PR head (upstream CI did not fire).
+
+**Outcome (as merged)**
+
+- `.github/workflows/fork-ci.yml` landed with three jobs whose check names are
+  stable for `gh pr checks`: `conventional-commits`, `check (ubuntu-latest)`,
+  `shellcheck`. Action SHAs are identical to `ci.yml`'s ubuntu path
+  (checkout v6, `dtolnay/rust-toolchain` v1, `taiki-e/install-action` v2.81.9,
+  `oven-sh/setup-bun` v2 @ bun 1.3.14, `mlugg/setup-zig` v2.2.1 @ 0.15.2,
+  `Swatinem/rust-cache` v2 with `cache-bin: false`, `key: fork-ubuntu-latest`).
+  macOS/Windows-only steps (Homebrew Zig, `.zig-cache` restore, cmake/ninja,
+  ConPTY) are intentionally absent.
+- **Two deliberate divergences from `ci.yml`**, both commented in the file:
+  1. The push-event commit check does **not** use
+     `conventional_commits.py --range before..after`. `.claude/rules/fork.md`
+     mandates `git merge upstream/master` pushed to fork `master`, and
+     `origin/master` already carries non-conventional upstream subjects
+     (`Merge pull request #25 from …`, `Update rose pine surface_dim colour …`),
+     so a plain range would leave `master` permanently red on every sync. The
+     step walks `git log --no-merges --first-parent "$BEFORE..$AFTER"` and
+     passes those subjects positionally, guarded by
+     `git rev-parse --verify --quiet` for a zero/unreachable `before`
+     (branch creation, force push). Trade-off: a non-squash merge of a *fork*
+     feature branch would skip its individual commits — fork policy is
+     squash-merge only, and the PR-title check covers those.
+  2. `cancel-in-progress: ${{ github.event_name == 'pull_request' }}` — PR runs
+     supersede, but back-to-back squash merges must not cancel a `master` run,
+     because the epic validation reads that green record.
+- **Upstream workflows are disabled by repository state**, done *before* the
+  branch was pushed. All ten file-backed workflows report `disabled_manually`
+  in `gh workflow list --all -R vinceseguin/herdr`; `gh run list
+  --workflow=ci.yml` shows no run for this PR's head. The two dynamic entries
+  named in the plan (`Dependabot Updates`, `Copilot`) are **not present at all**
+  on this fork — `gh workflow disable "Dependabot Updates"` and `… "Copilot"`
+  both answer `could not find any workflows named …`. Nothing to do; they are
+  not push-triggered and `.github/dependabot.yml` stays as upstream ships it.
+- `shellcheck` was **not** on this machine's PATH; it was installed with
+  `mise use -g shellcheck@latest` (0.11.0) to run the job's command locally.
+  PR 2's `dev-setup.sh` must keep pinning it (already in decision (c)).
 
 **Downstream**
 
