@@ -1614,8 +1614,9 @@ mod tests {
         let socket = alpha.socket.clone();
         let mut connector = FleetConnector::start_with(
             specs,
-            // `manage_ssh_config: false`: a test must never write herdr's
-            // managed ssh config under the running user's `$HOME`.
+            // `manage_ssh_config: false`: a test must never read the running
+            // user's `~/.ssh/config` into a managed config or start a control
+            // master.
             FleetConnectorOptions::default(),
             // The ssh host goes through the real `transport_for`; only the
             // local host is redirected at the fake endpoint's socket.

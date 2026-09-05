@@ -24,6 +24,7 @@ use super::HostTransport;
 use crate::fleet::handshake::REMOTE_HANDSHAKE_READ_TIMEOUT;
 use crate::fleet::hosts::HostId;
 use crate::ipc::{connect_local_stream, LocalStream};
+use crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION;
 use crate::remote::{
     discover_remote_herdr, local_forward_socket_path_scoped, BridgeErrorSink, RemoteHerdr,
     RemoteSsh, SshStdioBridge,
@@ -81,7 +82,7 @@ impl SshTransport {
     }
 
     /// The forward socket this host's bridge listens on.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn local_socket(&self) -> &std::path::Path {
         &self.local_socket
     }
@@ -112,8 +113,11 @@ impl SshTransport {
 
     /// The remote herdr, discovered once and cached.
     ///
-    /// A discovery failure — transport error or no compatible binary — retires
-    /// the cache so the next attempt probes again.
+    /// Nothing is cached after a failure, so the next attempt probes again.
+    /// Only a transport-level failure retires the ssh session: a host that
+    /// answered "no compatible herdr" has a working ssh path, and keeping its
+    /// control master means every retry at the backoff ceiling costs probes,
+    /// not a new master and a rewritten managed config.
     fn remote_herdr(&mut self) -> io::Result<RemoteHerdr> {
         if let Some(herdr) = &self.herdr {
             return Ok(herdr.clone());
@@ -127,16 +131,15 @@ impl SshTransport {
                 self.herdr = Some(herdr.clone());
                 Ok(herdr)
             }
-            Ok(None) => {
-                self.retire_ssh_session();
-                Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "no herdr with endpoint generation 1 on host; run `herdr --remote {target}` once to install it"
-                    ),
-                ))
-            }
+            Ok(None) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "no herdr with endpoint generation {} on host; run `herdr --remote {target}` once to install it",
+                    ENDPOINT_PROTOCOL_GENERATION
+                ),
+            )),
             Err(error) => {
+                tracing::debug!(host = %host, error = %error, "fleet ssh discovery failed");
                 self.retire_ssh_session();
                 Err(error)
             }
@@ -430,6 +433,26 @@ mod tests {
     use crate::ipc::bind_local_listener;
     use crate::protocol::endpoint::{EndpointServerWelcome, ENDPOINT_WELCOME_KIND};
     use crate::protocol::{self, ClientMessage, ClientSurfaceSize, ServerMessage, MAX_FRAME_SIZE};
+    use crate::remote::{remote_bridge_command, RemotePlatform};
+
+    /// The `ssh` argv `herdr --remote` runs per accepted connection, as the
+    /// shim traces it: `-T <target> <remote command>`, built by the very
+    /// function the `--remote` bridge calls, so the two cannot drift apart.
+    fn expected_bridge_argv(target: &str, session_name: &str) -> String {
+        let herdr = RemoteHerdr::for_platform(RemotePlatform::local());
+        format!(
+            "ARGV -T {target} {}",
+            remote_bridge_command(&herdr, session_name)
+        )
+    }
+
+    /// The trace lines for bridge commands, exactly as run.
+    fn bridge_argv_lines(trace: &str) -> Vec<&str> {
+        trace
+            .lines()
+            .filter(|line| line.starts_with("ARGV ") && line.contains("remote-client-bridge"))
+            .collect()
+    }
 
     /// Wait for a condition the bridge's accept thread satisfies out of band:
     /// `connect` returns as soon as the *listener* accepts, and the ssh child
@@ -454,8 +477,9 @@ mod tests {
             host(host_id),
             target.to_string(),
             session.map(str::to_string),
-            // Never true in a test: `RemoteSsh::new(_, true)` writes herdr's
-            // managed ssh config under the running user's `$HOME`.
+            // Never true in a test: `RemoteSsh::new(_, true)` reads the
+            // running user's `~/.ssh/config` into a managed config and would
+            // start a control master against the shim.
             false,
         )
     }
@@ -559,12 +583,19 @@ mod tests {
         assert_eq!(endpoint.connections(), 1);
 
         let trace = shim.trace();
-        // The exact command `herdr --remote` runs, and nothing else.
-        assert!(
-            trace.contains(
+        // The exact argv `herdr --remote` runs — byte for byte, nothing before
+        // `-T`, nothing after `remote-client-bridge` — and exactly once.
+        assert_eq!(
+            bridge_argv_lines(&trace),
+            vec![
                 "ARGV -T herdr-ssh-lab exec \"$HOME/.local/bin/herdr\" --session lab-1 remote-client-bridge"
-            ),
+            ],
             "trace: {trace}"
+        );
+        assert_eq!(
+            bridge_argv_lines(&trace),
+            vec![expected_bridge_argv("herdr-ssh-lab", "lab-1").as_str()],
+            "the fleet bridge command drifted from `herdr --remote`'s; trace: {trace}"
         );
         for forbidden in [
             "status server --json",
@@ -600,9 +631,15 @@ mod tests {
         );
 
         let trace = shim.trace();
-        assert!(
-            trace.contains("ARGV -T workbox exec \"$HOME/.local/bin/herdr\" remote-client-bridge"),
+        assert_eq!(
+            bridge_argv_lines(&trace),
+            vec!["ARGV -T workbox exec \"$HOME/.local/bin/herdr\" remote-client-bridge"],
             "trace: {trace}"
+        );
+        assert_eq!(
+            bridge_argv_lines(&trace),
+            vec![expected_bridge_argv("workbox", crate::session::DEFAULT_SESSION_NAME).as_str()],
+            "the fleet bridge command drifted from `herdr --remote`'s; trace: {trace}"
         );
         assert!(!trace.contains("--session"), "trace: {trace}");
     }
@@ -634,6 +671,16 @@ mod tests {
             !trace.contains("status server --json") && !trace.contains("mkdir -p"),
             "the fleet transport must never install or inspect the server; trace: {trace}"
         );
+        // The ssh path answered; only the discovery result is discarded.
+        assert!(
+            transport.ssh.is_some(),
+            "a host without a compatible herdr must keep its ssh session"
+        );
+        assert!(transport.herdr.is_none() && transport.bridge.is_none());
+        assert!(
+            !transport.local_socket().exists(),
+            "an incompatible host must not leave a forward socket behind"
+        );
     }
 
     #[test]
@@ -650,6 +697,12 @@ mod tests {
         assert!(
             !transport.local_socket().exists(),
             "a failed discovery must not leave a forward socket behind"
+        );
+        // The ssh path itself failed: the session (and its control master,
+        // when managed) is retired so the next attempt starts clean.
+        assert!(
+            transport.ssh.is_none(),
+            "an unreachable host must not keep a possibly stale ssh session"
         );
         let trace = shim.trace();
         assert!(
@@ -749,6 +802,66 @@ mod tests {
             probes,
             2,
             "a failed discovery must not be cached; trace: {}",
+            shim.trace()
+        );
+        assert!(
+            transport.ssh.is_some(),
+            "retrying discovery must reuse the ssh session, not rebuild it"
+        );
+    }
+
+    #[test]
+    fn a_lost_forward_socket_is_rebuilt_on_the_next_attempt() {
+        let _guard = ssh_env_lock().lock().expect("ssh env lock");
+        let endpoint = FakeEndpoint::start("rebuild");
+        let shim = FakeSsh::install("rebuild", Some(1), Bridge::ProxyTo(endpoint.socket.clone()));
+
+        let mut transport = ssh_transport("lab-ssh", "herdr-ssh-lab", Some("lab-1"));
+        let stream = transport.connect().expect("connect through the bridge");
+        drop(stream);
+        let socket = transport.local_socket().to_path_buf();
+        assert!(socket.exists(), "the bridge socket was never bound");
+
+        // Something outside herdr (a tmp cleaner) removes the socket file: the
+        // listener is still up, but nobody can reach it any more.
+        std::fs::remove_file(&socket).expect("remove the forward socket");
+        let error = transport
+            .connect()
+            .expect_err("a missing forward socket cannot be connected to");
+        assert!(
+            error
+                .to_string()
+                .contains("could not reach the ssh bridge socket"),
+            "unexpected reason: {error}"
+        );
+        assert!(
+            transport.bridge.is_none(),
+            "an unreachable bridge must be dropped, not kept"
+        );
+
+        // The next attempt binds a fresh listener at the same path and the
+        // cached discovery is reused: no new probe.
+        let mut stream = transport.connect().expect("the bridge is rebuilt");
+        assert!(socket.exists(), "the bridge socket was not rebound");
+        let outcome = endpoint_handshake(
+            &mut stream,
+            &HandshakeParams::read_only(ClientSurfaceSize { cols: 80, rows: 24 }),
+        )
+        .expect("handshake completes through the rebuilt bridge");
+        assert!(
+            matches!(outcome, HandshakeOutcome::Connected(_)),
+            "unexpected handshake outcome: {outcome:?}"
+        );
+        assert_eq!(endpoint.connections(), 2);
+        let probes = shim
+            .trace()
+            .lines()
+            .filter(|line| line.contains("status client --json"))
+            .count();
+        assert_eq!(
+            probes,
+            1,
+            "rebuilding the bridge must not rediscover; trace: {}",
             shim.trace()
         );
     }
