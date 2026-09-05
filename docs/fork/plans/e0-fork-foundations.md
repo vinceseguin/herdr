@@ -209,7 +209,7 @@ epic dependency.
 | 1 | ci: add fork ci workflow and disable upstream workflows | A · Repository | — | ✅ |
 | 2 | chore: add mise-based fork dev setup script and verify the gate | A · Repository | 1 | ✅ |
 | 3 | feat: fork build channel disables self-update and shows in version | B · Identity | 1 | ✅ |
-| 4 | feat: fleet lab script boots isolated named herdr sessions | C · Fleet lab | 1 | ⬜ |
+| 4 | feat: fleet lab script boots isolated named herdr sessions | C · Fleet lab | 1 | ✅ |
 | 5 | docs: fork readme for dev setup, ci, fleet lab; review adr 0001 | D · Docs | 2, 3, 4 | ⬜ |
 
 **Wave preview (2-agent cap):** W1 `[1]` → W2 `[2, 3]` → W3 `[4]` → W4 `[5]`.
@@ -817,6 +817,72 @@ Also prove isolation: with the lab up, `herdr session list --json` **without**
 the lab's `XDG_CONFIG_HOME` (i.e. the user's real config) must not list any
 `lab-*` session.
 
+**As built** (merged; deviations and facts later PRs need)
+
+- Subcommands, knobs and layout are as planned. `status --json` emits exactly
+  the contracted object; `pid` comes from `$ROOT/pids/lab-N.pid` (herdr's
+  `SessionInfo` carries no pid) and is reported only while that pid still
+  validates as this lab's server.
+- **Readiness is a served snapshot, not a listening socket.** The API socket
+  accepts connections before the app loop consumes requests, so a
+  `workspace create` issued as soon as `session list --json` reports
+  `running: true` fails with `server_unavailable: request handling failed:
+  receiving on a closed channel`. `up` therefore polls *both* `session list`
+  and `api snapshot` (looking for `"snapshot"`) before it touches a session.
+  Any later epic that boots a herdr server and immediately drives it needs the
+  same gate.
+- **Unix socket paths cap the lab root.**
+  `$ROOT/xdg/herdr-dev/sessions/lab-N/herdr-client.sock` must stay under
+  ~104 bytes or the server dies inside its own bind with `local socket name
+  length exceeds capacity of sun_path of sockaddr_un`. `up` refuses a too-long
+  root up front, and `tests/fork_fleet_lab.rs` uses short
+  `/tmp/herdr-lab-<label>-<pid>-<n>` roots. E1's fixtures must keep lab roots
+  short too.
+- **Isolation is wider than the plan's list.** Beyond `--session lab-N`,
+  `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR` and dropping
+  `HERDR_SOCKET_PATH`/`HERDR_CLIENT_SOCKET_PATH`/`HERDR_ENV`/`HERDR_SESSION`,
+  every lab process also drops `HERDR_CONFIG_PATH` (`config::io::config_path`
+  honours it *above* `XDG_CONFIG_HOME`, so a caller with it set would have had
+  the lab read and write the real `config.toml`) and redirects
+  `XDG_STATE_HOME`, `XDG_DATA_HOME` and `XDG_CACHE_HOME` into the root
+  (`state_dir()` otherwise writes announcement/plugin state to
+  `~/.local/state/herdr-dev`).
+- **`env` deliberately does not export `XDG_RUNTIME_DIR`**: `eval`-ing it into
+  an interactive shell would hijack the caller's Wayland/D-Bus/PipeWire socket
+  lookup, and herdr clients do not need it (sockets live under
+  `XDG_CONFIG_HOME`). It exports the additive `HERDR_FLEET_LAB_RUNTIME_DIR`
+  instead, plus `HERDR_FLEET_LAB_API_SOCKET_<N>` and
+  `HERDR_FLEET_LAB_PANE_<N>`. The contracted lines (`HERDR_FLEET_LAB_ROOT`,
+  `XDG_CONFIG_HOME`, `HERDR_FLEET_LAB_SESSIONS`,
+  `HERDR_FLEET_LAB_CLIENT_SOCKET_<N>`) are unchanged.
+- **Deletion safety** (`down`, and the stale-lab path of `up`): the marker must
+  be a regular non-symlink file whose first line is `herdr-fleet-lab`; the root
+  must be a plain non-symlink directory, absolute, at least two path
+  components, and is refused when it is `/`, `$HOME`, an ancestor of `$HOME`,
+  `/home/<user>` or `/Users/<user>` (even with `HOME` unset or wrong), a
+  reserved system directory, at/above/inside the caller's `XDG_CONFIG_HOME`
+  (the lab's own `$ROOT/xdg` is exempt so `eval "$(fleet-lab.sh env)"` still
+  allows `down`), or contains a newline.
+- **Signal safety:** only pids from this lab's own pid files are ever
+  signalled. Parsing is strict (first line, decimal digits, no sign, no leading
+  zero, at most 10 digits, never `0`/`1`/`$$`/`$PPID`, symlinked pid files
+  ignored) and each pid is re-validated immediately before TERM/KILL against
+  `/proc/<pid>/environ` (`XDG_RUNTIME_DIR=$ROOT/runtime`) and its argv
+  (`<bin> --session lab-N server`), so pid reuse cannot reach a bystander. On
+  non-Linux hosts argv alone identifies the process (documented in the script).
+- **A failed `up` undoes itself** at every stage (missing binary, server exits
+  early, API never ready, workspace/pane failure) and exits with the failing
+  status — 130 on SIGINT, 143 on SIGTERM, since `$?` inside a signal trap is
+  meaningless.
+- `terminal session observe` emits newline-delimited JSON records with
+  base64-encoded `bytes`, not raw ANSI; the plan's `cat -v` line shows that
+  JSON envelope.
+- `tests/fork_fleet_lab.rs` has four tests (lifecycle, missing binary, server
+  exits early, unmarked/decoy marker) and runs in ~1.4 s. It registers the lab
+  runtime dir with `support::register_runtime_dir` *after* a successful `up`,
+  because registering first creates `$ROOT/runtime` and `up` refuses a root
+  that carries no marker of its own. `tests/support/mod.rs` is untouched.
+
 **Downstream**
 
 - E1's `tests/` integration test and E2/E3 validations call
@@ -855,7 +921,11 @@ re-derive it.
   `err="fork build: self-update disabled; see docs/fork/README.md"`. This
   README path is the one both messages point at, so it must exist and explain
   the guard. Document `fleet-lab.sh up|status|env|down` with the isolation
-  rules and the `HERDR_BIN` / `HERDR_FLEET_LAB_ROOT` knobs, state that fork CI
+  rules and the `HERDR_BIN` / `HERDR_FLEET_LAB_ROOT` /
+  `HERDR_FLEET_LAB_TIMEOUT_MS` knobs — including that the lab root must be
+  short enough for a unix socket path and that `env` exports
+  `HERDR_FLEET_LAB_RUNTIME_DIR`, not `XDG_RUNTIME_DIR` (see PR 4's
+  *As built*) — state that fork CI
   is `.github/workflows/fork-ci.yml` (= `just ci` + PR-title check +
   shellcheck) and that upstream workflows are disabled by repository state
   (with the re-check step after every upstream sync), and keep the skills
