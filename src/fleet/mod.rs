@@ -27,6 +27,7 @@ pub mod hosts;
 pub mod oneshot;
 pub mod refs;
 pub mod report;
+pub mod sidebar;
 pub mod state;
 pub mod transport;
 
@@ -35,10 +36,11 @@ mod tests {
     /// Modules that must stay pure data, and the paths that would end that.
     /// Precedent: `scripts/test_ui_hot_path_architecture.py` guards the render
     /// hot path the same way.
-    const PURE_MODULES: [(&str, &str); 4] = [
+    const PURE_MODULES: [(&str, &str); 5] = [
         ("hosts.rs", include_str!("hosts.rs")),
         ("refs.rs", include_str!("refs.rs")),
         ("report.rs", include_str!("report.rs")),
+        ("sidebar.rs", include_str!("sidebar.rs")),
         ("state.rs", include_str!("state.rs")),
     ];
 
