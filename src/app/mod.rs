@@ -1558,10 +1558,10 @@ mod tests {
             stored["show_on_startup"].as_bool()
         };
 
-        let current = env!("CARGO_PKG_VERSION");
-        crate::release_notes::save_pending(current, "### Changed\n- Current").unwrap();
+        let current = crate::build_info::version();
+        crate::release_notes::save_pending(&current, "### Changed\n- Current").unwrap();
         let mut app = test_app();
-        dismiss(&mut app, current);
+        dismiss(&mut app, &current);
         assert_eq!(show_on_startup(), Some(false));
 
         crate::release_notes::save_pending("99.99.99", "### Changed\n- Preview").unwrap();
@@ -1596,7 +1596,7 @@ mod tests {
         let path = temp_config_path("startup-pending-release-notes-no-auto-open");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
-        crate::release_notes::save_pending(env!("CARGO_PKG_VERSION"), "### Changed\n- One")
+        crate::release_notes::save_pending(&crate::build_info::version(), "### Changed\n- One")
             .unwrap();
         let config = Config {
             onboarding: Some(false),
@@ -1628,10 +1628,10 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
         std::env::set_var("XDG_STATE_HOME", &state_home);
 
-        crate::release_notes::save_pending(env!("CARGO_PKG_VERSION"), "### Changed\n- One")
+        crate::release_notes::save_pending(&crate::build_info::version(), "### Changed\n- One")
             .unwrap();
         crate::product_announcements::save_manifest_announcement(
-            env!("CARGO_PKG_VERSION"),
+            &crate::build_info::version(),
             Some(&crate::product_announcements::ManifestAnnouncement {
                 id: "startup-announcement".into(),
                 title: Some("Startup announcement".into()),

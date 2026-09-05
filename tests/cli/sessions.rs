@@ -385,7 +385,7 @@ fn status_commands_report_client_and_server_versions() {
     let full_stdout = String::from_utf8_lossy(&full.stdout);
     assert!(full_stdout.contains("client:\n"), "stdout: {full_stdout}");
     assert!(
-        full_stdout.contains(&format!("  version: {}", env!("CARGO_PKG_VERSION"))),
+        full_stdout.contains(&format!("  version: {}", crate::support::build_version())),
         "stdout: {full_stdout}"
     );
     assert!(
@@ -426,7 +426,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {server_stdout}"
     );
     assert!(
-        server_stdout.contains(&format!("version: {}", env!("CARGO_PKG_VERSION"))),
+        server_stdout.contains(&format!("version: {}", crate::support::build_version())),
         "stdout: {server_stdout}"
     );
     assert!(
@@ -438,7 +438,7 @@ fn status_commands_report_client_and_server_versions() {
     assert!(client.status.success());
     let client_stdout = String::from_utf8_lossy(&client.stdout);
     assert!(
-        client_stdout.contains(&format!("version: {}", env!("CARGO_PKG_VERSION"))),
+        client_stdout.contains(&format!("version: {}", crate::support::build_version())),
         "stdout: {client_stdout}"
     );
     assert!(
@@ -455,7 +455,10 @@ fn status_commands_report_client_and_server_versions() {
     );
 
     let full_json = run_cli_json(&socket_path, &["status", "--json"]);
-    assert_eq!(full_json["client"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        full_json["client"]["version"],
+        crate::support::build_version()
+    );
     assert_eq!(full_json["client"]["protocol"], 22);
     assert_eq!(full_json["client"]["endpoint_protocol_generation"], 1);
     assert_eq!(full_json["server"]["status"], "running");
@@ -473,13 +476,13 @@ fn status_commands_report_client_and_server_versions() {
 
     let server_json = run_cli_json(&socket_path, &["status", "server", "--json"]);
     assert_eq!(server_json["status"], "running");
-    assert_eq!(server_json["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(server_json["version"], crate::support::build_version());
     assert_eq!(server_json["protocol"], 22);
     assert_eq!(server_json["compatible"], true);
     assert_eq!(server_json["endpoint_compatible"], true);
 
     let client_json = run_cli_json(&socket_path, &["status", "client", "--json"]);
-    assert_eq!(client_json["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(client_json["version"], crate::support::build_version());
     assert_eq!(client_json["protocol"], 22);
     assert_eq!(client_json["endpoint_protocol_generation"], 1);
     assert!(client_json["binary"]

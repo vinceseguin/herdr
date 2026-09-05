@@ -184,8 +184,10 @@ epic dependency.
   (additive helper only); PR 4 reads that module but does not edit it.
 - **Upstream files touched, and by which PR only:** `.cargo/config.toml`,
   `src/build_info.rs`, `src/update.rs`, `src/main.rs` (help text only),
-  `src/cli.rs`, `src/app/mod.rs` (tests), `tests/api_ping.rs`,
-  `tests/cli/sessions.rs`, `tests/support/mod.rs` — PR 3. `.github/workflows/`
+  `src/cli.rs`, `src/release_notes.rs`, `src/app/mod.rs` (tests),
+  `tests/api_ping.rs`, `tests/cli/sessions.rs`, `tests/support/mod.rs` — PR 3.
+  (`src/release_notes.rs` was not foreseen; the channel suffix exposed a real
+  bug there — see PR 3's *As built*.) `.github/workflows/`
   gains one new file (PR 1). Nothing else upstream is edited; `justfile`,
   `Cargo.toml`, `Cargo.lock`, `src/protocol/**` are untouched by E0.
 - **Fork docs collide by design:** `docs/fork/README.md` is edited only by
@@ -206,7 +208,7 @@ epic dependency.
 | --- | --- | --- | --- | --- |
 | 1 | ci: add fork ci workflow and disable upstream workflows | A · Repository | — | ✅ |
 | 2 | chore: add mise-based fork dev setup script and verify the gate | A · Repository | 1 | ✅ |
-| 3 | feat: fork build channel disables self-update and shows in version | B · Identity | 1 | ⬜ |
+| 3 | feat: fork build channel disables self-update and shows in version | B · Identity | 1 | ✅ |
 | 4 | feat: fleet lab script boots isolated named herdr sessions | C · Fleet lab | 1 | ⬜ |
 | 5 | docs: fork readme for dev setup, ci, fleet lab; review adr 0001 | D · Docs | 2, 3, 4 | ⬜ |
 
@@ -648,6 +650,62 @@ and point the fork client at it with
 target/debug/herdr status server --json` → `running: true`, `version:
 "0.8.2"`; stop both sessions and remove both dirs.
 
+**As built** (merged; deviations and facts later PRs need)
+
+- Exact strings, now fixtures: `herdr --version` → `herdr 0.8.2-fork`;
+  `herdr update` exits 1 printing
+  `self-update is disabled for fork builds; see docs/fork/README.md`
+  (`update::FORK_UPDATE_REFUSAL`); the background check logs
+  `err="fork build: self-update disabled; see docs/fork/README.md"`
+  (`update::FORK_UPDATE_CHECK_SKIP`) through
+  `logging::update_check_failed`, at WARN, event `update.check.complete`.
+- Symbols added: `build_info::{FORK_CHANNEL, is_fork_channel, is_fork}`,
+  `update::{fork_channel_refusal, fork_channel_update_guidance}` (both
+  `pub(crate)`), `cli::channel_set_guidance(fork, package_manager)` —
+  extracted rather than inlining `.or()` at the call site so the precedence is
+  unit-testable — and `tests/support::build_version()`.
+- **Extra upstream file: `src/release_notes.rs`.** The channel suffix exposed a
+  real bug, not just a test failure: `release_notes_from_stored` decided
+  "these notes are newer than me" with `Version::parse(build_info::version())`,
+  which returns `None` for `0.8.2-fork` (and for upstream's
+  `0.8.2-preview.<id>`), so every pending release note silently read as
+  non-preview and `update_available` stayed `None`. Fixed with a pure
+  `comparable_version(&str)` that falls back to the pre-`-` base version.
+  Version *identity* checks (`mark_current_version_seen_at`,
+  `product_announcements`) still compare the full string, which is correct.
+- `tests/cli/sessions.rs` needed six edits, not the one the plan listed
+  (`:388, :429, :441, :458, :476, :482`); all now use
+  `crate::support::build_version()`.
+- New `tests/fork_channel.rs` drives the real binary under a throwaway
+  `XDG_CONFIG_HOME`: `--version`, `--help`, `herdr update`, and
+  `herdr channel set stable|preview`. Every channel-conditional test asserts on
+  both branches (no silent `return`), so the suite stays meaningful if someone
+  compiles this checkout with an explicit non-fork channel. The `herdr update`
+  and `channel set` tests set `HERDR_ENV=1` purely as a backstop: `self_update`
+  also refuses inside a herdr session, so a regressed fork guard can never make
+  the test suite download or install anything — it just fails on the message.
+- `update::auto_update` has a call-site test, not only a pure-guard test: the
+  manifest fetch is a PATH-resolved `curl`
+  (`noninteractive_process::curl_command`), so the test shims `curl` first on
+  `PATH` and asserts a fork build never invokes it. Moving the guard after
+  `check_latest()` turns it red.
+- `src/main.rs` help: the usage line reads
+  `herdr update [--handoff]         (fork build; self-update disabled)` on fork
+  builds only. **Deferred:** the command-table description at
+  `src/main.rs:616` still reads "Download and install the latest version";
+  making it channel-aware means turning a `&'static str` table into owned
+  strings, which is more reshaping of an upstream file than this PR is allowed.
+- Verified against real servers: client and server both report `0.8.2-fork` in
+  `herdr status --json`; `api snapshot` reports it at
+  `result.snapshot.version`; a release build's background check logs the fork
+  skip and never touches `herdr.dev`; a fork client attaches to a stock
+  `0.8.2` server (`running: true`, `version: "0.8.2"`).
+  Two fields differ against a stock server and both are correct:
+  `server_binary_stale: true` (string compare `0.8.2` vs `0.8.2-fork` — the
+  server really is a different binary) and, on this machine only,
+  `compatible: false` because the installed `/usr/bin/herdr` predates master's
+  `PROTOCOL_VERSION` bump (20 vs 22) — unrelated to the channel.
+
 **Downstream**
 
 - E8 replaces `fork_channel_refusal` with a fork manifest lookup; keep the
@@ -656,7 +714,11 @@ target/debug/herdr status server --json` → `running: true`, `version:
   `CARGO_PKG_VERSION` again — use `support::build_version()` /
   `build_info::version()`.
 - `Version::parse("0.8.2-fork")` is `None` by design; code that needs a
-  comparable version uses `Version::current()` (`BASE_VERSION`).
+  comparable version uses `Version::current()` (`BASE_VERSION`) or
+  `release_notes::comparable_version`. Any *new* code that compares
+  `build_info::version()` numerically must do the same — a bare
+  `Version::parse` on it silently yields `None` and the comparison degrades to
+  a `false` branch instead of failing loudly.
 
 ### PR 4 — feat: fleet lab script boots isolated named herdr sessions · deps: 1
 
@@ -741,8 +803,10 @@ bash scripts/fork/fleet-lab.sh up 3            # table with lab-1..lab-3, socket
 bash scripts/fork/fleet-lab.sh status --json | python3 -m json.tool
 eval "$(bash scripts/fork/fleet-lab.sh env)"
 H="env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH -u HERDR_ENV target/debug/herdr"
-$H --session lab-2 api snapshot | python3 -c 'import json,sys; s=json.load(sys.stdin)["result"]; print(s["version"], [w["label"] for w in s["workspaces"]], len(s["panes"]))'
-#   0.8.2-fork ['lab-2'] 1   (version is 0.8.2 if PR 3 is not merged yet)
+$H --session lab-2 api snapshot | python3 -c 'import json,sys; s=json.load(sys.stdin)["result"]["snapshot"]; print(s["version"], [w["label"] for w in s["workspaces"]], len(s["panes"]))'
+#   0.8.2-fork ['lab-2'] 1
+#   NB (verified in PR 3): the snapshot lives under `result.snapshot`, not
+#   `result`. PR 3 is merged, so the version is `0.8.2-fork`.
 $H --session lab-2 pane read "$(…pane_id…)" --source recent | grep herdr-fleet-lab:lab-2
 $H --session lab-2 terminal session observe <pane_id> --cols 80 --rows 24 | head -c 400 | cat -v   # ANSI frame bytes
 ls -l /tmp/herdr-fleet-lab/xdg/*/sessions/*/herdr-client.sock                 # three sockets, mode srw-------
@@ -783,8 +847,14 @@ re-derive it.
 - README: replace the "Until then: `mise use -g …`" block with
   `bash scripts/fork/dev-setup.sh` (`--check`, `--skip-ci`), keep the gate
   wrapper paragraph, document `herdr --version` → `0.8.2-fork` and that
-  `herdr update` / background checks are disabled (E8 will add a fork
-  channel), document `fleet-lab.sh up|status|env|down` with the isolation
+  `herdr update` / `herdr channel set` / background checks are disabled (E8
+  will add a fork channel) — quote the exact strings PR 3 ships:
+  `herdr update` exits 1 with
+  `self-update is disabled for fork builds; see docs/fork/README.md`, and the
+  background check logs
+  `err="fork build: self-update disabled; see docs/fork/README.md"`. This
+  README path is the one both messages point at, so it must exist and explain
+  the guard. Document `fleet-lab.sh up|status|env|down` with the isolation
   rules and the `HERDR_BIN` / `HERDR_FLEET_LAB_ROOT` knobs, state that fork CI
   is `.github/workflows/fork-ci.yml` (= `just ci` + PR-title check +
   shellcheck) and that upstream workflows are disabled by repository state

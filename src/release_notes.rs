@@ -89,8 +89,8 @@ fn release_notes_from_stored(
     }
 
     let preview = match (
-        crate::update::Version::parse(&stored.version),
-        crate::update::Version::parse(current_version),
+        comparable_version(&stored.version),
+        comparable_version(current_version),
     ) {
         (Some(stored_version), Some(current_version)) => stored_version > current_version,
         _ => false,
@@ -100,6 +100,20 @@ fn release_notes_from_stored(
         preview,
         version: stored.version,
         body,
+    })
+}
+
+/// Version comparison that tolerates a build-channel suffix.
+///
+/// `build_info::version()` renders `x.y.z-<channel>` (and `x.y.z-<channel>.<id>`)
+/// on every non-stable channel — `fork` here, `preview` upstream — which
+/// `Version::parse` rejects. Compare on the numeric base version instead, so
+/// release-note freshness keeps working on those builds. Version *identity*
+/// checks keep using the full string.
+fn comparable_version(version: &str) -> Option<crate::update::Version> {
+    crate::update::Version::parse(version).or_else(|| {
+        let base = version.split_once('-').map_or(version, |(base, _)| base);
+        crate::update::Version::parse(base)
     })
 }
 
@@ -173,6 +187,40 @@ pub fn normalize_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comparable_version_ignores_the_build_channel_suffix() {
+        assert_eq!(
+            comparable_version("0.8.2"),
+            crate::update::Version::parse("0.8.2")
+        );
+        assert_eq!(
+            comparable_version("0.8.2-fork"),
+            crate::update::Version::parse("0.8.2")
+        );
+        assert_eq!(
+            comparable_version("0.8.2-preview.42"),
+            crate::update::Version::parse("0.8.2")
+        );
+        assert_eq!(comparable_version("not-a-version"), None);
+        assert_eq!(comparable_version(""), None);
+    }
+
+    #[test]
+    fn newer_notes_are_preview_on_a_channel_suffixed_build() {
+        let stored = StoredReleaseNotes {
+            version: "99.99.99".into(),
+            body: "### Changed\n- One".into(),
+            show_on_startup: true,
+        };
+        let notes = release_notes_from_stored(stored, &crate::build_info::version())
+            .expect("release notes");
+        assert!(
+            notes.preview,
+            "a newer stored version must read as preview on build {}",
+            crate::build_info::version()
+        );
+    }
 
     #[test]
     fn extracts_version_section() {
