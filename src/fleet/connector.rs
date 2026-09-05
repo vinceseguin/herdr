@@ -377,23 +377,33 @@ impl FleetConnector {
         let events_tx_weak = events_tx.downgrade();
         let (finished_tx, finished) = std::sync::mpsc::channel();
 
+        // Drop duplicate ids first, keeping the first occurrence, because
+        // `FleetState::new` does exactly that; both must agree or an event
+        // would address a host the state does not have (or worse, the wrong
+        // one). It has to happen *before* the active host is chosen: for
+        // `[a(disabled), a(enabled)]` the kept `a` is the disabled one, so
+        // "the first enabled spec" read from the caller's list would name a
+        // host this connector never opens while the state renders another —
+        // and every frame from the state's host would be dropped as inactive.
+        let mut kept: Vec<HostSpec> = Vec::with_capacity(specs.len());
+        for spec in specs {
+            if kept.iter().any(|host| host.id == spec.id) {
+                tracing::warn!(host = %spec.id, "ignoring a duplicate fleet host id");
+                continue;
+            }
+            kept.push(spec);
+        }
+
         // The first enabled host is active, matching `FleetState::new`, so the
         // two agree about which host is being rendered.
-        let active_host = specs
+        let active_host = kept
             .iter()
             .find(|spec| spec.enabled)
             .map(|spec| spec.id.clone());
 
-        let mut hosts: Vec<HostLink> = Vec::with_capacity(specs.len());
+        let mut hosts: Vec<HostLink> = Vec::with_capacity(kept.len());
         let mut supervisors = 0usize;
-        for spec in specs {
-            if hosts.iter().any(|host| host.id == spec.id) {
-                // `FleetState::new` drops duplicates the same way; both must
-                // agree or an event would address a host the state does not
-                // have (or worse, the wrong one).
-                tracing::warn!(host = %spec.id, "ignoring a duplicate fleet host id");
-                continue;
-            }
+        for spec in kept {
             let active = Arc::new(AtomicBool::new(
                 active_host.as_ref() == Some(&spec.id) && spec.enabled,
             ));
@@ -511,6 +521,12 @@ impl FleetConnector {
     /// nothing: the supervisor reads the same cell when it handshakes, so a
     /// host that drops and reconnects while active comes back at the size the
     /// console has now — not the one it started with.
+    ///
+    /// The geometry is adopted whether or not it can be delivered, so an
+    /// `Err` only ever means the write to the *current* active host failed —
+    /// a host-local fact (that connection is already dropped and its
+    /// supervisor is reconnecting, at this geometry). Callers log it; it is
+    /// never a reason to stop the console.
     // Called by the fleet console (E2 PR 3/4) on `ClientLoopEvent::Resize`.
     #[allow(dead_code)]
     pub fn set_active_geometry(&self, geometry: ActiveGeometry) -> Result<(), HostSendError> {
@@ -1650,14 +1666,27 @@ pub(crate) mod test_support {
         hosts: &[(&str, &FakeHost)],
         options: FleetConnectorOptions,
     ) -> FleetConnector {
-        let sockets: HashMap<HostId, PathBuf> = hosts
-            .iter()
-            .map(|(id, host)| (HostId::new(id).expect("valid host id"), host.socket.clone()))
-            .collect();
         let specs = hosts
             .iter()
             .map(|(id, host)| host.spec(id))
             .collect::<Vec<_>>();
+        fake_connector_with_specs(hosts, specs, options)
+    }
+
+    /// A connector over `hosts`' sockets, driven by exactly `specs`.
+    ///
+    /// [`fake_connector`] derives one enabled spec per host; this takes the
+    /// spec list itself, for the cases a fleet has to survive: a disabled
+    /// host, or a caller that passed the same id twice.
+    pub(crate) fn fake_connector_with_specs(
+        hosts: &[(&str, &FakeHost)],
+        specs: Vec<HostSpec>,
+        options: FleetConnectorOptions,
+    ) -> FleetConnector {
+        let sockets: HashMap<HostId, PathBuf> = hosts
+            .iter()
+            .map(|(id, host)| (HostId::new(id).expect("valid host id"), host.socket.clone()))
+            .collect();
         FleetConnector::start_with(
             specs,
             options,
@@ -3035,6 +3064,197 @@ mod tests {
             "shutdown must not wait out the backoff: {:?}",
             started.elapsed()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `shutdown` must stay bounded even when the console did the wrong thing
+    /// and kept the receiver: the supervisors it cannot wake are detached, not
+    /// waited on forever.
+    #[test]
+    fn shutdown_returns_when_the_caller_still_holds_the_taken_receiver() {
+        let dir = scratch_dir("held-events");
+        let mut messages = vec![snapshot_message(&snapshot("boot-alpha", 1))];
+        messages.extend(
+            (1..=(EVENT_CHANNEL_CAPACITY as u64 + 50))
+                .map(|revision| surface_message("boot-alpha", revision)),
+        );
+        let alpha = FakeHost::start(&dir, "alpha", Behaviour::Serve(messages));
+        let mut connector = fake_connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        let events = connector.take_events().expect("the receiver is attached");
+        assert!(
+            wait_for(Duration::from_secs(5), || alpha.connections() == 1),
+            "the host must connect"
+        );
+        // The supervisor is parked on a full channel and only the receiver can
+        // release it — and the caller is still holding it.
+        std::thread::sleep(Duration::from_millis(500));
+
+        let started = Instant::now();
+        connector.shutdown();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SHUTDOWN_JOIN_TIMEOUT + Duration::from_secs(2),
+            "shutdown must detach rather than block on a receiver it cannot close: {elapsed:?}"
+        );
+        drop(events);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The console can resize before it has picked a host — or while it is
+    /// pointed at none. That geometry is not lost: it is what the next
+    /// activation announces.
+    #[test]
+    fn a_geometry_set_with_no_active_host_is_used_by_the_next_activation() {
+        let dir = scratch_dir("geometry-no-active");
+        let alpha = FakeHost::start(
+            &dir,
+            "alpha",
+            Behaviour::Serve(vec![snapshot_message(&snapshot("boot-alpha", 1))]),
+        );
+        // A starting console geometry, so deactivation is a visible resize.
+        let start = ActiveGeometry {
+            surface: ClientSurfaceSize {
+                cols: 200,
+                rows: 60,
+            },
+            cell_width_px: 8,
+            cell_height_px: 16,
+            pixel_mouse: false,
+        };
+        let specs = vec![alpha.spec("alpha")];
+        let mut state = FleetState::new(specs);
+        let mut connector = fake_connector(
+            &[("alpha", &alpha)],
+            FleetConnectorOptions {
+                active: start,
+                ..FleetConnectorOptions::default()
+            },
+        );
+        drain_until(
+            &mut connector,
+            &mut state,
+            Duration::from_secs(10),
+            |state| connected_with_snapshot(state, "alpha"),
+        );
+
+        connector
+            .set_active(None)
+            .expect("the fleet can point at no host");
+        let inactive = ActiveGeometry::default();
+        assert!(
+            wait_for(Duration::from_secs(2), || resize_geometry(
+                &alpha.received()
+            ) == vec![inactive]),
+            "the deactivated host must go back to the inactive geometry: {:?}",
+            resize_geometry(&alpha.received())
+        );
+
+        let console = ActiveGeometry {
+            surface: ClientSurfaceSize {
+                cols: 160,
+                rows: 48,
+            },
+            cell_width_px: 9,
+            cell_height_px: 18,
+            pixel_mouse: true,
+        };
+        connector
+            .set_active_geometry(console)
+            .expect("a fleet with no active host accepts a geometry");
+        assert!(
+            connector.active_host().is_none(),
+            "the geometry must not activate anything"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            resize_geometry(&alpha.received()),
+            vec![inactive],
+            "a host nobody is looking at must not hear the console geometry"
+        );
+
+        let id = HostId::new("alpha").expect("valid host id");
+        connector
+            .set_active(Some(&id))
+            .expect("alpha can be activated");
+        assert!(
+            wait_for(Duration::from_secs(2), || resize_geometry(
+                &alpha.received()
+            ) == vec![inactive, console]),
+            "activation must announce the geometry set while no host was active: {:?}",
+            resize_geometry(&alpha.received())
+        );
+        connector.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `FleetState::new` drops duplicate host ids keeping the *first*
+    /// occurrence and only then picks the first enabled host as the active
+    /// one. The connector has to do it in the same order: reading "the first
+    /// enabled spec" from the caller's list instead would name a host the
+    /// connector never opens, while the state renders another whose frames the
+    /// connector would drop as inactive.
+    #[test]
+    fn a_duplicate_host_id_leaves_the_connector_and_the_state_on_one_active_host() {
+        let dir = scratch_dir("duplicate-ids");
+        let alpha = FakeHost::start(
+            &dir,
+            "alpha",
+            Behaviour::Serve(vec![snapshot_message(&snapshot("boot-alpha", 1))]),
+        );
+        let beta = FakeHost::start(
+            &dir,
+            "beta",
+            Behaviour::Serve(vec![snapshot_message(&snapshot("boot-beta", 1))]),
+        );
+        let mut disabled_alpha = alpha.spec("alpha");
+        disabled_alpha.enabled = false;
+        // The kept `alpha` is the disabled one, so beta is the first enabled
+        // host that survives deduplication.
+        let specs = vec![disabled_alpha, alpha.spec("alpha"), beta.spec("beta")];
+        let active_surface = ClientSurfaceSize {
+            cols: 200,
+            rows: 60,
+        };
+        let options = FleetConnectorOptions {
+            active: ActiveGeometry {
+                surface: active_surface,
+                ..ActiveGeometry::default()
+            },
+            ..FleetConnectorOptions::default()
+        };
+        let mut state = FleetState::new(specs.clone());
+        let mut connector =
+            fake_connector_with_specs(&[("alpha", &alpha), ("beta", &beta)], specs, options);
+
+        assert_eq!(
+            connector.active_host().as_ref(),
+            state.active_host(),
+            "the connector and the state must agree on the active host"
+        );
+        assert_eq!(
+            connector.active_host(),
+            HostId::new("beta").ok(),
+            "the surviving enabled host is the active one"
+        );
+
+        drain_until(
+            &mut connector,
+            &mut state,
+            Duration::from_secs(10),
+            |state| connected_with_snapshot(state, "beta"),
+        );
+        assert!(
+            wait_for(Duration::from_secs(2), || hello_surface(&beta.received())
+                == vec![active_surface]),
+            "the active host must handshake at the active geometry: {:?}",
+            hello_surface(&beta.received())
+        );
+        assert_eq!(
+            alpha.connections(),
+            0,
+            "the kept duplicate is disabled, so it is never opened"
+        );
+        connector.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
