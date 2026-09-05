@@ -1793,7 +1793,9 @@ impl SshStdioBridge {
 ///
 /// `Stderr` keeps `herdr --remote`'s output byte-for-byte unchanged. `Report`
 /// lets a long-lived caller turn a bridge failure into host-local state
-/// instead of terminal noise.
+/// instead of terminal noise. The callback runs on the bridge's accept thread
+/// between connections, so it must return promptly; a panic inside it is
+/// contained and logged rather than allowed to kill the listener.
 #[derive(Clone)]
 pub(crate) enum BridgeErrorSink {
     Stderr,
@@ -1806,7 +1808,13 @@ impl BridgeErrorSink {
     fn report(&self, message: String) {
         match self {
             Self::Stderr => eprintln!("herdr: {message}"),
-            Self::Report(report) => report(message),
+            Self::Report(report) => {
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report(message)));
+                if outcome.is_err() {
+                    tracing::error!("remote bridge error sink panicked; report dropped");
+                }
+            }
         }
     }
 }
@@ -2224,24 +2232,30 @@ pub(crate) fn local_forward_socket_path(target: &str, session_name: &str) -> Pat
 /// do not fight over one socket file.
 ///
 /// An empty `scope` reproduces `--remote`'s names byte-for-byte: the scope is
-/// folded into the readable name and the hash only when it is non-empty.
+/// folded into the readable name and the hash only when it is non-empty. The
+/// readable form is not injective (`scope` `a` + target `b-c` reads like
+/// scope `a-b` + target `c`); the hashed form is what keeps distinct inputs
+/// apart, and a same-process clash surfaces as `prepare_socket_path`'s
+/// "already listening" error rather than a shared socket.
 pub(crate) fn local_forward_socket_path_scoped(
     scope: &str,
     target: &str,
     session_name: &str,
 ) -> PathBuf {
     let pid = std::process::id();
-    let scope_clean = sanitize_path_component(scope);
     let target_clean = sanitize_path_component(target);
     let session_clean = sanitize_path_component(session_name);
     let target_prefix: String = target_clean.chars().take(8).collect();
     let hash = short_socket_hash_scoped(scope, target, session_name);
-    let (readable_name, short_name) = if scope_clean.is_empty() {
+    // Branch on the raw scope, exactly like the hash does, so a scope that
+    // sanitizes to nothing still yields a scoped (and consistent) name.
+    let (readable_name, short_name) = if scope.is_empty() {
         (
             format!("herdr-remote-{pid}-{target_clean}-{session_clean}.sock"),
             format!("herdr-r-{pid}-{target_prefix}-{hash}.sock"),
         )
     } else {
+        let scope_clean = sanitize_path_component(scope);
         let scope_prefix: String = scope_clean.chars().take(8).collect();
         (
             format!("herdr-remote-{pid}-{scope_clean}-{target_clean}-{session_clean}.sock"),
@@ -3499,16 +3513,53 @@ mod tests {
         );
     }
 
+    /// Sets (or unsets) one process env var and restores the prior value on
+    /// drop, so a panicking test cannot leak it into the next one. Callers
+    /// must hold `remote_env_lock()`.
+    #[cfg(unix)]
+    struct EnvVarGuard {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: Option<&std::ffi::OsStr>) -> Self {
+            let prior = std::env::var_os(key);
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            Self { key, prior }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[cfg(unix)]
     fn with_tmpdir<R>(dir: &Path, body: impl FnOnce() -> R) -> R {
-        let prior = std::env::var_os("TMPDIR");
-        std::env::set_var("TMPDIR", dir);
-        let result = body();
-        match prior {
-            Some(value) => std::env::set_var("TMPDIR", value),
-            None => std::env::remove_var("TMPDIR"),
-        }
-        result
+        let _tmpdir = EnvVarGuard::set("TMPDIR", Some(dir.as_os_str()));
+        body()
+    }
+
+    /// A directory name long enough that no socket name fits under it, unique
+    /// to this process so parallel test runs never share it. Nothing checks
+    /// that it exists; `remote_bridge_endpoint_path` only measures the path.
+    #[cfg(unix)]
+    fn overlong_tmpdir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "herdr-{tag}-{}-{}",
+            std::process::id(),
+            "x".repeat(64)
+        ))
     }
 
     #[cfg(unix)]
@@ -3548,8 +3599,7 @@ mod tests {
             ),
         ];
 
-        let long_dir = std::env::temp_dir().join("b".repeat(80));
-        let _ = fs::create_dir_all(&long_dir);
+        let long_dir = overlong_tmpdir("golden");
         let observed: Vec<(PathBuf, PathBuf)> = cases
             .iter()
             .map(|(target, session, _, _)| {
@@ -3561,7 +3611,6 @@ mod tests {
                 )
             })
             .collect();
-        let _ = fs::remove_dir_all(&long_dir);
 
         for ((target, session, readable, short), (readable_path, short_path)) in
             cases.iter().zip(observed.iter())
@@ -3677,13 +3726,8 @@ esac
 
     #[cfg(unix)]
     fn without_remote_binary_override<R>(body: impl FnOnce() -> R) -> R {
-        let prior = std::env::var_os(REMOTE_BINARY_ENV_VAR);
-        std::env::remove_var(REMOTE_BINARY_ENV_VAR);
-        let result = body();
-        if let Some(value) = prior {
-            std::env::set_var(REMOTE_BINARY_ENV_VAR, value);
-        }
-        result
+        let _override = EnvVarGuard::set(REMOTE_BINARY_ENV_VAR, None);
+        body()
     }
 
     #[cfg(unix)]
@@ -3726,16 +3770,12 @@ esac
         let override_binary = ssh_shim.dir.join("override-herdr");
         fs::write(&override_binary, b"not a real binary").expect("write override binary");
 
-        let prior = std::env::var_os(REMOTE_BINARY_ENV_VAR);
-        std::env::set_var(REMOTE_BINARY_ENV_VAR, &override_binary);
         let result = {
+            let _override =
+                EnvVarGuard::set(REMOTE_BINARY_ENV_VAR, Some(override_binary.as_os_str()));
             let ssh = RemoteSsh::new("charact-host".to_string(), false);
             prepare_remote_herdr(&ssh, false)
         };
-        match prior {
-            Some(value) => std::env::set_var(REMOTE_BINARY_ENV_VAR, value),
-            None => std::env::remove_var(REMOTE_BINARY_ENV_VAR),
-        }
 
         let err = result.err().expect("override skips the discovery shortcut");
         assert!(
@@ -3829,6 +3869,12 @@ esac
         assert_ne!(first, second);
         assert_ne!(first, unscoped);
         assert_ne!(second, unscoped);
+
+        // A scope that sanitizes to nothing is still a scope: only the empty
+        // string means "unscoped", in the readable name and the hash alike.
+        let punctuation = local_forward_socket_path_scoped("///", "herdr-ssh-lab", "lab-1");
+        assert_ne!(punctuation, unscoped);
+        assert_ne!(punctuation, first);
     }
 
     #[cfg(unix)]
@@ -3840,12 +3886,10 @@ esac
         let readable = with_tmpdir(Path::new("/tmp"), || {
             local_forward_socket_path_scoped("box-a", "herdr-ssh-lab", "lab-1")
         });
-        let long_dir = std::env::temp_dir().join("c".repeat(80));
-        let _ = fs::create_dir_all(&long_dir);
+        let long_dir = overlong_tmpdir("scoped");
         let short = with_tmpdir(&long_dir, || {
             local_forward_socket_path_scoped("box-a", "herdr-ssh-lab", "lab-1")
         });
-        let _ = fs::remove_dir_all(&long_dir);
 
         assert_eq!(
             readable,
@@ -3926,16 +3970,12 @@ esac
         let override_binary = ssh_shim.dir.join("override-herdr");
         fs::write(&override_binary, b"not a real binary").expect("write override binary");
 
-        let prior = std::env::var_os(REMOTE_BINARY_ENV_VAR);
-        std::env::set_var(REMOTE_BINARY_ENV_VAR, &override_binary);
         let discovered = {
+            let _override =
+                EnvVarGuard::set(REMOTE_BINARY_ENV_VAR, Some(override_binary.as_os_str()));
             let ssh = RemoteSsh::new("discover-host".to_string(), false);
             discover_remote_herdr(&ssh)
         };
-        match prior {
-            Some(value) => std::env::set_var(REMOTE_BINARY_ENV_VAR, value),
-            None => std::env::remove_var(REMOTE_BINARY_ENV_VAR),
-        }
 
         assert_eq!(
             discovered
@@ -3992,6 +4032,55 @@ esac
             assert!(Instant::now() < deadline, "bridge never reported a failure");
             thread::sleep(Duration::from_millis(20));
         }
+
+        drop(bridge);
+        assert!(!socket.exists(), "bridge socket was not unlinked");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_survives_a_panicking_error_sink() {
+        use std::sync::atomic::AtomicUsize;
+
+        let _guard = remote_env_lock().lock().unwrap();
+        let _ssh_shim = FakeSsh::install(
+            "bridge-sink-panic",
+            "#!/bin/sh\nprintf 'ARGV %s\\n' \"$*\" >> '__TRACE__'\nexit 7\n",
+        );
+
+        let reports = Arc::new(AtomicUsize::new(0));
+        let sink_reports = Arc::clone(&reports);
+        let socket = std::env::temp_dir().join(format!(
+            "herdr-bridge-sink-panic-test-{}.sock",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&socket);
+        let bridge = SshStdioBridge::start_with(
+            "bridge-host".to_string(),
+            RemoteHerdr::for_platform(RemotePlatform::local()),
+            socket.clone(),
+            "lab-1".to_string(),
+            None,
+            BridgeErrorSink::Report(Arc::new(move |_message| {
+                sink_reports.fetch_add(1, Ordering::SeqCst);
+                panic!("sink panicked on purpose");
+            })),
+        )
+        .expect("start bridge listener");
+
+        // Two connections: the second is only accepted if the accept thread
+        // outlived the first report's panic.
+        for _ in 0..2 {
+            let seen_before = reports.load(Ordering::SeqCst);
+            let client = crate::ipc::connect_local_stream(&socket).expect("connect to bridge");
+            drop(client);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while reports.load(Ordering::SeqCst) == seen_before {
+                assert!(Instant::now() < deadline, "bridge stopped reporting");
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        assert_eq!(reports.load(Ordering::SeqCst), 2);
 
         drop(bridge);
         assert!(!socket.exists(), "bridge socket was not unlinked");

@@ -979,6 +979,13 @@ Deltas from the shapes above, all additive:
 - The `Stderr` sink still prints `herdr: remote bridge failed: {err}` and
   `herdr: remote bridge listener failed: {err}`; the sink receives the message
   without the `herdr: ` prefix.
+- A `Report` callback runs on the bridge's accept thread between connections,
+  so it must return promptly (PR 6 records the reason into a mutex and
+  returns). A panic inside it is caught and logged, not allowed to kill the
+  listener.
+- Only the empty string means "unscoped": both the readable name and the hash
+  branch on the raw `scope`, so a scope that sanitizes to nothing (`"///"`)
+  still produces a distinct socket path.
 
 ### PR 4 — feat: ssh lab script runs a user-space sshd against the fleet lab · deps: —
 
