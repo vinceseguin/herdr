@@ -309,7 +309,7 @@ integration test that boots two named sessions and asserts the merged status.
 | 4 | feat: ssh lab script runs a user-space sshd against the fleet lab | B · Transport | — | ✅ |
 | 5 | feat: fleet connector streams local hosts and herdr fleet status reports them | C · Connector and CLI | 2 | ✅ |
 | 6 | feat: fleet connector reaches ssh hosts through the shared bridge | C · Connector and CLI | 3, 5 | ✅ |
-| 7 | docs: fleet core reference, ssh lab guide, adr review | D · Docs | 6 | ⬜ |
+| 7 | docs: fleet core reference, ssh lab guide, adr review | D · Docs | 6 | ✅ |
 | 8 | fix: deflake ssh transport forward-socket rebuild test | C · Connector and CLI | 6 | ✅ |
 
 **Wave preview (2-agent cap):** W1 `[1, 4]` → W2 `[2, 3]` → W3 `[5]` → W4
@@ -1733,6 +1733,64 @@ user's `herdr session list` shows no `lab-*`.
 - E2 adds `docs/fork/fleet.md` (TUI keys/limits) and links here rather than
   duplicating the config reference; E3 adds `gateway.md`; E5
   `remote-access.md` points at the ssh lab section for local testing.
+
+**As built (merged)**
+
+Shipped as `docs/fork/fleet-core.md` (new), the *SSH lab* and *Fleet core*
+sections of `docs/fork/README.md`, the *E1 review* subsection of ADR 0001, and
+two factual-drift corrections in `docs/fork/ROADMAP.md`'s E1 section (the CLI
+line now carries `--timeout-ms`/`--watch` and points at `fleet-core.md`; the
+merged-agent ordering now says fleet-wide recency instead of
+`state_change_seq`). The E1 status row was left untouched — `implement-epic`
+owns it.
+
+`fleet-core.md` covers: every `[fleet]` key with its type and default, the
+reserved `local` host, the full validation rule list and the all-or-nothing
+exit-1 behaviour, the `host/w1:p1` id form and why `state_change_seq` and
+`boot_id`/`revision` are per host, `herdr fleet status` (flags, defaults, the
+600000 ms cap, exit codes 0/1/2, early settling, read-only guarantees) with a
+real text, JSON and `--watch` example, the five connection states and their
+real reason strings, the ssh half (one prior `herdr --remote <target>`, the
+exact unavailable reason, `[remote].manage_ssh_config`, the multi-attempt
+reconnect chain, the `/tmp/herdr-remote-<pid>-<host>-<target>-<session>.sock`
+forward socket and what a signal leaves behind, the inherited ssh stderr),
+reconnect/backoff, what the connector never does (including the foreground-
+client geometry caveat E2 must respect), and a "for developers" section with
+the `src/fleet/` module map, the E2 and E3 driving recipes, the ordering
+contract, and PR 8's `SshStdioBridge::drop` observation.
+
+Notes for later PRs:
+
+- **The `[fleet]` block of `DEFAULT_CONFIG` is quoted verbatim** in
+  `fleet-core.md`. Changing `src/main.rs`'s block means changing that quote.
+- **The doc is the only reference for `[fleet]`** (upstream's
+  `config_reference_check.py` skips the subtree), and it says so; a new
+  `[fleet]` key must be added there in the same PR.
+- The README's *Keeping up with upstream* section now carries a table of the
+  upstream files that hold fork wiring, including everything E1 added
+  (`src/config/{model,io}.rs`, `src/config.rs`, `src/remote/attach.rs`,
+  `src/cli/spec.rs`, `scripts/config_reference_check.py`, `tests/cli/mod.rs`).
+  Later epics should extend that table rather than the old prose sentence.
+- **Deferred, deliberately:** the `#[allow(dead_code)]` on `HostId::as_str` in
+  `src/fleet/hosts.rs` is still there. This PR's own *Files* section says to do
+  that janitoring "in the first later PR that touches the file, not in a
+  docs-only commit", so it stays for E2.
+
+**Evidence** (real servers, `fleet-lab.sh up 2` + `ssh-lab.sh up`, debug
+`0.8.2-fork`): a five-host fleet (`local` unavailable, `lab-ssh` connected over
+ssh, `lab-2` connected locally, `nowhere` = `ssh://127.0.0.1:1` unavailable,
+`spare` disabled) rendered both as the text table and as
+`herdr.fleet.status.v1` JSON — both pasted into the doc. `herdr config check`
+and `herdr fleet status` on a `[fleet]` naming `local` printed the two expected
+diagnostics and exited 1. Taking the ssh lab down and back up under
+`--watch --json` produced, for `lab-ssh` only, `host closed the connection` →
+`remote bridge failed: ssh bridge exited with exit status: 255` →
+`remote platform detection failed: ssh: Could not resolve hostname …` (×2) →
+`connected` + `snapshot`, with `retry_in_ms` 1000 → 2000 → 4000 → 8000 and
+`attempt` 2 → 5; `lab-2` emitted zero connection changes. The forward socket
+appeared as `/tmp/herdr-remote-<pid>-lab-ssh-herdr-ssh-lab-lab-1.sock` and
+survived a SIGTERM, as documented. `ls -la ~/.ssh | sha256sum` was identical
+before and after.
 
 ### PR 8 — fix: deflake ssh transport forward-socket rebuild test · deps: 6
 

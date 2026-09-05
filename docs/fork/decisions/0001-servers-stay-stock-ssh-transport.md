@@ -106,3 +106,69 @@ later epics do not re-derive them.
   `herdr`, and must drop `HERDR_CONFIG_PATH` when isolating.
 
 Nothing in *Decision* is amended.
+
+### E1 review (2026-09-05)
+
+E1 built the fleet core against the real codebase: `[fleet]` configuration,
+the pure `FleetState`/`FleetStatusReport`, the per-host connector, the ssh
+transport, and `herdr fleet status`. Option 4 held — servers were not touched,
+`src/protocol/**` and `tests/fixtures/endpoint-*.json` have an empty diff, and a
+fleet host runs a stock server. Six facts are worth recording.
+
+- **The SSH bridge was widened in place, not moved.** The decision's
+  "must be refactored into a reusable transport" was implemented as the
+  smallest behaviour-preserving diff to `src/remote/attach.rs`: the existing
+  types stay there with `pub(crate)` visibility, plus three injection points —
+  `SshStdioBridge::start_with(…, BridgeErrorSink)`, a `scope` argument on
+  `local_forward_socket_path_scoped`, and `discover_remote_herdr` split out of
+  `prepare_remote_herdr` — while the fleet-side adapter lives in
+  `src/fleet/transport/ssh.rs`. Moving ~800 lines into `src/fleet/` would have
+  turned every upstream edit to the bridge into a conflict against deleted code
+  and made `herdr --remote` depend on the fleet module. The unscoped socket
+  names, readable *and* hashed, are byte-identical to upstream's, so
+  `--remote`'s behaviour is unchanged.
+- **The fleet never installs, uploads, stops or hands off a herdr.** The E0
+  review above noted that a fork client cannot seed a foreign-platform remote
+  and that E1 must surface that as a host-local `Unavailable { reason }`. E1
+  went further: the connector uses *discovery only*, ignores
+  `HERDR_REMOTE_BINARY`, and never prompts. A host with no generation-1 herdr
+  reports ``no herdr with endpoint generation 1 on host; run `herdr --remote
+  <target>` once to install it``. `herdr --remote` — interactive, allowed to
+  install and hand off — stays the one place that changes a host, run once by
+  the operator. This keeps "servers stay stock" true of the *fleet* as well as
+  of the protocol.
+- **`state_change_seq` is not comparable across hosts.** It is a per-server-boot
+  counter, so a merged, blocked-first list ordered by it would be meaningless
+  across a fleet. `FleetState` therefore owns a monotonic `fleet_change_seq`
+  assigned when an agent appears or its status advances, and the fleet order is
+  `(status_rank, Reverse(fleet_change_seq), host_index, pane_id)`. Every later
+  epic that ranks agents across hosts must use `merged_agents()`; upstream's
+  `status_priority` stays correct only *within* one host.
+- **A read-only fleet client is not passive today.** A connecting client shell
+  becomes that host's foreground client, and the foreground client's surface is
+  the host's effective pane geometry — so a fleet client with a small surface
+  reflows every pane on every configured host. E1 handshakes inactive hosts at
+  herdr's own default headless geometry, which makes the common case (headless
+  servers running agents) a no-op, but a host with an attached client or a
+  `[server]` `headless_cols`/`headless_rows` of its own is still resized while
+  the fleet is connected. A
+  genuinely passive reader would need an *advertised optional* endpoint
+  observer method — exactly the escape hatch the decision reserves — and is out
+  of scope until an epic needs it. Until then E2 must hold fleet connections
+  only while the fleet console is in use.
+- **A user-space sshd is a sufficient SSH stand-in.** `scripts/fork/ssh-lab.sh`
+  runs sshd as the invoking user on `127.0.0.1:2299` with a throwaway key, an
+  in-lab `HOME`, and `SetEnv HOME/XDG_CONFIG_HOME/PATH`, so the whole ssh path —
+  managed ssh config, control master, discovery, the stdio bridge, reconnect —
+  is exercised without root, without a second machine, and without touching the
+  caller's `~/.ssh` or installed herdr. Combined with `kind = "local"` hosts
+  from the fleet lab, a full mixed-transport fleet is testable on one laptop.
+  Machines that have no `sshd` are handled explicitly (exit 3), not silently.
+- **Host failure is local, and provably so.** Each host has its own supervisor
+  thread, backoff (1 s → 30 s) and reason string; a live run that cut the ssh
+  lab out from under a connected host produced connection changes for that host
+  only, with `lab-2` and `local` emitting none. That is the "unavailable servers
+  are a client-local outcome" clause of the endpoint contract, honoured by the
+  fleet as well as by the single-host client.
+
+Nothing in *Decision* is amended.
