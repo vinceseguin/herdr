@@ -143,6 +143,8 @@ superseded; see below).
   what makes E4's installability and E6's push notifications work on iOS.
 - **E8** last: only the gateway host needs a fork binary; the console is
   upstream's client and LAN servers can stay stock.
+- **E9** is independent of the fleet chain (it depends on E0 only) and can be
+  scheduled whenever the budget allows; its phone half waits for E7.
 
 ## Milestones
 
@@ -153,6 +155,8 @@ superseded; see below).
   grouped blocked-first, watch a terminal, answer a prompt, from the couch or
   from a café over Tailscale.
 - **Polish:** E6 (push), E7 (rich control), E8 (release/install).
+- **Accounts:** E9 — pick which Claude account each agent runs under and
+  switch an agent to another account without losing its conversation.
 
 ---
 
@@ -171,6 +175,7 @@ Owned by `implement-roadmap`. Legend: ✅ done · 🔨 in progress · ⬜ not st
 | E6 | Push notifications to the phone | E4, E5 | ⬜ | — |
 | E7 | Control from phone and console (approvals, prompts, start) | E3, E4 | ⬜ | — |
 | E8 | Fork release and install pipeline | E3, E4 | ⬜ | — |
+| E9 | Claude account profiles per agent, switchable mid-session | E0 | ⬜ | — |
 
 ---
 
@@ -516,6 +521,90 @@ gateway host; keep LAN servers on stock or fork interchangeably.
 **Depends on:** E3, E4.
 **Open decisions (default in bold):** **fork update channel** vs manual install
 only.
+
+---
+
+### E9 — Claude account profiles per agent, switchable mid-session
+
+**Goal:** choose which Claude account (Pro/Max licence) each Claude Code agent
+runs under when it starts, see at a glance which account every agent is using,
+and move a running agent to another account — keeping its conversation — when
+one account runs out of usage.
+**Why:** usage limits are per account. With a second Max licence the only way
+to keep working today is to log out and back in inside Claude Code, which is
+manual, global to the machine, and loses track of which agent is on which
+account. herdr already knows how Claude Code is launched, where its config
+directory is (`CLAUDE_CONFIG_DIR`, `src/integration/env.rs`), and which Claude
+session id an agent holds for resume (`src/agent_resume.rs`); an account is
+just a Claude config directory with its own `.credentials.json` and
+`.claude.json` (`oauthAccount`).
+**Deliverables:**
+
+- **Account profiles.** A `[[accounts]]` section in `config.toml` (fork
+  field with defaults, `herdr --default-config` reference updated):
+
+  ```toml
+  [[accounts]]
+  name = "perso"            # display name and id
+  agent = "claude"          # only "claude" in v1
+  config_dir = "~/.claude"  # this profile's CLAUDE_CONFIG_DIR
+  # default = true          # used when an agent is started without a choice
+
+  [[accounts]]
+  name = "work"
+  agent = "claude"
+  config_dir = "~/.claude-work"
+  ```
+
+  `herdr account list|add <name> [--config-dir <path>]|login <name>|status
+  [<name>]|default <name>` — `add` creates the profile directory and seeds it
+  from the default profile (shared `projects/` transcripts so `--resume` works
+  from any account, shared hooks/skills/plugins/settings; **private**
+  `.credentials.json`, `.claude.json` and caches — the exact share list is a
+  plan decision verified against the installed Claude Code); `login` runs
+  `claude auth login` in that directory in a pane; `status` reads each
+  profile's `oauthAccount` (email, plan) without printing tokens. Profiles
+  are per host: credentials never leave the machine the agent runs on.
+- **Choose at start.** `herdr agent start --account <name>` and the TUI agent
+  launcher (a picker or a `[keys]` binding, following the existing dialog
+  language) launch Claude Code with that profile's `CLAUDE_CONFIG_DIR`. The
+  launch stays client-side and stock-server compatible: the pane shell
+  command is prefixed with the environment assignment (per-shell syntax via
+  `crate::platform::interactive_shell_command`), or `agent.start` gains an
+  **optional** `env`/`account` field that older servers ignore — the plan
+  proves which. Defaults resolve `agent` → workspace → host → the profile
+  marked `default`.
+- **See it.** Every Claude agent shows its account (name, and a warning
+  badge when the profile is logged out or rate-limited) in the sidebar,
+  `herdr agent list`, `herdr fleet status --json` and, through E3/E4, the
+  phone. The account is a runtime fact recorded when the agent is launched
+  (client-local metadata keyed by the agent's resume session) and confirmed
+  by reading the process environment in `src/platform/` where the OS allows.
+- **Switch mid-session.** `herdr agent switch-account <pane> <name>` and a
+  TUI action: capture the agent's Claude session id (already tracked for
+  resume), ask Claude Code to exit cleanly, relaunch `claude --resume <id>`
+  under the new profile in the same pane, and verify the transcript resumed.
+  Read is safe / control is explicit: the switch is a confirmed action and
+  never runs automatically.
+- **Limit awareness.** A `src/detect/manifests/claude.toml` rule (evidence
+  captured with `herdr agent read --source detection`) recognises Claude
+  Code's usage-limit screen as a distinct blocked reason (`usage_limit`) so
+  the agent sorts blocked-first with a "switch account" hint; the reset time,
+  when shown, is surfaced. No auto-switch in v1.
+- Docs in `docs/fork/accounts.md`; tests: pure config/profile-resolution
+  units, launch-command construction per shell, the switch state machine on
+  `AppState::test_new()`, and a real-server validation that starts two fake
+  `claude` stubs under two throwaway profile directories and switches one.
+
+**Depends on:** E0 (phone-side display and switch action: E7).
+**Open decisions (default in bold):** (a) profile layout — **separate
+`CLAUDE_CONFIG_DIR` per account sharing transcripts via symlinks** vs one
+directory with credentials swapped (would switch every running agent at
+once); (b) how the env reaches the agent — **client-side shell prefix, stock
+servers unchanged** vs an optional `agent.start` field; (c) scope of
+accounts — **Claude only in v1**, other agents' config-dir variables listed in
+`src/integration/env.rs` later; (d) limit handling — **detect and suggest**
+vs auto-switch on limit.
 
 ---
 
