@@ -93,11 +93,6 @@ pub(crate) struct ClientShellConfig {
     pub(super) palette: Palette,
     pub(super) keybinds: LiveKeybindConfig,
     pub(super) local_keys: crate::config::KeysConfig,
-    /// The local `[fleet.keys]` (fork), kept for the same reason as
-    /// `local_keys`: the client recompiles its keymap from these when a
-    /// server publishes its custom commands, and a fleet binding must
-    /// survive that.
-    pub(super) local_fleet_keys: crate::config::FleetKeysConfig,
     pub(super) keybinding_source: ClientShellKeybindingSource,
     pub(super) prompt_new_tab_name: bool,
     pub(super) prompt_new_workspace_name: bool,
@@ -174,10 +169,6 @@ pub(super) struct ShellHitMap {
     pub(super) navigator_popup: Rect,
     pub(super) navigator_search: Rect,
     pub(super) navigator_rows: Vec<(Rect, usize)>,
-    /// Host picker rows (fork, E2 PR 6), by index into the overlay's own
-    /// `rows`. Never a host id: the row a click lands on is resolved against
-    /// the overlay that drew it, and that overlay is closed by the switch.
-    pub(super) host_picker_rows: Vec<(Rect, usize)>,
     pub(super) worktree_search: Rect,
     pub(super) worktree_rows: Vec<(Rect, usize)>,
     pub(super) help_popup: Rect,
@@ -340,7 +331,6 @@ pub(super) enum ClientShellOverlayKind {
     ContextMenu,
     GlobalMenu,
     Settings,
-    HostPicker,
 }
 
 #[derive(Debug)]
@@ -408,19 +398,6 @@ pub(super) struct ClientNavigatorOverlay {
     pub(super) scroll: usize,
     pub(super) filter: Option<ClientNavigatorFilter>,
     pub(super) expanded_workspaces: HashSet<String>,
-}
-
-/// The Fleet console's host picker (fork, E2 PR 6).
-///
-/// Rows are a snapshot of `FleetSidebarModel::picker` taken when the overlay
-/// opens and refreshed whenever the console installs a new model, so a picker
-/// that is open while a host drops redraws with that host's new state. The
-/// behaviour lives in `fleet_overlay.rs`.
-#[derive(Debug)]
-pub(super) struct ClientHostPickerOverlay {
-    pub(super) rows: Vec<crate::fleet::sidebar::HostPickerRow>,
-    pub(super) selected: usize,
-    pub(super) scroll: usize,
 }
 
 #[derive(Debug)]
@@ -639,7 +616,6 @@ pub(super) enum ClientShellOverlay {
     ContextMenu(ClientContextMenuOverlay),
     GlobalMenu(ClientGlobalMenuOverlay),
     Settings(ClientSettingsOverlay),
-    HostPicker(ClientHostPickerOverlay),
 }
 
 impl ClientShellOverlay {
@@ -658,7 +634,6 @@ impl ClientShellOverlay {
             Self::ContextMenu(_) => ClientShellOverlayKind::ContextMenu,
             Self::GlobalMenu(_) => ClientShellOverlayKind::GlobalMenu,
             Self::Settings(_) => ClientShellOverlayKind::Settings,
-            Self::HostPicker(_) => ClientShellOverlayKind::HostPicker,
         }
     }
 }
@@ -1746,8 +1721,6 @@ impl ClientShellState {
                     | ClientShellOverlay::WorktreeRemove(_)
                     | ClientShellOverlay::ContextMenu(_)
                     | ClientShellOverlay::GlobalMenu(_)
-                    // The picker's keys are j/k and 1-9, like the navigator's.
-                    | ClientShellOverlay::HostPicker(_)
             );
         }
         matches!(

@@ -12,7 +12,6 @@ message, no field and no server code (see
 [ADR 0001](./decisions/0001-servers-stay-stock-ssh-transport.md)).
 
 - [Configuring `[fleet]`](#configuring-fleet)
-- [`[fleet.keys]`](#fleet-keys)
 - [Host-qualified ids](#host-qualified-ids)
 - [`herdr fleet status`](#herdr-fleet-status)
 - [Connection states](#connection-states)
@@ -33,10 +32,6 @@ The fleet is configured in the normal `config.toml`
 # This machine's default session is always host "local" unless disabled.
 # include_local = true
 #
-# [fleet.keys]
-# Bindings that only act in the Fleet console (`herdr fleet`).
-# host_picker = "prefix+shift+f"
-#
 # [[fleet.hosts]]
 # name = "workbox"        # display name and id prefix (workbox/w1:p1)
 # kind = "ssh"            # "ssh" | "local"
@@ -55,7 +50,6 @@ The fleet is configured in the normal `config.toml`
 | `fleet.hosts[].target` | string | — | SSH destination: an alias from your `~/.ssh/config`, `user@host`, or `ssh://host:2222`. **Required** for `kind = "ssh"`, and rejected for `kind = "local"`. |
 | `fleet.hosts[].session` | string | — | Named herdr session on that host. **Required** for `kind = "local"`; optional for `kind = "ssh"`, where omitting it means the host's default session. |
 | `fleet.hosts[].enabled` | bool | `true` | `false` keeps the host in the config and in the report, but the fleet never opens it. |
-| `fleet.keys.host_picker` | binding | `"prefix+shift+f"` | Open the Fleet console's host picker. See [`[fleet.keys]`](#fleet-keys) below. |
 
 `[[fleet.hosts]]` entries keep their file order in every list; the implicit
 `local` host, when enabled, always comes first.
@@ -80,42 +74,6 @@ kind = "local"
 session = "scratch"
 enabled = false
 ```
-
-<a id="fleet-keys"></a>
-
-### `[fleet.keys]`
-
-Keybindings for surfaces only the Fleet console has. They are ordinary
-binding values — the same `"prefix+x"` / `["prefix+x", "f5"]` syntax as
-`[keys]`, and the same `""` to unbind — compiled through the same registry, so
-a collision with a `[keys]` binding is reported like any other duplicate, and
-the console's own reload binding (`prefix+shift+r`) picks a new value up
-without a restart.
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `host_picker` | `"prefix+shift+f"` | Open the host picker: every configured host with its state, agent counts and transport (`local` / `ssh`), `↑↓`/`j k` to move, `home`/`end` and `1`-`9` to jump, `enter` to make one the active host, `esc` to close. |
-
-```toml
-[fleet.keys]
-host_picker = "prefix+h"
-```
-
-The section is fork-owned and lives under `[fleet]` rather than as a `[keys]`
-leaf, because `[keys]` is enumerated against upstream's published config
-reference.
-
-Precedence when two bindings want the same combo is the ordinary one: a
-binding *you* wrote always beats a default, whichever section the default is
-in — so the override above silently takes `prefix+h` from upstream's default
-`keys.focus_pane_left`. If you write the same combo in both sections,
-`[keys]` keeps it and the `[fleet.keys]` binding is reported as disabled.
-
-The default is `prefix+shift+f` ("**F**leet") and not `prefix+shift+h`, which
-is upstream's default `keys.swap_pane_left`.
-
-Outside the console the binding does nothing: a single-host client has no
-fleet to pick from.
 
 ### The reserved `local` host
 

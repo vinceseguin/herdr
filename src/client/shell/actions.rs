@@ -28,12 +28,6 @@ impl ClientShellState {
                     self.begin_worktree_action(action, outcome);
                     return;
                 }
-                if action == crate::input::KeybindAction::HostPicker {
-                    // Fork: a console opens the host picker; every other
-                    // client has no fleet and ignores the binding.
-                    outcome.repaint |= self.open_host_picker_overlay();
-                    return;
-                }
                 if action == crate::input::KeybindAction::OpenNavigator {
                     self.open_navigator_overlay();
                     outcome.repaint = true;

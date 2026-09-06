@@ -1546,37 +1546,6 @@ impl ClientShellState {
             }
             return;
         }
-        // Fork (E2 PR 6): the Fleet console's host picker, driven like the
-        // navigator below it — hover selects, a press on a row switches, a
-        // press outside the popup closes.
-        if matches!(self.overlay, Some(ClientShellOverlay::HostPicker(_))) {
-            let row_hit = self.host_picker_row_at(point);
-            match mouse.kind {
-                MouseEventKind::Moved => {
-                    if let Some(index) = row_hit {
-                        outcome.repaint |= self.select_host_picker_row(index);
-                    }
-                }
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(index) = row_hit {
-                        self.accept_host_picker_row(index, outcome);
-                    } else if !super::contains(self.hits.overlay_primary, point) {
-                        self.overlay = None;
-                        outcome.repaint = true;
-                    }
-                }
-                MouseEventKind::ScrollUp => {
-                    self.move_host_picker_selection(-3);
-                    outcome.repaint = true;
-                }
-                MouseEventKind::ScrollDown => {
-                    self.move_host_picker_selection(3);
-                    outcome.repaint = true;
-                }
-                _ => {}
-            }
-            return;
-        }
         if matches!(self.overlay, Some(ClientShellOverlay::Navigator(_))) {
             let row_hit = self
                 .hits

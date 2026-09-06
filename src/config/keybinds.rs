@@ -369,9 +369,6 @@ pub struct Keybinds {
     pub resize_pane_up: ActionKeybinds,
     pub resize_pane_right: ActionKeybinds,
     pub toggle_sidebar: ActionKeybinds,
-    /// `[fleet.keys] host_picker` — the Fleet console's host picker. Present
-    /// in every build; a client that is not a console ignores the action.
-    pub host_picker: ActionKeybinds,
     pub custom_commands: Vec<CustomCommandKeybind>,
 }
 
@@ -540,7 +537,6 @@ impl Config {
             resize_pane_up: empty_action!(),
             resize_pane_right: empty_action!(),
             toggle_sidebar: empty_action!(),
-            host_picker: empty_action!(),
             custom_commands: Vec::new(),
         };
 
@@ -688,18 +684,6 @@ impl Config {
             apply_action!(keybinds.resize_pane_up, resize_pane_up, source);
             apply_action!(keybinds.resize_pane_right, resize_pane_right, source);
             apply_action!(keybinds.toggle_sidebar, toggle_sidebar, source);
-            // Fork: `[fleet.keys]`. Applied after every `[keys]` field so that
-            // when a user binds the same combo in both, the upstream section
-            // keeps it and the fleet binding is the one reported as disabled.
-            if fleet_keys_source(&self.fleet.keys, "host_picker") == source {
-                keybinds.host_picker = parse_action_bindings(
-                    "fleet.keys.host_picker",
-                    &self.fleet.keys.host_picker,
-                    &mut registry,
-                    &mut diagnostics,
-                    source,
-                );
-            }
 
             if source == field_source!(indexed) {
                 append_legacy_indexed_bindings(
@@ -820,19 +804,6 @@ fn append_custom_command_bindings(
             width,
             height,
         });
-    }
-}
-
-/// Whether a `[fleet.keys]` field is the user's or this build's default.
-///
-/// The same two-pass rule `[keys]` uses: user bindings are registered first,
-/// so a default that collides with one is dropped silently instead of
-/// producing a diagnostic the user cannot act on.
-fn fleet_keys_source(keys: &crate::config::FleetKeysConfig, field: &str) -> BindingSource {
-    if keys.key_field_is_user_configured(field) {
-        BindingSource::User
-    } else {
-        BindingSource::Default
     }
 }
 
@@ -2266,129 +2237,6 @@ swap_pane_right = "prefix+shift+l"
             diag.contains("kept keys.previous_workspace")
                 && diag.contains("disabled keys.swap_pane_right")
         }));
-    }
-
-    #[test]
-    fn the_fleet_host_picker_has_a_default_binding_that_conflicts_with_nothing() {
-        let config = Config::default();
-        let diagnostics = config.collect_diagnostics();
-        let kb = config.keybinds();
-
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        assert_eq!(
-            binding_triggers(&kb.host_picker),
-            vec![BindingTrigger::Prefix((
-                KeyCode::Char('f'),
-                KeyModifiers::SHIFT
-            ))]
-        );
-        // The combo E2's plan first sketched belongs to an upstream default;
-        // a fleet default on it would disable one of the two on a stock
-        // install. This test is what says so out loud.
-        assert_eq!(
-            binding_triggers(&kb.swap_pane_left),
-            vec![BindingTrigger::Prefix((
-                KeyCode::Char('h'),
-                KeyModifiers::SHIFT
-            ))]
-        );
-    }
-
-    #[test]
-    fn a_user_fleet_binding_silently_displaces_the_upstream_default_on_that_key() {
-        let config: Config = toml::from_str(
-            r#"
-[fleet.keys]
-host_picker = "prefix+h"
-"#,
-        )
-        .unwrap();
-
-        let diagnostics = config.collect_diagnostics();
-        let kb = config.keybinds();
-
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        assert_eq!(
-            binding_triggers(&kb.host_picker),
-            vec![BindingTrigger::Prefix((
-                KeyCode::Char('h'),
-                KeyModifiers::empty()
-            ))]
-        );
-        assert!(
-            kb.focus_pane_left.bindings.is_empty(),
-            "a user binding beats a default, whichever section it is in"
-        );
-    }
-
-    #[test]
-    fn a_fleet_binding_colliding_with_a_user_keys_binding_is_the_one_reported() {
-        let config: Config = toml::from_str(
-            r#"
-[keys]
-goto = "prefix+shift+f"
-
-[fleet.keys]
-host_picker = "prefix+shift+f"
-"#,
-        )
-        .unwrap();
-
-        let diagnostics = config.collect_diagnostics();
-        let kb = config.keybinds();
-
-        assert!(
-            kb.host_picker.bindings.is_empty(),
-            "[keys] is applied first, so it keeps the combo"
-        );
-        assert_eq!(
-            binding_triggers(&kb.goto),
-            vec![BindingTrigger::Prefix((
-                KeyCode::Char('f'),
-                KeyModifiers::SHIFT
-            ))]
-        );
-        assert!(
-            diagnostics.iter().any(|diag| {
-                diag.contains("kept keys.goto") && diag.contains("disabled fleet.keys.host_picker")
-            }),
-            "{diagnostics:?}"
-        );
-    }
-
-    #[test]
-    fn an_invalid_fleet_binding_is_named_by_its_own_field() {
-        let config: Config = toml::from_str(
-            r#"
-[fleet.keys]
-host_picker = "prefix+nonsense"
-"#,
-        )
-        .unwrap();
-
-        let diagnostics = config.collect_diagnostics();
-
-        assert!(config.keybinds().host_picker.bindings.is_empty());
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diag| diag.contains("invalid keybinding: fleet.keys.host_picker")),
-            "{diagnostics:?}"
-        );
-    }
-
-    #[test]
-    fn an_empty_fleet_binding_unbinds_the_picker() {
-        let config: Config = toml::from_str(
-            r#"
-[fleet.keys]
-host_picker = ""
-"#,
-        )
-        .unwrap();
-
-        assert!(config.collect_diagnostics().is_empty());
-        assert!(config.keybinds().host_picker.bindings.is_empty());
     }
 
     #[test]

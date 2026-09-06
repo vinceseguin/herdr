@@ -7,7 +7,6 @@ mod config;
 mod context_menu;
 mod copy_mode;
 mod fleet;
-mod fleet_overlay;
 mod global_menu;
 mod graphics;
 mod input;

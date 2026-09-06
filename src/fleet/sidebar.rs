@@ -59,6 +59,19 @@ impl HostRowState {
     pub fn is_connected(&self) -> bool {
         matches!(self, Self::Connected)
     }
+
+    /// Short lowercase name, matching [`HostConnection::state_name`].
+    // Read by the host picker overlay (E2 PR 6), which names the state in
+    // prose next to each row; the sidebar draws the state as a style instead.
+    #[allow(dead_code)]
+    pub fn state_name(&self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Connecting { .. } => "connecting",
+            Self::Unavailable => "unavailable",
+            Self::Incompatible => "incompatible",
+        }
+    }
 }
 
 /// The header row of one host group.
@@ -124,13 +137,6 @@ pub struct HostGroup {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FleetSidebarModel {
     pub groups: Vec<HostGroup>,
-    /// The host picker's rows, same hosts and same order as `groups`.
-    ///
-    /// Cached here rather than derived when the overlay opens because the
-    /// shell holds this model and not [`FleetState`] (the console's fleet
-    /// state lives in the client loop), and because a picker that is open
-    /// while a host changes state must redraw from fresh rows.
-    pub picker: Vec<HostPickerRow>,
     /// Bumped by every [`FleetSidebarModel::rebuild`], so a renderer can key a
     /// derived cache (row heights, wrapped labels) on it and recompute only
     /// when the model actually changed.
@@ -160,7 +166,6 @@ impl FleetSidebarModel {
         sort: AgentPanelSortConfig,
     ) {
         let active = state.active_host();
-        self.picker = host_picker_rows(state);
         self.groups.clear();
         self.groups.reserve(state.hosts().len());
         for host in state.hosts() {
@@ -176,15 +181,6 @@ impl FleetSidebarModel {
         // stale-but-correct only if it also ignores `groups`, whereas a wrap
         // could collide with a live generation. Neither is reachable.
         self.generation = self.generation.saturating_add(1);
-    }
-
-    /// Whether two models describe the same rows.
-    ///
-    /// `generation` changes on every rebuild, so it cannot answer this; the
-    /// console asks before installing a rebuilt model, because installing one
-    /// costs a full recompose while most fleet changes move no visible row.
-    pub fn same_rows(&self, other: &Self) -> bool {
-        self.groups == other.groups && self.picker == other.picker
     }
 
     pub fn group(&self, host: &HostId) -> Option<&HostGroup> {
@@ -209,6 +205,8 @@ impl FleetSidebarModel {
 /// Same hosts, same order as the sidebar, so a `1-9` jump in the picker names
 /// the same host as the *n*-th sidebar group.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Every field is read by the picker overlay's renderer (E2 PR 6).
+#[allow(dead_code)]
 pub struct HostPickerRow {
     pub host: HostId,
     pub active: bool,
@@ -222,10 +220,9 @@ pub struct HostPickerRow {
 }
 
 /// The picker's rows, in `[fleet]` order with `local` first.
-///
-/// Called by [`FleetSidebarModel::rebuild`], which caches the result: the
-/// picker overlay lives in the client shell, which holds the model and not
-/// [`FleetState`], and a row built per frame would be a per-frame format.
+// Rendered by the host picker overlay (E2 PR 6). The sidebar (PR 5) draws
+// `FleetSidebarModel` instead; both derive from the same `FleetState`.
+#[allow(dead_code)]
 pub fn host_picker_rows(state: &FleetState) -> Vec<HostPickerRow> {
     let active = state.active_host();
     state
@@ -1104,47 +1101,6 @@ mod tests {
     }
 
     #[test]
-    fn the_model_caches_the_picker_rows_it_was_rebuilt_from() {
-        let mut state = FleetState::new(vec![local_spec(), ssh_spec("workbox")]);
-        connect(&mut state, &HostId::local(), "0.8.2-fork");
-        state.set_active_host(Some(HostId::local()));
-        let model = model_of(&state);
-
-        assert_eq!(
-            model.picker,
-            host_picker_rows(&state),
-            "the picker overlay reads the model, so it must carry the same rows"
-        );
-        assert_eq!(
-            model.picker.len(),
-            model.groups.len(),
-            "one picker row per group keeps the picker's 1-9 jump aligned with the sidebar"
-        );
-        assert!(model.picker[0].active);
-    }
-
-    #[test]
-    fn same_rows_sees_a_change_the_groups_alone_would_hide() {
-        let mut state = FleetState::new(vec![local_spec()]);
-        connect(&mut state, &HostId::local(), "0.8.2-fork");
-        let before = model_of(&state);
-
-        // A reconnect to an upgraded server: same rollup, same header label,
-        // so `groups` compares equal — but the picker names the version.
-        connect(&mut state, &HostId::local(), "0.9.0-fork");
-        let mut after = before.clone();
-        after.rebuild(&state, &HashSet::new(), AgentPanelSortConfig::Priority);
-
-        assert_eq!(before.groups, after.groups);
-        assert!(!before.same_rows(&after), "the picker row moved");
-        assert!(before.same_rows(&before.clone()));
-        assert_ne!(
-            before.generation, after.generation,
-            "generation cannot answer this question"
-        );
-    }
-
-    #[test]
     fn host_status_rank_matches_upstreams_table() {
         // Pinned against `status_priority` in `src/client/shell.rs`.
         assert_eq!(host_status_rank(AgentStatus::Blocked), 4);
@@ -1300,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn row_state_follows_the_connection_it_came_from() {
+    fn row_state_names_match_the_connection_they_came_from() {
         for connection in [
             HostConnection::Connected {
                 server_version: "0.8.2-fork".to_string(),
@@ -1317,15 +1273,7 @@ mod tests {
             },
         ] {
             let row = HostRowState::from_connection(&connection);
-            let expected = match &connection {
-                HostConnection::Connected { .. } => HostRowState::Connected,
-                HostConnection::Connecting { attempt } => {
-                    HostRowState::Connecting { attempt: *attempt }
-                }
-                HostConnection::Unavailable { .. } => HostRowState::Unavailable,
-                HostConnection::Incompatible { .. } => HostRowState::Incompatible,
-            };
-            assert_eq!(row, expected, "{}", connection.state_name());
+            assert_eq!(row.state_name(), connection.state_name());
             assert_eq!(row.is_connected(), connection.is_connected());
         }
     }
