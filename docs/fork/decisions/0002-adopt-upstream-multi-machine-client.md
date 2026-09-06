@@ -106,8 +106,47 @@ Option 3.
   `src/cli/spec.rs`, `src/main.rs`), the E1 hooks in `src/remote/attach.rs`,
   and test support. `docs/fork/README.md` keeps the authoritative table.
 
-### Upstream sync 2026-09-06 (`chore: sync upstream master`)
+### Upstream sync 2026-09-06 (`chore: sync upstream master through e366a05f`)
 
-_Filled in by the sync PR that follows the revert: how the E1 hooks were
-reconciled with upstream's rewritten `src/remote/attach.rs`, and which
-upstream-provided bridge, if any, `src/fleet/transport/ssh.rs` now uses._
+The first sync after the revert merged upstream `35b0dff9..e366a05f`
+(including #3670). After PR #33 only two files conflicted: `src/main.rs` (the
+bare-command list — both `"fleet"` and `"machine"` kept) and
+`src/remote/attach.rs`. Upstream's `attach.rs` was taken whole, then E1's
+hooks were re-applied on top of it as the smallest diff that keeps
+`src/fleet/transport/ssh.rs` compiling:
+
+- **No upstream bridge was adopted.** Upstream's new `src/client/transport.rs`
+  is the endpoint reader/writer for the client loop, not an ssh bridge, and its
+  saved-machine path (`prepare_saved_ssh`, `find_installed_remote_herdr`,
+  `RemoteSsh::new_noninteractive`, `probe_remote_endpoint`) is built for the
+  client's own endpoint registry: it *requires* surface-interest support on
+  the remote and installs/updates herdr interactively. The fleet keeps its own
+  discovery-only, install-never contract, so the E1 hooks stay.
+- `pub(crate)` on `RemoteHerdr`, `ManagedSshOptions`, `RemoteSsh` (and its
+  `new`/`options`), `SshStdioBridge`, `remote_bridge_command` — upstream
+  narrowed them to `pub(super)`/private, which `pub(crate) use attach::*` does
+  not re-export.
+- `discover_remote_herdr(ssh) -> io::Result<Option<RemoteHerdr>>` is now a
+  standalone helper next to upstream's `find_installed_remote_herdr`, probing
+  with `remote_binary_supports_endpoint_requirement(…, false)` — generation
+  match only, as before. Upstream's `prepare_remote_herdr` is untouched.
+- `SshStdioBridge::start_with(…, noninteractive, BridgeErrorSink)`: upstream's
+  `start` gained a `noninteractive` flag and logs through `tracing` in that
+  mode; the sink gained a `Log` variant so `start` reproduces upstream's stderr
+  and tracing output byte-for-byte in both modes, while the fleet's `Report`
+  sink keeps its messages. `RemoteSsh::new` now takes the session name;
+  `SshTransport` passes its own and stays interactive (managed ssh config,
+  control master), exactly as `herdr --remote` does.
+- `local_forward_socket_path_scoped` / `short_socket_hash_scoped` merged
+  cleanly and were kept.
+
+Two fleet-side adaptations outside `attach.rs`: upstream deleted
+`ipc::shutdown_local_stream_write` (the fleet connector was its last caller),
+so the half-close now lives in `src/fleet/connector.rs`; and the generation-1
+hello gained `surface_active` (default `true`), which the fleet sends as
+`true` — the pre-sync behaviour. Sending `false` for hosts with no active
+surface is upstream's new passive-reader hook, exactly what the E1 review
+asked for; E3 may adopt it.
+
+Upstream syncs remain a merge commit (`gh pr merge --merge`), so upstream's
+history stays in the fork's `master`.

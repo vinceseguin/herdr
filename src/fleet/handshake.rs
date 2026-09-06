@@ -137,6 +137,11 @@ pub fn endpoint_handshake(
         // Every host keeps local keybindings; see the plan's decision list.
         endpoint_keybindings: false,
         mouse_capture: params.mouse_capture,
+        // Upstream #3670: `false` lets a server drop this endpoint from surface
+        // interest. Kept `true` for now — the pre-sync behaviour, and what a
+        // generation-1 server that predates the field assumes; E3 may flip it
+        // for hosts with no active surface.
+        surface_active: true,
         snapshot_codecs: vec![SNAPSHOT_CODEC_V1.into()],
         surface_codecs: vec![SURFACE_CODEC_V1.into()],
         input_codecs: vec![INPUT_CODEC_V1.into()],

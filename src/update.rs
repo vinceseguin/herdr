@@ -3005,6 +3005,8 @@ mod tests {
                 endpoint_protocol_generation: Some(
                     crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
                 ),
+                surface_interest: true,
+                health_check: true,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -3077,6 +3079,8 @@ mod tests {
                     endpoint_protocol_generation: Some(
                         crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
                     ),
+                    surface_interest: true,
+                    health_check: true,
                 }),
             },
         };
@@ -3333,6 +3337,8 @@ mod tests {
                     endpoint_protocol_generation: Some(
                         crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
                     ),
+                    surface_interest: true,
+                    health_check: true,
                 }),
             },
         };

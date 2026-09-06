@@ -377,7 +377,7 @@ no agents
 ```
 
 The multi-machine **console** is upstream's: `herdr machine add <target>`
-saves an SSH machine, and the client's machine sidebar shows every saved
+(`list`, `rename`, `enable`, `disable`, `remove`) saves an SSH machine, and the client's machine sidebar shows every saved
 machine's workspaces and agents (upstream #3670). `herdr fleet status` is the
 fork's headless view of the same hosts, and the shape the gateway (E3) serves.
 
