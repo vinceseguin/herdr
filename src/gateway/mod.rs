@@ -26,6 +26,8 @@ mod policy;
 mod protocol;
 mod run;
 mod server;
+mod terminal;
+mod transports;
 
 /// The invocation line, shared with `herdr --help` so the two never drift.
 pub(crate) const GATEWAY_COMMAND_LINE: &str = "herdr gateway [--bind ADDR] [--config PATH]";
