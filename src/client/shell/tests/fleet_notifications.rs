@@ -375,6 +375,75 @@ fn a_notification_from_a_host_that_cannot_be_switched_to_focuses_nothing() {
 }
 
 #[test]
+fn another_hosts_notification_is_current_when_its_agent_is_hidden_by_a_named_view() {
+    // beta's panel is a named view that does not list `pane_9`, so the agent
+    // is absent from beta's *rows* while beta's snapshot still says it is
+    // blocked. The single-host client validates against `snapshot.agents`,
+    // never the panel; the console must do the same for another host.
+    let mut fleet = fleet_state(AgentStatus::Blocked);
+    let mut projection = host_snapshot("beta", "boot-beta", AgentStatus::Blocked);
+    projection.revision += 1;
+    projection.agent_view_label = Some("recent".into());
+    projection.agent_order = vec!["pane_elsewhere".into()];
+    fleet.apply(&host("beta"), HostEvent::Snapshot(Box::new(projection)));
+    let mut state = console(AgentStatus::Blocked);
+    state.fleet_sidebar_update(model_for(&fleet), host("alpha"), None);
+    state.config.toast_delay_seconds = 1;
+    let now = std::time::Instant::now();
+
+    state.receive_fleet_notification(host("beta"), blocked_on("beta", "pane_9"), now);
+    state.tick_notifications(now + std::time::Duration::from_secs(2));
+
+    let visible = state
+        .visible_notification
+        .as_ref()
+        .expect("a view that hides the agent does not make its toast stale");
+    assert_eq!(visible.host.as_ref(), Some(&host("beta")));
+}
+
+#[test]
+fn a_host_qualified_notification_before_any_fleet_view_is_never_resolved_here() {
+    // A console whose shell has a projection but no fleet view yet: nothing
+    // says which host that projection belongs to, so a host-qualified
+    // notification's ids must not be validated or focused against it.
+    let mut config = ClientShellConfig::from_config(&Config::default());
+    config.toast_delivery = crate::config::ToastDelivery::Herdr;
+    config.toast_delay_seconds = 0;
+    let mut state = ClientShellState::new(config);
+    state.set_snapshot(Box::new(host_snapshot(
+        "alpha",
+        "boot-alpha",
+        AgentStatus::Blocked,
+    )));
+    state.set_pane_surface(surface());
+    state.set_endpoint_methods(Some(vec!["pane.focus".into()]));
+    assert!(state.fleet.is_none(), "no fleet view installed yet");
+    let now = std::time::Instant::now();
+
+    // Shown — the active host's focused ids do not suppress it — but not
+    // openable: neither a switch (no fleet to switch with) nor a `pane.focus`
+    // on the projection at hand.
+    state.receive_fleet_notification(host("beta"), blocked_on("beta", "pane_9"), now);
+    assert!(state.visible_notification.is_some());
+    let outcome = open_the_target(&mut state);
+    assert!(fleet_actions(&outcome).is_empty());
+    assert!(
+        focused_panes(&outcome).is_empty(),
+        "another host's pane id must not be focused on the projection at hand"
+    );
+    assert!(state.visible_notification.is_none());
+
+    // Validated: the shell's snapshot is not the answer, and there is no
+    // model to ask, so a delayed notification is dropped rather than shown
+    // on the strength of a different machine's agent.
+    state.config.toast_delay_seconds = 1;
+    state.receive_fleet_notification(host("beta"), blocked_on("beta", "pane_9"), now);
+    state.tick_notifications(now + std::time::Duration::from_secs(2));
+    assert!(state.visible_notification.is_none());
+    assert!(state.pending_notifications.is_empty());
+}
+
+#[test]
 fn the_single_host_client_is_unchanged() {
     let mut config = ClientShellConfig::from_config(&Config::default());
     config.toast_delivery = crate::config::ToastDelivery::Herdr;

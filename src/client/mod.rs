@@ -1018,8 +1018,8 @@ fn handle_fleet_event(
         fleet::Translated::Notification { host, notification } => {
             // The host travels with the event: the shell validates and opens
             // its ids against the machine that sent it (fork, E2 PR 7).
-            fleet::deliver_notification(state, host, *notification);
-            if chrome_changed {
+            let presented = fleet::deliver_notification(state, host, *notification);
+            if chrome_changed && !presented {
                 fleet::present(state);
             }
             Ok(FleetOutcome::Handled)

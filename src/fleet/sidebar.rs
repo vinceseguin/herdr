@@ -118,6 +118,16 @@ pub struct HostGroup {
     pub workspaces: Vec<WorkspaceRow>,
     /// Upstream's agent-panel order; see [`host_status_rank`].
     pub agents: Vec<AgentRow>,
+    /// Status of every agent in the host's last snapshot, in snapshot order —
+    /// the ones a named agent view keeps out of `agents` included.
+    ///
+    /// [`FleetSidebarModel::agent_status`] reads this rather than the rows:
+    /// the single-host client answers "is this notification still current"
+    /// from `snapshot.agents`, not from the panel, and a filtered view on
+    /// another host must not turn an agent that is still blocked into a stale
+    /// toast. Part of the group's equality on purpose, so a hidden agent's
+    /// status change still installs a rebuilt model (`same_rows`).
+    pub agent_statuses: Vec<(String, AgentStatus)>,
 }
 
 /// Every host's rows, in `[fleet]` order with `local` first.
@@ -194,14 +204,16 @@ impl FleetSidebarModel {
     /// Status of one agent, addressed across hosts.
     ///
     /// Read by host-aware notifications (E2 PR 7) to decide whether a toast
-    /// for another host's agent is still worth showing: that host's rows are
-    /// the console's only view of a machine it is not currently drawing.
+    /// for another host's agent is still worth showing: that host's last
+    /// snapshot is the console's only view of a machine it is not currently
+    /// drawing. Answered from [`HostGroup::agent_statuses`], which lists every
+    /// agent — not from `agents`, which a named agent view filters.
     pub fn agent_status(&self, pane: &FleetPaneRef) -> Option<AgentStatus> {
         self.group(&pane.host)?
-            .agents
+            .agent_statuses
             .iter()
-            .find(|agent| agent.pane.pane_id == pane.pane_id)
-            .map(|agent| agent.status)
+            .find(|(pane_id, _)| *pane_id == pane.pane_id)
+            .map(|(_, status)| *status)
     }
 }
 
@@ -288,6 +300,7 @@ fn host_group(
     HostGroup {
         workspaces: workspace_rows(&id, snapshot),
         agents: agent_rows(&id, snapshot, sort),
+        agent_statuses: agent_statuses(snapshot),
         header: HostHeaderRow {
             active,
             collapsed,
@@ -451,6 +464,17 @@ fn agent_rows(
         .into_iter()
         .map(|agent| agent_row(host, agent))
         .collect()
+}
+
+/// Every agent's status, snapshot order, whatever the panel shows.
+fn agent_statuses(snapshot: Option<&ClientShellSnapshot>) -> Vec<(String, AgentStatus)> {
+    snapshot.map_or_else(Vec::new, |snapshot| {
+        snapshot
+            .agents
+            .iter()
+            .map(|agent| (agent.pane_id.clone(), agent.agent_status))
+            .collect()
+    })
 }
 
 fn agent_row(host: &HostId, agent: &crate::protocol::ClientShellAgent) -> AgentRow {
@@ -1024,6 +1048,62 @@ mod tests {
             model.agent_status(&FleetPaneRef::new(host("absent"), "w1:p1")),
             None,
             "an unknown host has no status"
+        );
+    }
+
+    #[test]
+    fn agent_status_covers_agents_a_named_view_keeps_out_of_the_rows() {
+        let mut state = FleetState::new(vec![local_spec()]);
+        let local = HostId::local();
+        connect(&mut state, &local, "0.8.2-fork");
+        let mut projection = snapshot(
+            "boot-1",
+            1,
+            vec![workspace("w1", "repo")],
+            vec![
+                agent("w1:p1", AgentStatus::Idle, 1),
+                agent("w1:p2", AgentStatus::Blocked, 2),
+            ],
+        );
+        projection.agent_view_label = Some("recent".to_string());
+        projection.agent_order = vec!["w1:p1".to_string()];
+        state.apply(&local, HostEvent::Snapshot(projection));
+        let model = model_of(&state);
+
+        assert_eq!(
+            labels(&model.groups[0].agents),
+            vec!["agent-w1:p1"],
+            "the panel shows what the view names"
+        );
+        assert_eq!(
+            model.agent_status(&FleetPaneRef::new(local.clone(), "w1:p2")),
+            Some(AgentStatus::Blocked),
+            "but the agent the view hides is still that host's agent: its \
+             notification is validated against it, not against the panel"
+        );
+
+        // A hidden agent's status change is a change to the model, or the
+        // console would keep validating against the status it had before.
+        let mut projection = snapshot(
+            "boot-1",
+            2,
+            vec![workspace("w1", "repo")],
+            vec![
+                agent("w1:p1", AgentStatus::Idle, 1),
+                agent("w1:p2", AgentStatus::Working, 3),
+            ],
+        );
+        projection.agent_view_label = Some("recent".to_string());
+        projection.agent_order = vec!["w1:p1".to_string()];
+        state.apply(&local, HostEvent::Snapshot(projection));
+        let next = model_of(&state);
+        assert!(
+            !model.same_rows(&next),
+            "a hidden agent's status change must install the rebuilt model"
+        );
+        assert_eq!(
+            next.agent_status(&FleetPaneRef::new(local, "w1:p2")),
+            Some(AgentStatus::Working)
         );
     }
 

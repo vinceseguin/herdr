@@ -266,7 +266,6 @@ pub(super) fn sync_switching_notice(state: &mut ClientState) -> bool {
         .is_some_and(|shell| shell.set_fleet_switching(pending))
 }
 
-/// Compose and present, after something that changed the console's chrome.
 /// Deliver one host's notification to the shell, with its host.
 ///
 /// The loop's `ServerMessage::SemanticNotification` arm cannot be reused: it
@@ -274,13 +273,16 @@ pub(super) fn sync_switching_notice(state: &mut ClientState) -> bool {
 /// the shell resolve another machine's ids against the active host's
 /// projection. Everything else it does — the effects, the repaint — is the
 /// same, and is done here once (E2 PR 7).
+///
+/// Returns whether the console was recomposed, so a caller that already knows
+/// the chrome changed does not compose the same frame twice.
 pub(super) fn deliver_notification(
     state: &mut ClientState,
     host: HostId,
     notification: crate::protocol::SemanticNotification,
-) {
+) -> bool {
     let Some(shell) = state.shell.as_mut() else {
-        return;
+        return false;
     };
     let (effects, repaint) =
         shell.receive_fleet_notification(host, notification, std::time::Instant::now());
@@ -288,8 +290,10 @@ pub(super) fn deliver_notification(
     if repaint {
         present(state);
     }
+    repaint
 }
 
+/// Compose and present, after something that changed the console's chrome.
 pub(super) fn present(state: &mut ClientState) {
     let Some(frame) = state
         .shell

@@ -705,19 +705,25 @@ impl ClientShellState {
         self.receive_notification_from(Some(host), event, now)
     }
 
-    /// The host of a notification that belongs to a machine this shell is
-    /// *not* showing, if that is what this is.
+    /// The host of a notification whose ids must *not* be resolved against
+    /// this shell's snapshot, if that is what this is.
     ///
-    /// `None` for the single-host client (no fleet state), for a notification
-    /// with no host, and for the active host — in all three the shell's own
-    /// snapshot is the right thing to resolve ids against.
+    /// `None` for a notification with no host (the single-host client: one
+    /// server, so its ids can only mean that one) and for the active host —
+    /// the shell's own snapshot is the right thing to resolve those against.
+    /// `Some` for every other host, and also for a host-qualified notification
+    /// that arrives before the console has installed a fleet view: nothing
+    /// then says the host on screen is the one that sent it, and the safe
+    /// answer is that its ids belong elsewhere — it cannot be opened here.
     pub(super) fn remote_fleet_notification_host<'a>(
         &self,
         host: Option<&'a HostId>,
     ) -> Option<&'a HostId> {
-        let fleet = self.fleet.as_ref()?;
         let host = host?;
-        (!fleet.is_active(host)).then_some(host)
+        match self.fleet.as_ref() {
+            Some(fleet) if fleet.is_active(host) => None,
+            _ => Some(host),
+        }
     }
 
     /// Whether this notification came from a host the shell is not showing.
