@@ -369,3 +369,254 @@ fn bad_credentials_are_refused_and_then_rate_limited() {
     assert!(blocked.header("retry-after").is_some());
     assert_eq!(gateway.http_get("/health", &[]).status, 200);
 }
+
+// ---- events (PR 5) ----
+
+/// `GET /api/events` against the real lab: the opening pair, then a real host
+/// going away arriving as a delta on an already-open socket.
+///
+/// One test for both because the second half needs the first half's lab, and a
+/// second `Lab::up` would double a 30-second setup for no extra coverage.
+#[test]
+fn events_stream_sends_report_then_host_delta() {
+    let mut lab = Lab::new("gw-events");
+    let up = lab.up("2");
+    assert!(
+        up.status.success(),
+        "up 2 failed: {}{}",
+        stdout_of(&up),
+        stderr_of(&up)
+    );
+
+    let gateway = Gateway::spawn(&lab, "");
+
+    // Wait for both hosts, so the opening `fleet` message is the interesting
+    // one rather than a race with the connector's first snapshot.
+    let connected = support::wait_until(
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(250),
+        || {
+            let response =
+                gateway.http_get("/api/fleet", &[("Authorization", &gateway.authorization())]);
+            response.status == 200
+                && response.json()["hosts"].as_array().is_some_and(|hosts| {
+                    hosts.len() == 2
+                        && hosts
+                            .iter()
+                            .all(|host| host["connection"]["state"].as_str() == Some("connected"))
+                })
+        },
+    );
+    assert!(connected, "hosts never all connected");
+
+    // 1. The opening pair: identity, then the whole fleet.
+    let opening = gateway.ws("/api/events", &["--max-messages", "2", "--timeout", "30"]);
+    let lines = support::gateway::ws_lines(&opening);
+    assert_eq!(opening.status.code(), Some(0), "{lines:?}");
+    assert_eq!(lines.len(), 2, "{lines:?}");
+
+    let hello = support::gateway::ws_text_json(&lines[0]);
+    assert_eq!(hello["kind"].as_str(), Some("hello"), "{hello}");
+    assert_eq!(
+        hello["schema"].as_str(),
+        Some("herdr.fleet.events.v1"),
+        "{hello}"
+    );
+    assert_eq!(hello["scope"].as_str(), Some("read"), "{hello}");
+
+    let fleet = support::gateway::ws_text_json(&lines[1]);
+    assert_eq!(fleet["kind"].as_str(), Some("fleet"), "{fleet}");
+    assert_eq!(
+        fleet["report"]["schema"].as_str(),
+        Some("herdr.fleet.status.v1"),
+        "{fleet}"
+    );
+    let hosts: Vec<&str> = fleet["report"]["hosts"]
+        .as_array()
+        .expect("hosts")
+        .iter()
+        .filter_map(|host| host["id"].as_str())
+        .collect();
+    assert_eq!(hosts, vec!["lab-1", "lab-2"], "{fleet}");
+
+    // The gateway advertises the capability it now serves.
+    let info = gateway.http_get(
+        "/api/gateway",
+        &[("Authorization", &gateway.authorization())],
+    );
+    let features: Vec<String> = info.json()["features"]
+        .as_array()
+        .map(|features| {
+            features
+                .iter()
+                .filter_map(|feature| feature.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(features.contains(&"events".to_string()), "{features:?}");
+
+    // 2. A delta on an open socket: stop one lab server and watch the
+    //    `host_connection` change arrive without re-polling `/api/fleet`.
+    let watcher = gateway.ws_spawn(
+        "/api/events",
+        &[("Authorization", &gateway.authorization())],
+        &["--max-messages", "3", "--timeout", "60"],
+    );
+    // The socket is opened by the child; give it the two opening messages
+    // before changing the world, so the delta cannot land in the report.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let stop = lab.herdr("lab-2", &["session", "stop", "lab-2"]);
+    assert!(
+        stop.status.success(),
+        "stopping lab-2 failed: {}{}",
+        stdout_of(&stop),
+        stderr_of(&stop)
+    );
+
+    let observed = watcher
+        .wait_with_output()
+        .expect("wait for the events watcher");
+    let lines = support::gateway::ws_lines(&observed);
+    assert_eq!(observed.status.code(), Some(0), "{lines:?}");
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    let delta = support::gateway::ws_text_json(&lines[2]);
+    assert_eq!(delta["kind"].as_str(), Some("host_connection"), "{delta}");
+    assert_eq!(delta["host"].as_str(), Some("lab-2"), "{delta}");
+    assert_ne!(
+        delta["connection"]["state"].as_str(),
+        Some("connected"),
+        "a stopped host must not still read as connected: {delta}"
+    );
+}
+
+/// The socket is behind exactly the same auth as the JSON routes: no
+/// credential is a 401 at the HTTP handshake, before any upgrade, and a
+/// foreign browser origin is a 403 even with a good token.
+#[test]
+fn events_refuses_a_missing_token_and_a_foreign_origin() {
+    let (_home, env) = hostless_env("events-auth");
+    let gateway = Gateway::spawn_in(env);
+
+    let anonymous = gateway.ws_with("/api/events", &[], &["--timeout", "20"]);
+    let lines = support::gateway::ws_lines(&anonymous);
+    assert_eq!(anonymous.status.code(), Some(2), "{lines:?}");
+    assert_eq!(lines, vec!["handshake 401".to_string()], "{lines:?}");
+
+    let foreign = gateway.ws_with(
+        "/api/events",
+        &[
+            ("Authorization", &gateway.authorization()),
+            ("Origin", "https://evil.example"),
+        ],
+        &["--timeout", "20"],
+    );
+    let lines = support::gateway::ws_lines(&foreign);
+    assert_eq!(foreign.status.code(), Some(2), "{lines:?}");
+    assert_eq!(lines, vec!["handshake 403".to_string()], "{lines:?}");
+
+    // And a good token on a hostless gateway still gets a well-formed stream:
+    // an empty fleet is a fleet.
+    let opening = gateway.ws("/api/events", &["--max-messages", "2", "--timeout", "20"]);
+    let lines = support::gateway::ws_lines(&opening);
+    assert_eq!(opening.status.code(), Some(0), "{lines:?}");
+    let fleet = support::gateway::ws_text_json(&lines[1]);
+    assert_eq!(fleet["kind"].as_str(), Some("fleet"), "{fleet}");
+    assert_eq!(
+        fleet["report"]["hosts"].as_array().map(Vec::len),
+        Some(0),
+        "{fleet}"
+    );
+}
+
+/// A stopping gateway says goodbye rather than dropping the TCP connection, so
+/// a client can tell "the server went away" from "the network blipped".
+#[test]
+fn events_closes_with_going_away_when_the_gateway_stops() {
+    let (_home, env) = hostless_env("events-shutdown");
+    let mut gateway = Gateway::spawn_in(env);
+
+    let watcher = gateway.ws_spawn(
+        "/api/events",
+        &[("Authorization", &gateway.authorization())],
+        &["--max-messages", "10", "--timeout", "30"],
+    );
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    assert_eq!(gateway.stop(), Some(0));
+
+    let observed = watcher.wait_with_output().expect("wait for the watcher");
+    let lines = support::gateway::ws_lines(&observed);
+    assert_eq!(observed.status.code(), Some(0), "{lines:?}");
+    assert_eq!(
+        lines.last().map(String::as_str),
+        Some("close 1001"),
+        "{lines:?}"
+    );
+}
+
+/// The feed is a feed: a `read` client that talks anyway is ignored, and a
+/// client that talks *too much* takes down only its own socket.
+///
+/// Both halves are one test because they share a gateway and neither needs a
+/// lab: an empty fleet still exercises the whole handshake and the inbound cap.
+#[test]
+fn events_ignores_client_chatter_and_survives_an_oversized_message() {
+    let (_home, env) = hostless_env("events-inbound");
+    let gateway = Gateway::spawn_in(env);
+
+    // Anything a client says on this socket is dropped — including a message
+    // shaped like the terminal input a `read` token may never send.
+    let chatty = gateway.ws(
+        "/api/events",
+        &[
+            "--send",
+            r#"{"type":"terminal.input","data":"rm -rf /"}"#,
+            "--max-messages",
+            "2",
+            "--timeout",
+            "20",
+        ],
+    );
+    let lines = support::gateway::ws_lines(&chatty);
+    assert_eq!(chatty.status.code(), Some(0), "{lines:?}");
+    let kinds: Vec<Option<String>> = lines
+        .iter()
+        .map(|line| {
+            support::gateway::ws_text_json(line)["kind"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![Some("hello".to_string()), Some("fleet".to_string())],
+        "{lines:?}"
+    );
+
+    // A message past the 4 KiB inbound cap ends that socket. The exit code is
+    // deliberately not asserted (the peer may see a close frame or a reset);
+    // what matters is that the *gateway* is unharmed.
+    let oversized = format!(r#"{{"pad":"{}"}}"#, "x".repeat(8 * 1024));
+    let _ = gateway.ws(
+        "/api/events",
+        &[
+            "--send",
+            &oversized,
+            "--max-messages",
+            "2",
+            "--timeout",
+            "20",
+        ],
+    );
+
+    assert_eq!(gateway.http_get("/health", &[]).status, 200);
+    let again = gateway.ws("/api/events", &["--max-messages", "2", "--timeout", "20"]);
+    let lines = support::gateway::ws_lines(&again);
+    assert_eq!(again.status.code(), Some(0), "{lines:?}");
+    assert_eq!(
+        support::gateway::ws_text_json(&lines[1])["kind"].as_str(),
+        Some("fleet"),
+        "{lines:?}"
+    );
+}

@@ -23,7 +23,7 @@ use crate::config::GatewayConfig;
 use crate::gateway::auth::{AuthLimiter, DeviceStore, TokenStore};
 use crate::gateway::fleet::FleetHandle;
 use crate::gateway::policy::OriginAllowlist;
-use crate::gateway::{assets, http, middleware};
+use crate::gateway::{assets, events, http, middleware};
 
 /// Largest request body the gateway accepts.
 ///
@@ -101,9 +101,9 @@ pub(crate) struct GatewayInfo {
 impl GatewayInfo {
     /// The features this build serves.
     ///
-    /// PR 5 appends `"events"`, PR 6 `"terminal"`, PR 8 `"pairing"`.
+    /// PR 6 appends `"terminal"`, PR 8 `"pairing"`.
     pub(crate) fn features() -> Vec<&'static str> {
-        vec!["fleet"]
+        vec!["fleet", "events"]
     }
 
     pub(crate) fn new(bind: SocketAddr, config: &GatewayConfig) -> Self {
@@ -124,6 +124,7 @@ impl GatewayInfo {
 pub(crate) fn router(state: AppState) -> Router {
     Router::new()
         .merge(http::routes())
+        .merge(events::routes())
         .fallback(assets::serve)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -501,13 +502,15 @@ pub(crate) mod tests {
             assert_eq!(json["schema"].as_str(), Some(http::GATEWAY_INFO_SCHEMA));
             assert_eq!(json["scope"].as_str(), Some(scope.as_str()));
             assert_eq!(json["loopback"].as_bool(), Some(true));
-            assert_eq!(
-                json["features"].as_array().map(|features| features
-                    .iter()
-                    .filter_map(|f| f.as_str())
-                    .collect::<Vec<_>>()),
-                Some(vec!["fleet"])
-            );
+            // Capability names are appended as PRs land them and never
+            // removed, so this asserts presence rather than an exact list a
+            // later PR would have to edit for no behavioural reason.
+            let features: Vec<&str> = json["features"]
+                .as_array()
+                .map(|features| features.iter().filter_map(|f| f.as_str()).collect())
+                .unwrap_or_default();
+            assert!(features.contains(&"fleet"), "{features:?}");
+            assert!(features.contains(&"events"), "{features:?}");
         }
         server.shutdown().await;
     }

@@ -229,7 +229,17 @@ async fn serve_until_signal(
     // Before the address is announced, so nothing that reacts to that line can
     // beat the signal handlers into place; the future itself is only awaited
     // by `serve`.
-    let shutdown = server::shutdown_signal();
+    let signal = server::shutdown_signal();
+    let stopper = fleet.stopper();
+    let shutdown = async move {
+        signal.await;
+        // End every open stream here rather than at the server's drain
+        // deadline. An upgraded WebSocket keeps graceful shutdown waiting for
+        // as long as it is open, so without this a stopping gateway would
+        // stall for the whole drain and then drop its clients' connections
+        // instead of telling them it is going away.
+        stopper.stop();
+    };
 
     let marker = gateway_dir.join(paths::RUNTIME_FILE);
     if let Err(error) = write_runtime_marker(&marker, listen) {
