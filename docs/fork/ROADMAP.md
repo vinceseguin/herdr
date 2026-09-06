@@ -319,13 +319,13 @@ it at full fidelity.
 **Deliverables:**
 
 - Launch: `herdr fleet [--session <name>]` (and `herdr --fleet` alias). Reuses
-  `run_client_with_mode` / the client-owned shell; the difference is N streams
-  behind a `FleetConnector` instead of one socket.
+  `run_client_with_launch` / the client-owned shell; the difference is N
+  streams behind a `FleetConnector` instead of one socket.
 - Sidebar: a host group per configured host (`▸ workbox · 2 blocked · 3
   working`), then that host's workspaces and agents using the existing agent
   status glyphs and ordering; unreachable hosts shown dimmed with the reason;
   the local host first. Click a host header or use the host picker
-  (`prefix+shift+h` default, configurable under `[keys]`) to switch the
+  (`prefix+shift+f` default, configurable under `[fleet.keys]`) to switch the
   **active host**.
 - Pane area renders the active host only — its focused tab and panes exactly as
   today. Switching hosts swaps which stream's pane surfaces are installed.
@@ -340,11 +340,13 @@ it at full fidelity.
 - Failure UX: a host dropping shows "reconnecting…" in its group and keeps the
   rest usable; if the *active* host drops, the pane area shows a reconnect
   notice, not an exit.
-- Docs: `docs/fork/fleet.md` (config, keys, limits).
+- Docs: `docs/fork/fleet.md` (launch, sidebar, switching, routing,
+  notifications, failure UX, limits, lab walkthrough).
 - Tests: shell-state unit tests for host grouping/switching/routing without
   PTYs; a `tests/` integration run against the fleet lab asserting the
   snapshot-driven sidebar lists both hosts' agents and that input reaches the
-  right server.
+  right server, driven through a real PTY (`tests/support/fleet_tui.rs`, and
+  `scripts/fork/tui-drive.py` for manual runs).
 
 **Depends on:** E1.
 **Open decisions (default in bold):** (a) host switch UX — **sidebar host

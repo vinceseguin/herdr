@@ -172,3 +172,79 @@ fleet host runs a stock server. Six facts are worth recording.
   fleet as well as by the single-host client.
 
 Nothing in *Decision* is amended.
+
+### E2 review (2026-09-06)
+
+E2 built the Fleet console — `herdr fleet` over N hosts at once, host groups in
+the sidebar, a host picker, host-aware notifications, and a reconnect notice
+for the active host. Option 4 held again: `src/server/`, `src/app/`, `src/api/`,
+`src/protocol/**` and `tests/fixtures/endpoint-*.json` have an empty diff,
+`PROTOCOL_VERSION` is unchanged at 22, and every lab host in validation ran a
+stock-behaviour server. Six facts are worth recording.
+
+- **One loop, one link — not a second client.** The console is upstream's
+  `run_client_loop` with its write side widened into a `ServerLink`
+  (`Single(LocalStream)` | `Fleet(FleetLink)`) and one extra `select!` branch
+  that *translates* a `FleetEvent` into the existing `ServerMessage` arms after
+  a host check. Duplicating the ~1100-line loop would have forked every future
+  upstream fix to it; a trait object per write would have touched every one of
+  `write_to_server`'s two dozen call sites. The cost is the one reshaping edit to
+  `src/client/mod.rs` the fork rules require a written reason for, and it is
+  this. The rule that falls out is worth keeping: **every write names a host
+  explicitly, and every inbound event is compared against that same id before
+  it reaches the shell** — there is no "current host" fallback anywhere, so a
+  message can only reach the host whose ids it carries.
+- **One shell, one active host.** `ClientShellState` keeps its single
+  `snapshot`/`pane_surface`, always the *active* host's, so every reader of
+  `self.snapshot` and every overlay were untouched and "input goes to the
+  active host" is true by construction. Other hosts reach the shell only as a
+  pure, pre-rendered `FleetSidebarModel` rebuilt on change. This is the
+  decision's "the render path stays single-endpoint; the sidebar is what
+  aggregates", made concrete — and it is also why a switch has to be a complete
+  boot reset (surface, hit map, leases, overlays, notifications): every one of
+  those holds the previous machine's ids.
+- **`[keys]` is upstream's namespace; fork bindings live under `[fleet.keys]`.**
+  A new `[keys]` leaf is enumerated by upstream's `config_reference_check.py`
+  against `docs/next/website/src/data/config-reference.json`, which fork rules
+  forbid editing, and `SKIPPED_SUBTREES` skips only struct-typed fields.
+  `[fleet]` is already skipped and fork-documented, so `[fleet.keys]` is the
+  fork's home for console-only bindings — compiled through the same
+  `BindingRegistry`, diagnosed against `[keys]` like any other duplicate. The
+  default is `prefix+shift+f`: `prefix+shift+h` (which the roadmap and this
+  plan's first draft both named) is upstream's `keys.swap_pane_left`, and two
+  defaults on one combo would have broken swap-pane-left for every herdr user.
+  **Check any new fork default against `KeysConfig::default()` first.**
+- **The ssh child's inherited stderr is redirected, not re-plumbed.** A
+  full-screen console cannot let ssh paint over it. Editing
+  `bridge_connection` in `src/remote/attach.rs` would have widened the one
+  non-trivial upstream edit the decision already regrets; instead the console
+  `dup2`s the herdr client log over fd 2 while it runs (unix) and restores the
+  original on every exit path, panic hook included. An ssh problem then reaches
+  the user as a host *reason* in the sidebar, and the raw text is in the log.
+  Same principle as the bridge refactor: solve it on the fork's side of the
+  seam.
+- **Foreground geometry is now a documented product limit, not just a note.**
+  E1 recorded that a connecting client becomes each host's foreground client
+  and so sets its effective pane geometry. E2 closed the mechanical half — the
+  active geometry is shared state the connector re-reads at handshake time, so
+  a reconnecting active host comes back at the console's *current* size — but
+  the other half is unfixable without a server change: inactive hosts are held
+  at herdr's default headless size, which is a no-op for a headless server and
+  a real resize for a host that already has an attached client. `fleet.md` says
+  plainly to run the console while you are using it rather than as a daemon. A
+  genuinely passive reader still needs the advertised-optional endpoint
+  observer method the decision reserves.
+- **Host failure stayed local through a second transport, and through input.**
+  Cutting the ssh lab's sshd out from under a *connected, active* host gave
+  `lab-ssh · reconnecting · host closed the connection` in the pane area and
+  `▾ lab-ssh · unavailable` in the sidebar while the other three hosts stayed
+  usable, and restarting the sshd in place brought the host back over ssh on
+  its own; the console never exited either way. Stopping a *local* host's
+  server under the console gave the same notice, and text typed at it reached
+  no host — not the dead one when it returned, and not the host that was active
+  by then. Dropping rather than queueing is the console's reading of the
+  endpoint contract's "unavailable servers are a client-local outcome": a
+  client-local outcome must not turn into a delayed write to somebody else's
+  machine.
+
+Nothing in *Decision* is amended.
