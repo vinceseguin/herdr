@@ -4,9 +4,10 @@
 //! The gateway does not re-render anything. A herdr server already produces
 //! diffed ANSI for a terminal client ([`ServerMessage::Terminal`]), so a
 //! session here is a pipe with a policy on it: open a *separate* client
-//! connection to that host through [`HostTransports`], put it in observe mode,
-//! and forward every frame to the browser as a binary message with a 14-byte
-//! header. Frames are never decoded, re-encoded or buffered beyond two.
+//! connection to that host through [`HostTransports`], put it in observe or
+//! control mode, and forward every frame to the browser as a binary message
+//! with a 14-byte header. Frames are never decoded, re-encoded or buffered
+//! beyond two.
 //!
 //! **Why a separate connection.** A client socket's mode is fixed for its
 //! lifetime by its first message, so a terminal cannot ride the fleet
@@ -18,10 +19,19 @@
 //! cannot keep up makes its host skip intermediate frames instead of growing a
 //! queue. Memory per session is two frames.
 //!
-//! **Scope.** Observe never carries input. The check is in
-//! [`SessionPolicy::admit`], re-run on every message, because a route-level
+//! **Scope.** Observe never carries input, and only a `control` credential can
+//! open a control session at all. Both halves live in [`SessionPolicy`]: the
+//! `(control mode, read scope)` pair cannot be constructed, and
+//! [`SessionPolicy::admit`] re-checks *every* message, because a route-level
 //! gate decided once at the handshake cannot police a socket that lives for
-//! hours.
+//! hours. The route's `require(&principal, TokenScope::Read)` is the floor for
+//! reaching the endpoint, never the gate on what the session may do.
+//!
+//! **Ownership.** A herdr server gives a pane's PTY to one attached client at
+//! a time. A control open on a pane somebody else holds is answered
+//! `terminal.error {code:"busy"}`; `terminal.open {takeover:true}` evicts that
+//! owner, whose session then ends with `terminal.closed {reason:"taken_over"}`.
+//! `terminal.release` (or the socket closing) hands the pane back.
 
 use std::io;
 use std::sync::Arc;
@@ -34,18 +44,18 @@ use axum::routing::get;
 use axum::Router;
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::TryClone as _;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::client::terminal_control_command_from_json;
 use crate::fleet::hosts::{HostId, HostSpec};
 use crate::fleet::refs::is_valid_resource_id;
-use crate::gateway::auth::{Principal, TokenScope};
+use crate::gateway::auth::{Credential, Principal, TokenScope};
 use crate::gateway::http::ApiError;
 use crate::gateway::middleware::{require, Authed};
 use crate::gateway::protocol::{
     check_geometry, classify_shutdown_reason, encode_frame, parse_terminal_open, terminal_closed,
     terminal_error, terminal_ready, SessionPolicy, TerminalClose, TerminalErrorCode, TerminalMode,
-    MAX_CLIENT_MESSAGE_BYTES,
+    CLOSED_RELEASED, CLOSED_TAKEN_OVER, MAX_CLIENT_MESSAGE_BYTES,
 };
 use crate::gateway::server::AppState;
 use crate::gateway::transports::{HostTransports, OpenStream, StreamLease, HOST_BUSY_KIND};
@@ -64,6 +74,28 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_CHANNEL_CAPACITY: usize = 2;
 /// Commands buffered between the browser and the host.
 const COMMAND_CHANNEL_CAPACITY: usize = 16;
+/// How long a session waits for its writer thread to drain before it tears the
+/// connection down.
+///
+/// A `terminal.release` right after a keystroke is the ordinary case — a
+/// browser closing a terminal it just typed into — and the keystroke has to
+/// reach the pty before the socket is half-closed under the writer. Bounded so
+/// a wedged write cannot hold the task open, and kept *under*
+/// `HostTransports`' three-second release wait so a session that is draining
+/// when the gateway stops still lets its `StreamLease` go in time.
+const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the gateway waits for the host to confirm the session before it
+/// tells the client the terminal is ready.
+///
+/// A herdr server answers an accepted observe or attach with a full redraw and
+/// a refused one with a `ServerShutdown`, so the first event decides. The bound
+/// exists only so a host that says neither still produces a usable session
+/// rather than a socket that hangs: on timeout the client gets its
+/// `terminal.ready` and the stream continues.
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
+/// The `terminal.closed` reason a gateway shutdown produces, wherever a
+/// session notices the stop latch.
+const GATEWAY_STOPPING: &str = "the gateway is stopping";
 
 /// The terminal stream. Merged by [`crate::gateway::server::router`], which is
 /// what puts it behind the auth layer.
@@ -130,9 +162,10 @@ async fn run_terminal(
         Err(failure) => return failure.emit(&mut socket).await,
     };
 
-    // Scope first, capability second: a read credential asking for control must
-    // learn that it lacks the scope, not that the build lacks the feature.
-    if !principal.allows(open.mode.required_scope()) {
+    // The session's own gate, decided before a host is touched: a credential
+    // that cannot hold this mode never opens a connection at all. `Read` at
+    // the route is the floor for reaching the endpoint, never this.
+    let Some(policy) = SessionPolicy::new(open.mode, principal.scope) else {
         return Failure::new(
             TerminalErrorCode::Forbidden,
             format!(
@@ -144,16 +177,8 @@ async fn run_terminal(
         )
         .emit(&mut socket)
         .await;
-    }
-    if open.mode == TerminalMode::Control {
-        return Failure::new(
-            TerminalErrorCode::Unsupported,
-            "this gateway serves observe sessions only".to_string(),
-            close_code::POLICY,
-        )
-        .emit(&mut socket)
-        .await;
-    }
+    };
+    let mode = policy.mode;
 
     // Host failure is local to this socket: never a 5xx, never another host's
     // problem. `None` from either lookup means the host is not configured.
@@ -191,11 +216,16 @@ async fn run_terminal(
 
     // Blocking: ssh discovery, a socket connect and two round trips.
     let transports = Arc::clone(&state.transports);
-    let target = pane.clone();
     let (cols, rows) = (open.cols, open.rows);
+    let request = SessionRequest {
+        mode,
+        pane: pane.clone(),
+        cols,
+        rows,
+        takeover: open.takeover,
+    };
     let opened =
-        tokio::task::spawn_blocking(move || open_observe(&transports, &spec, &target, cols, rows))
-            .await;
+        tokio::task::spawn_blocking(move || open_session(&transports, &spec, &request)).await;
     let mut session = match opened {
         Ok(Ok(session)) => session,
         Ok(Err(error)) => {
@@ -235,22 +265,54 @@ async fn run_terminal(
         }
     };
 
-    let policy = SessionPolicy::new(TerminalMode::Observe, principal.scope);
+    // The host's first word decides whether this session exists. An accepted
+    // observe or attach answers with a full redraw; a refused one answers with
+    // a shutdown — a pane that is not there, an attach slot somebody else
+    // holds. Saying `terminal.ready` before that would make a client open a
+    // terminal it does not have and then take it away again.
+    let first_frame = match await_attach(&mut session, &mut stopping).await {
+        Attached::Ready(frame) => frame,
+        Attached::Refused { text, close } => {
+            tracing::info!(
+                target: "gateway",
+                host = %host,
+                pane = %pane,
+                mode = mode.as_str(),
+                "the host refused the terminal session"
+            );
+            drop(session);
+            let _ = socket.send(Message::Text(text.into())).await;
+            let _ = socket.send(Message::Close(Some(close))).await;
+            return;
+        }
+    };
+
     tracing::info!(
         target: "gateway",
         host = %host,
         pane = %pane,
-        mode = TerminalMode::Observe.as_str(),
+        mode = mode.as_str(),
+        takeover = open.takeover,
+        credential = credential_kind(&principal.via),
         "terminal session opened"
     );
     if socket
         .send(Message::Text(
-            terminal_ready(TerminalMode::Observe, &host, &pane, cols, rows).into(),
+            terminal_ready(mode, &host, &pane, cols, rows).into(),
         ))
         .await
         .is_err()
     {
         return;
+    }
+    if let Some(frame) = first_frame {
+        if socket
+            .send(Message::Binary(encode_frame(&frame).into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
     }
 
     let mut close: Option<CloseFrame> = None;
@@ -261,7 +323,7 @@ async fn run_terminal(
             // while a stream is open.
             changed = stopping.changed() => {
                 if changed.is_err() || *stopping.borrow_and_update() {
-                    let _ = socket.send(Message::Text(terminal_closed(Some("the gateway is stopping")).into())).await;
+                    let _ = socket.send(Message::Text(terminal_closed(Some(GATEWAY_STOPPING)).into())).await;
                     close = Some(frame(close_code::AWAY, "gateway stopping"));
                     break;
                 }
@@ -273,17 +335,9 @@ async fn run_terminal(
                     }
                 }
                 Some(TerminalEvent::Closed(reason)) => {
-                    let text = match classify_shutdown_reason(reason.as_deref()) {
-                        TerminalClose::PaneNotFound(reason) => {
-                            close = Some(frame(close_code::NORMAL, "pane not found"));
-                            terminal_error(TerminalErrorCode::PaneNotFound, &reason)
-                        }
-                        TerminalClose::Closed(reason) => {
-                            close = Some(frame(close_code::NORMAL, "closed"));
-                            terminal_closed(reason.as_deref())
-                        }
-                    };
-                    let _ = socket.send(Message::Text(text.into())).await;
+                    let answer = ending_answer(Ending::Closed(reason));
+                    let _ = socket.send(Message::Text(answer.text.into())).await;
+                    close = Some(answer.close);
                     break;
                 }
                 // The stream broke in a way that is nobody's request: a frame
@@ -291,14 +345,16 @@ async fn run_terminal(
                 // client can tell it from the host closing the pane.
                 Some(TerminalEvent::Failed(error)) => {
                     tracing::info!(target: "gateway", host = %host, pane = %pane, error = %error, "terminal stream failed");
-                    let _ = socket.send(Message::Text(terminal_error(TerminalErrorCode::Internal, &error).into())).await;
-                    close = Some(frame(close_code::ERROR, "stream failed"));
+                    let answer = ending_answer(Ending::Failed(error));
+                    let _ = socket.send(Message::Text(answer.text.into())).await;
+                    close = Some(answer.close);
                     break;
                 }
                 // The reader thread ended without a reason: the host hung up.
                 None => {
-                    let _ = socket.send(Message::Text(terminal_closed(None).into())).await;
-                    close = Some(frame(close_code::NORMAL, "closed"));
+                    let answer = ending_answer(Ending::Eof);
+                    let _ = socket.send(Message::Text(answer.text.into())).await;
+                    close = Some(answer.close);
                     break;
                 }
             },
@@ -313,6 +369,15 @@ async fn run_terminal(
                             }
                         }
                         ClientOutcome::Release => {
+                            // The client's own doing, so the gateway names it
+                            // rather than relaying the host's "detached": a
+                            // release and a pane that exited are not the same
+                            // event to whatever drew the terminal.
+                            let _ = socket
+                                .send(Message::Text(
+                                    terminal_closed(Some(CLOSED_RELEASED)).into(),
+                                ))
+                                .await;
                             close = Some(frame(close_code::NORMAL, "released"));
                             break;
                         }
@@ -335,15 +400,145 @@ async fn run_terminal(
         }
     }
 
+    // Before the socket is torn down: anything the client asked for that is
+    // still in flight has to land first.
+    session.drain().await;
     let _ = socket.send(Message::Close(close)).await;
     drop(session);
     tracing::info!(
         target: "gateway",
         host = %host,
         pane = %pane,
-        mode = TerminalMode::Observe.as_str(),
+        mode = mode.as_str(),
         "terminal session closed"
     );
+}
+
+/// How a credential was presented, for the log. Never the secret, never a
+/// device id: only which of the two ways it arrived.
+fn credential_kind(credential: &Credential) -> &'static str {
+    match credential {
+        Credential::Bearer => "bearer",
+        Credential::Device { .. } => "device",
+    }
+}
+
+/// The host's answer to the opening request.
+enum Attached {
+    /// The session is live. The frame is the host's first redraw, or `None`
+    /// when it said nothing within [`ATTACH_TIMEOUT`].
+    Ready(Option<TerminalFrame>),
+    /// The host ended the session before it began; this is what the client
+    /// hears instead of `terminal.ready`.
+    Refused { text: String, close: CloseFrame },
+}
+
+/// Wait for the host to accept or refuse the session.
+///
+/// Selects on the stop latch as the main loop does, and for the same reason: a
+/// session that is waiting on a host is still a session holding a
+/// [`StreamLease`], and `HostTransports::shutdown` waits only three seconds for
+/// the last lease before it drops a transport. Without this arm a stopping
+/// gateway could tear an ssh bridge down under a stream that is still opening.
+async fn await_attach(
+    session: &mut TerminalSession,
+    stopping: &mut watch::Receiver<bool>,
+) -> Attached {
+    let deadline = tokio::time::Instant::now() + ATTACH_TIMEOUT;
+    loop {
+        // Both futures are cancel-safe, so the arm that loses drops nothing:
+        // `recv` leaves the queued event in the channel.
+        let event = tokio::select! {
+            changed = stopping.changed() => {
+                if changed.is_err() || *stopping.borrow_and_update() {
+                    return Attached::Refused {
+                        text: terminal_closed(Some(GATEWAY_STOPPING)),
+                        close: frame(close_code::AWAY, "gateway stopping"),
+                    };
+                }
+                // The latch only ever moves to `true`; anything else is not a
+                // stop, so keep waiting for the host.
+                continue;
+            }
+            event = tokio::time::timeout_at(deadline, session.frames.recv()) => event,
+        };
+        return match event {
+            Ok(Some(TerminalEvent::Frame(frame))) => Attached::Ready(Some(frame)),
+            Ok(Some(TerminalEvent::Closed(reason))) => {
+                Attached::from(ending_answer(Ending::Closed(reason)))
+            }
+            Ok(Some(TerminalEvent::Failed(error))) => {
+                Attached::from(ending_answer(Ending::Failed(error)))
+            }
+            Ok(None) => Attached::from(ending_answer(Ending::Eof)),
+            // Nothing yet. The connection is open and the policy is settled, so
+            // this is a slow host, not a refusal: let the session run.
+            Err(_) => Attached::Ready(None),
+        };
+    }
+}
+
+impl From<Answer> for Attached {
+    fn from(answer: Answer) -> Self {
+        Attached::Refused {
+            text: answer.text,
+            close: answer.close,
+        }
+    }
+}
+
+/// How a session ended on the host's side.
+enum Ending {
+    /// A `ServerShutdown`, with the host's reason.
+    Closed(Option<String>),
+    /// The stream broke.
+    Failed(String),
+    /// The reader ended without a word.
+    Eof,
+}
+
+/// What the client is told, and how the socket closes.
+struct Answer {
+    text: String,
+    close: CloseFrame,
+}
+
+/// Translate a host-side ending into this stream's vocabulary.
+///
+/// One place, because an ending can arrive before `terminal.ready` (the host
+/// refusing the open) or hours later (a takeover, the pane exiting), and the
+/// two must not drift apart.
+fn ending_answer(ending: Ending) -> Answer {
+    let (text, close) = match ending {
+        Ending::Closed(reason) => match classify_shutdown_reason(reason.as_deref()) {
+            TerminalClose::PaneNotFound(reason) => (
+                terminal_error(TerminalErrorCode::PaneNotFound, &reason),
+                frame(close_code::NORMAL, "pane not found"),
+            ),
+            // Somebody else holds this pane. Retryable — with `takeover` —
+            // so it closes like the gateway's own busy transport does.
+            TerminalClose::Busy(reason) => (
+                terminal_error(TerminalErrorCode::Busy, &reason),
+                frame(close_code::AGAIN, "busy"),
+            ),
+            // Not an error: this client did nothing wrong, it simply no
+            // longer owns the pane.
+            TerminalClose::TakenOver => (
+                terminal_closed(Some(CLOSED_TAKEN_OVER)),
+                frame(close_code::NORMAL, "taken over"),
+            ),
+            TerminalClose::Closed(reason) => (
+                terminal_closed(reason.as_deref()),
+                frame(close_code::NORMAL, "closed"),
+            ),
+        },
+        Ending::Failed(error) => (
+            terminal_error(TerminalErrorCode::Internal, &error),
+            frame(close_code::ERROR, "stream failed"),
+        ),
+        Ending::Eof => (terminal_closed(None), frame(close_code::NORMAL, "closed")),
+    };
+    Answer { text, close }
 }
 
 fn frame(code: u16, reason: &'static str) -> CloseFrame {
@@ -391,14 +586,31 @@ async fn handle_client_text(
     // The CLI vocabulary bounds a resize below only; the host renders this
     // session at whatever it asks for, so the ceiling is applied here, the
     // same one `terminal.open` was held to.
-    if let ClientMessage::Resize { cols, rows, .. } = &message {
-        if let Err(error) = check_geometry(*cols, *rows) {
-            return ClientOutcome::Answer(terminal_error(
-                TerminalErrorCode::BadRequest,
-                &format!("terminal.resize {error}"),
-            ));
+    let message = match message {
+        ClientMessage::Resize { cols, rows, .. } => {
+            if let Err(error) = check_geometry(cols, rows) {
+                return ClientOutcome::Answer(terminal_error(
+                    TerminalErrorCode::BadRequest,
+                    &format!("terminal.resize {error}"),
+                ));
+            }
+            // The terminal hello declared no cell geometry and no pixel mouse,
+            // and a resize must not smuggle either back in: for a *controller*
+            // this resize reaches the real pty (`headless.rs` hands
+            // `cell_*_px` to `runtime.resize`), so a browser-chosen pixel cell
+            // size would change what the pane reports to every other client of
+            // that host. The gateway renders nothing and knows no cell size, so
+            // the only honest answer is the zero it opened with.
+            ClientMessage::Resize {
+                cols,
+                rows,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                pixel_mouse: false,
+            }
         }
-    }
+        other => other,
+    };
     let release = matches!(message, ClientMessage::Detach);
     if session.send(message).await.is_err() {
         // The writer thread is gone; the frame arm will end the session.
@@ -497,36 +709,61 @@ async fn read_open(
     }
 }
 
-/// Open a client connection to `spec`'s host and put it in observe mode.
+/// Everything the client asked for, owned so it can cross into
+/// `spawn_blocking`.
+#[derive(Debug, Clone)]
+struct SessionRequest {
+    mode: TerminalMode,
+    pane: String,
+    cols: u16,
+    rows: u16,
+    takeover: bool,
+}
+
+impl SessionRequest {
+    /// The message that fixes this connection's mode for its whole life.
+    ///
+    /// The only place `takeover` is read: an observer owns nothing, so there
+    /// is nothing for it to take, and the server has no observe equivalent.
+    fn attach(&self) -> ClientMessage {
+        match self.mode {
+            TerminalMode::Observe => ClientMessage::ObserveTerminal {
+                target: self.pane.clone(),
+            },
+            TerminalMode::Control => ClientMessage::ControlTerminal {
+                target: self.pane.clone(),
+                takeover: self.takeover,
+            },
+        }
+    }
+}
+
+/// Open a client connection to `spec`'s host and put it in the asked-for mode.
 ///
 /// **Blocking.** Every failure is one host's: the caller turns it into a
 /// `terminal.error` on this socket and nothing else.
-fn open_observe(
+fn open_session(
     transports: &HostTransports,
     spec: &HostSpec,
-    pane: &str,
-    cols: u16,
-    rows: u16,
+    request: &SessionRequest,
 ) -> io::Result<TerminalSession> {
     let OpenStream {
         stream,
         read_timeout,
         lease,
     } = transports.connect(spec)?;
-    negotiate_observe(stream, read_timeout, pane, cols, rows, lease)
+    negotiate(stream, read_timeout, request, lease)
 }
 
 /// The terminal handshake on an already-open stream. **Blocking.**
 ///
-/// Split from [`open_observe`] so the two frozen exchanges — hello/welcome and
-/// `ObserveTerminal` — are testable against a fake endpoint without a
-/// transport, a config directory or a session socket.
-fn negotiate_observe(
+/// Split from [`open_session`] so the two frozen exchanges — hello/welcome and
+/// `ObserveTerminal`/`ControlTerminal` — are testable against a fake endpoint
+/// without a transport, a config directory or a session socket.
+fn negotiate(
     mut stream: LocalStream,
     read_timeout: Duration,
-    pane: &str,
-    cols: u16,
-    rows: u16,
+    request: &SessionRequest,
     lease: StreamLease,
 ) -> io::Result<TerminalSession> {
     // The terminal hello, not the endpoint hello: this connection is a
@@ -537,8 +774,8 @@ fn negotiate_observe(
         &mut stream,
         &ClientMessage::TerminalHello {
             version: PROTOCOL_VERSION,
-            cols,
-            rows,
+            cols: request.cols,
+            rows: request.rows,
             cell_width_px: 0,
             cell_height_px: 0,
             pixel_mouse: false,
@@ -576,12 +813,7 @@ fn negotiate_observe(
         }
     }
 
-    write(
-        &mut stream,
-        &ClientMessage::ObserveTerminal {
-            target: pane.to_string(),
-        },
-    )?;
+    write(&mut stream, &request.attach())?;
 
     TerminalSession::start(stream, lease)
 }
@@ -603,6 +835,9 @@ enum TerminalEvent {
 struct TerminalSession {
     frames: mpsc::Receiver<TerminalEvent>,
     commands: Option<mpsc::Sender<ClientMessage>>,
+    /// Resolves when the writer thread has stopped, so [`Self::drain`] knows
+    /// every queued command reached the host.
+    writer_done: Option<tokio::sync::oneshot::Receiver<()>>,
     /// A third handle on the same socket, kept only to half-close it.
     close: LocalStream,
     _lease: StreamLease,
@@ -624,16 +859,20 @@ impl TerminalSession {
             })?;
 
         let writer_lease = lease.clone();
+        let (writer_done_tx, writer_done_rx) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("herdr-gw-term-w".to_string())
             .spawn(move || {
                 let _lease = writer_lease;
+                // Dropped when this thread ends, which is what wakes `drain`.
+                let _done = writer_done_tx;
                 write_commands(stream, commands_rx);
             })?;
 
         Ok(Self {
             frames: frames_rx,
             commands: Some(commands_tx),
+            writer_done: Some(writer_done_rx),
             close,
             _lease: lease,
         })
@@ -645,6 +884,23 @@ impl TerminalSession {
             return Err(());
         };
         commands.send(message).await.map_err(|_| ())
+    }
+
+    /// Let every queued command reach the host before the socket is torn down.
+    ///
+    /// [`Drop`] half-closes the write side, which is what makes a host drop an
+    /// abandoned session promptly — but a writer thread still holding queued
+    /// commands would then fail its next write. A client that types and
+    /// immediately releases would silently lose the keystroke, which is the one
+    /// failure this whole module exists to avoid.
+    async fn drain(&mut self) {
+        // Dropping the sender is what tells the writer the queue is final;
+        // without it `blocking_recv` waits for a command that never comes.
+        self.commands = None;
+        let Some(done) = self.writer_done.take() else {
+            return;
+        };
+        let _ = tokio::time::timeout(WRITER_DRAIN_TIMEOUT, done).await;
     }
 }
 

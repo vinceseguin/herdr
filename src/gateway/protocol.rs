@@ -306,6 +306,12 @@ pub(crate) enum TerminalErrorCode {
     /// The host is up but its one terminal stream slot is taken (an ssh
     /// host's bridge serves one at a time); the client may retry later.
     HostBusy,
+    /// The pane already has an attached controller on the host and this
+    /// session did not ask to take it over. Distinct from [`Self::HostBusy`]:
+    /// that one is the gateway's own transport slot, this one is the herdr
+    /// server's single-owner attach slot, and the answer to it is
+    /// `terminal.open { takeover: true }` rather than "wait".
+    Busy,
     /// The host is reachable but has no such pane.
     PaneNotFound,
     /// The vocabulary allows it but this session cannot do it.
@@ -321,6 +327,7 @@ impl TerminalErrorCode {
             TerminalErrorCode::Forbidden => "forbidden",
             TerminalErrorCode::HostUnavailable => "host_unavailable",
             TerminalErrorCode::HostBusy => "host_busy",
+            TerminalErrorCode::Busy => "busy",
             TerminalErrorCode::PaneNotFound => "pane_not_found",
             TerminalErrorCode::Unsupported => "unsupported",
             TerminalErrorCode::Internal => "internal",
@@ -340,8 +347,17 @@ pub(crate) struct SessionPolicy {
 }
 
 impl SessionPolicy {
-    pub(crate) fn new(mode: TerminalMode, scope: TokenScope) -> Self {
-        Self { mode, scope }
+    /// The policy for `mode` held by `scope`, or `None` when that scope cannot
+    /// open that mode at all.
+    ///
+    /// The `(Control, Read)` row is unconstructible on purpose: a read
+    /// credential must not end up holding a control session whose only
+    /// remaining defence is [`Self::admit`] getting every arm right. The
+    /// session refuses at construction, and `admit` re-checks anyway.
+    pub(crate) fn new(mode: TerminalMode, scope: TokenScope) -> Option<Self> {
+        scope
+            .allows(mode.required_scope())
+            .then_some(Self { mode, scope })
     }
 
     /// Whether this session may forward `message` to the host.
@@ -490,20 +506,74 @@ pub(crate) fn terminal_closed(reason: Option<&str>) -> String {
 pub(crate) enum TerminalClose {
     /// The host could not resolve the pane this session named.
     PaneNotFound(String),
-    /// An ordinary end: the pane exited, the server stopped, a takeover.
+    /// The pane's single attach slot is held by somebody else, and this
+    /// session did not ask to take it. Retryable with `takeover: true`.
+    Busy(String),
+    /// Another control session took this pane over. Not an error: the client
+    /// asked for nothing wrong, it simply no longer owns the pane.
+    TakenOver,
+    /// An ordinary end: the pane exited, the server stopped.
     Closed(Option<String>),
 }
 
+/// The exact `terminal.closed` reason a takeover produces.
+///
+/// A stable token rather than the server's sentence, because a client
+/// switches on it to show "somebody else took this terminal".
+pub(crate) const CLOSED_TAKEN_OVER: &str = "taken_over";
+/// The `terminal.closed` reason a client's own `terminal.release` produces.
+pub(crate) const CLOSED_RELEASED: &str = "released";
+
+/// The server wordings this stream classifies, anchored rather than searched
+/// for.
+///
+/// Every reason that carries a *client-named* target interpolates it in the
+/// middle and always ends with fixed text — `terminal session observe failed:
+/// terminal target {target} not found`. Matching a prefix and a suffix is
+/// therefore what keeps a pane literally named `terminal attach taken over`
+/// (a pane id may contain spaces; only `/` and control characters are refused)
+/// from turning its own "not found" into somebody else's takeover, or into a
+/// retryable `busy` the client would then retry forever.
+const ATTACH_FAILED_PREFIX: &str = "terminal attach failed: ";
+const SESSION_FAILED_PREFIX: &str = "terminal session ";
+/// `headless.rs:1843`, the whole reason: sent to the *evicted* owner when
+/// another client attaches with `takeover: true`. It interpolates nothing, so
+/// it is matched whole.
+const TAKEN_OVER_REASON: &str = "terminal attach taken over";
+/// `headless.rs:1832`, sent to the *new* client, which the server then
+/// disconnects.
+const ATTACHED_CLIENT_SUFFIX: &str = "already has an attached client; retry with --takeover";
+/// `headless.rs:1818`: an alt-screen read holds the pane for a moment. The
+/// server itself says "retry", so it is the same answer as a taken slot.
+const READ_IN_PROGRESS_SUFFIX: &str = "has a read in progress; retry";
+/// The tail of both "not found" wordings (`headless.rs:1354` and `:1801`).
+const NOT_FOUND_SUFFIX: &str = " not found";
+
 pub(crate) fn classify_shutdown_reason(reason: Option<&str>) -> TerminalClose {
-    match reason {
-        // `headless.rs`: "terminal session observe failed: terminal target
-        // <target> not found". Matched on both halves so an unrelated reason
-        // containing "not found" is still an ordinary close.
-        Some(text) if text.contains("terminal target") && text.contains("not found") => {
-            TerminalClose::PaneNotFound(text.to_string())
-        }
-        other => TerminalClose::Closed(other.map(str::to_string)),
+    let Some(text) = reason else {
+        return TerminalClose::Closed(None);
+    };
+    if text == TAKEN_OVER_REASON {
+        return TerminalClose::TakenOver;
     }
+    if text.starts_with(ATTACH_FAILED_PREFIX) {
+        if text.ends_with(ATTACHED_CLIENT_SUFFIX) || text.ends_with(READ_IN_PROGRESS_SUFFIX) {
+            return TerminalClose::Busy(text.to_string());
+        }
+        if text.ends_with(NOT_FOUND_SUFFIX) {
+            return TerminalClose::PaneNotFound(text.to_string());
+        }
+    }
+    // The observe/control target the client itself named. `terminal target` is
+    // still required so the other `terminal session ... failed:` wording (a
+    // connection that is not pending) stays an ordinary close.
+    if text.starts_with(SESSION_FAILED_PREFIX)
+        && text.contains("terminal target")
+        && text.ends_with(NOT_FOUND_SUFFIX)
+    {
+        return TerminalClose::PaneNotFound(text.to_string());
+    }
+    TerminalClose::Closed(Some(text.to_string()))
 }
 
 /// One JSON object on one line, with no newline in it.
@@ -749,13 +819,24 @@ mod terminal_tests {
         ];
 
         for (mode, scope, message, expected) in cases {
-            let policy = SessionPolicy::new(mode, scope);
+            let policy = SessionPolicy { mode, scope };
             assert_eq!(
                 policy.admit(&message).err(),
                 expected,
                 "mode {mode:?} scope {scope:?} message {message:?}"
             );
         }
+    }
+
+    /// The one row the type system removes. A read credential cannot hold a
+    /// control session at all, so [`SessionPolicy::admit`] is never the last
+    /// line of defence between a read token and a byte on somebody's PTY.
+    #[test]
+    fn a_read_credential_cannot_construct_a_control_policy() {
+        assert!(SessionPolicy::new(TerminalMode::Control, TokenScope::Read).is_none());
+        assert!(SessionPolicy::new(TerminalMode::Control, TokenScope::Control).is_some());
+        assert!(SessionPolicy::new(TerminalMode::Observe, TokenScope::Read).is_some());
+        assert!(SessionPolicy::new(TerminalMode::Observe, TokenScope::Control).is_some());
     }
 
     #[test]
@@ -765,6 +846,7 @@ mod terminal_tests {
             TerminalErrorCode::Forbidden,
             TerminalErrorCode::HostUnavailable,
             TerminalErrorCode::HostBusy,
+            TerminalErrorCode::Busy,
             TerminalErrorCode::PaneNotFound,
             TerminalErrorCode::Unsupported,
             TerminalErrorCode::Internal,
@@ -834,13 +916,73 @@ mod terminal_message_tests {
         );
     }
 
+    /// The control-mode wordings, verbatim from `headless.rs`. A drift here
+    /// silently turns "somebody else has this pane" into a bare close.
+    #[test]
+    fn the_attach_slot_wordings_are_classified_by_name() {
+        let busy = "terminal attach failed: terminal t1 already has an attached client; retry with --takeover";
+        assert_eq!(
+            classify_shutdown_reason(Some(busy)),
+            TerminalClose::Busy(busy.to_string())
+        );
+        let reading = "terminal attach failed: terminal t1 has a read in progress; retry";
+        assert_eq!(
+            classify_shutdown_reason(Some(reading)),
+            TerminalClose::Busy(reading.to_string())
+        );
+        assert_eq!(
+            classify_shutdown_reason(Some("terminal attach taken over")),
+            TerminalClose::TakenOver
+        );
+        let missing = "terminal attach failed: terminal t9 not found";
+        assert_eq!(
+            classify_shutdown_reason(Some(missing)),
+            TerminalClose::PaneNotFound(missing.to_string())
+        );
+        let control_target = "terminal session control failed: terminal target w9:p9 not found";
+        assert_eq!(
+            classify_shutdown_reason(Some(control_target)),
+            TerminalClose::PaneNotFound(control_target.to_string())
+        );
+    }
+
+    /// A pane id may contain spaces, so a client can name a pane after the
+    /// server's own wordings. The reason it gets back still says what actually
+    /// happened: the pane it asked for does not exist.
+    #[test]
+    fn a_pane_named_after_a_server_wording_cannot_steer_the_classification() {
+        for pane in [
+            "terminal attach taken over",
+            "already has an attached client; retry with --takeover",
+            "has a read in progress; retry",
+        ] {
+            for reason in [
+                format!("terminal session control failed: terminal target {pane} not found"),
+                format!("terminal session observe failed: terminal target {pane} not found"),
+                format!("terminal attach failed: terminal {pane} not found"),
+            ] {
+                assert_eq!(
+                    classify_shutdown_reason(Some(&reason)),
+                    TerminalClose::PaneNotFound(reason.clone()),
+                    "a crafted pane id steered the classification: {reason}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_other_shutdown_is_an_ordinary_close() {
         for reason in [
             Some("server is shutting down"),
-            Some("terminal attach failed: terminal t1 already has an attached client; retry with --takeover"),
+            Some("detached"),
             // "not found" alone is not enough: only the target wording counts.
             Some("workspace not found"),
+            // The takeover reason is matched whole, so a sentence that merely
+            // mentions it is still an ordinary close.
+            Some("the operator said terminal attach taken over"),
+            // The other `terminal session ... failed:` wording, which names no
+            // pane and is not retryable.
+            Some("terminal session control failed: connection is not pending terminal session"),
             None,
         ] {
             assert_eq!(

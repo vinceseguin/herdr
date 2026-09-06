@@ -780,27 +780,9 @@ fn terminal_observe_streams_marker_pane_frames() {
         "an observer typed into the pane: {pane_text}"
     );
 
-    // A control mode is refused too: this build serves observers only, and the
-    // refusal is `unsupported`, not a silent downgrade to observe.
-    let control = gateway.ws_with(
-        &format!("/api/terminal/lab-2/{LAB_PANE}"),
-        &[("Authorization", &gateway.control_authorization())],
-        &[
-            "--send",
-            r#"{"type":"terminal.open","mode":"control","cols":80,"rows":24}"#,
-            "--max-messages",
-            "1",
-            "--timeout",
-            "30",
-        ],
-    );
-    let lines = support::gateway::ws_lines(&control);
-    let answer = support::gateway::ws_text_json(&lines[0]);
-    assert_eq!(answer["type"].as_str(), Some("terminal.error"), "{lines:?}");
-    assert_eq!(answer["code"].as_str(), Some("unsupported"), "{lines:?}");
-
-    // And a `read` credential asking for control is told it lacks the scope,
-    // before the build's own limitation is ever consulted.
+    // A `read` credential asking for control is told it lacks the scope, before
+    // a host is ever touched. What a *control* credential may do in that mode
+    // is the PR 7 section below.
     let unscoped = gateway.ws(
         &format!("/api/terminal/lab-2/{LAB_PANE}"),
         &[
@@ -973,4 +955,245 @@ fn terminal_open_on_a_stopped_host_fails_without_touching_the_gateway() {
 
     assert_eq!(gateway.http_get("/health", &[]).status, 200);
     assert_eq!(gateway.stop(), Some(0));
+}
+
+// ---- terminal control (PR 7) ----
+
+/// `terminal.open` for a control session at the lab's standard geometry.
+const OPEN_CONTROL: &str = r#"{"type":"terminal.open","mode":"control","cols":80,"rows":24}"#;
+/// The same, taking the pane from whoever holds it.
+const OPEN_CONTROL_TAKEOVER: &str =
+    r#"{"type":"terminal.open","mode":"control","cols":80,"rows":24,"takeover":true}"#;
+
+/// The JSON of every `text` line in a `ws-client.py` run.
+fn ws_texts(output: &std::process::Output) -> Vec<serde_json::Value> {
+    support::gateway::ws_lines(output)
+        .iter()
+        .filter(|line| line.starts_with("text "))
+        .map(|line| support::gateway::ws_text_json(line))
+        .collect()
+}
+
+/// Whether a pane's recent text contains `needle`, polled: a keystroke takes a
+/// moment to be echoed by the tty and rendered by the host.
+fn wait_for_pane_text(lab: &Lab, session: &str, pane: &str, needle: &str) -> String {
+    let mut text = String::new();
+    let found = support::wait_until(
+        std::time::Duration::from_secs(20),
+        std::time::Duration::from_millis(200),
+        || {
+            text = stdout_of(&lab.herdr(session, &["pane", "read", pane, "--source", "recent"]));
+            text.contains(needle)
+        },
+    );
+    assert!(found, "{session}/{pane} never showed {needle:?}: {text}");
+    text
+}
+
+/// The whole write path against real servers: a `control` token opens lab-1's
+/// marker pane, types, releases — and exactly one machine's pane changed.
+#[test]
+fn terminal_control_types_into_the_right_pane() {
+    let mut lab = Lab::new("gw-term-ctl");
+    let up = lab.up("2");
+    assert!(
+        up.status.success(),
+        "up 2 failed: {}{}",
+        stdout_of(&up),
+        stderr_of(&up)
+    );
+    let mut gateway = Gateway::spawn(&lab, "");
+    wait_for_connected_hosts(&gateway, 2);
+
+    let typed = gateway.ws_with(
+        &format!("/api/terminal/lab-1/{LAB_PANE}"),
+        &[("Authorization", &gateway.control_authorization())],
+        &[
+            "--send",
+            OPEN_CONTROL,
+            "--send",
+            r#"{"type":"terminal.input","text":"echo E3-CONTROL-lab-1\n"}"#,
+            "--send",
+            r#"{"type":"terminal.release"}"#,
+            "--max-messages",
+            "8",
+            "--timeout",
+            "30",
+            "--binary",
+            "len",
+        ],
+    );
+    let lines = support::gateway::ws_lines(&typed);
+    assert_eq!(typed.status.code(), Some(0), "{lines:?}");
+    let ready = support::gateway::ws_text_json(&lines[0]);
+    assert_eq!(ready["type"].as_str(), Some("terminal.ready"), "{lines:?}");
+    assert_eq!(ready["mode"].as_str(), Some("control"), "{lines:?}");
+    assert_eq!(ready["ref"].as_str(), Some("lab-1/w1:p1"), "{lines:?}");
+    // A release is the client's own doing and says so, rather than arriving as
+    // the host's "detached".
+    let closed = ws_texts(&typed)
+        .into_iter()
+        .find(|value| value["type"].as_str() == Some("terminal.closed"))
+        .unwrap_or_else(|| panic!("no terminal.closed in {lines:?}"));
+    assert_eq!(closed["reason"].as_str(), Some("released"), "{lines:?}");
+
+    // The bytes reached lab-1's pty — and only lab-1's.
+    wait_for_pane_text(&lab, "lab-1", LAB_PANE, "E3-CONTROL-lab-1");
+    let other = stdout_of(&lab.herdr("lab-2", &["pane", "read", LAB_PANE, "--source", "recent"]));
+    assert!(
+        !other.contains("E3-CONTROL"),
+        "input reached lab-2 as well: {other}"
+    );
+
+    assert_eq!(gateway.stop(), Some(0));
+}
+
+/// The scope gate, where it actually has to hold: inside the session, not at
+/// the route. A read credential cannot open a control session, and the pane it
+/// asked for is untouched.
+#[test]
+fn terminal_control_is_refused_for_the_read_scope() {
+    let mut lab = Lab::new("gw-term-scope");
+    let up = lab.up("1");
+    assert!(
+        up.status.success(),
+        "up 1 failed: {}{}",
+        stdout_of(&up),
+        stderr_of(&up)
+    );
+    let gateway = Gateway::spawn(&lab, "");
+    wait_for_connected_hosts(&gateway, 1);
+
+    // The read token reaches the route (it is authenticated) and is refused by
+    // the session, with the scope named and a policy close.
+    let refused = gateway.ws(
+        &format!("/api/terminal/lab-1/{LAB_PANE}"),
+        &[
+            "--send",
+            OPEN_CONTROL,
+            "--send",
+            r#"{"type":"terminal.input","text":"echo E3-READ-SCOPE\n"}"#,
+            "--max-messages",
+            "3",
+            "--timeout",
+            "30",
+        ],
+    );
+    let lines = support::gateway::ws_lines(&refused);
+    let answer = support::gateway::ws_text_json(&lines[0]);
+    assert_eq!(answer["type"].as_str(), Some("terminal.error"), "{lines:?}");
+    assert_eq!(answer["code"].as_str(), Some("forbidden"), "{lines:?}");
+    assert!(
+        lines.iter().any(|line| line == "close 1008"),
+        "a refused control open must close with a policy code: {lines:?}"
+    );
+    // Nothing after the refusal was forwarded either: the session is over.
+    assert!(
+        !lines.iter().any(|line| line.starts_with("binary ")),
+        "a refused session streamed frames: {lines:?}"
+    );
+
+    // Give the host a moment to be wrong, then prove it was not.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let pane = stdout_of(&lab.herdr("lab-1", &["pane", "read", LAB_PANE, "--source", "recent"]));
+    assert!(
+        !pane.contains("E3-READ-SCOPE"),
+        "a read credential typed into the pane: {pane}"
+    );
+}
+
+/// One pane, two controllers. The second is told `busy` rather than silently
+/// sharing the keyboard; with `takeover` it wins and the first is told so.
+#[test]
+fn terminal_control_second_owner_needs_takeover() {
+    use std::io::{BufRead, BufReader, Read};
+
+    let mut lab = Lab::new("gw-term-take");
+    let up = lab.up("1");
+    assert!(
+        up.status.success(),
+        "up 1 failed: {}{}",
+        stdout_of(&up),
+        stderr_of(&up)
+    );
+    let gateway = Gateway::spawn(&lab, "");
+    wait_for_connected_hosts(&gateway, 1);
+    let path = format!("/api/terminal/lab-1/{LAB_PANE}");
+    let control = gateway.control_authorization();
+
+    // The first controller holds the pane until somebody takes it. Reading its
+    // `terminal.ready` is what makes this deterministic: the gateway only sends
+    // it once the host has confirmed the attach.
+    let mut first = gateway.ws_spawn(
+        &path,
+        &[("Authorization", &control)],
+        &["--send", OPEN_CONTROL, "--timeout", "60", "--binary", "len"],
+    );
+    let mut first_out = BufReader::new(first.stdout.take().expect("piped stdout"));
+    let mut ready_line = String::new();
+    first_out
+        .read_line(&mut ready_line)
+        .expect("read the first controller's ready line");
+    let ready = support::gateway::ws_text_json(ready_line.trim_end());
+    assert_eq!(ready["type"].as_str(), Some("terminal.ready"), "{ready}");
+    assert_eq!(ready["mode"].as_str(), Some("control"), "{ready}");
+
+    // A second controller without `takeover` is refused by name, and the first
+    // one keeps the pane.
+    let busy = gateway.ws_with(
+        &path,
+        &[("Authorization", &control)],
+        &[
+            "--send",
+            OPEN_CONTROL,
+            "--max-messages",
+            "1",
+            "--timeout",
+            "30",
+        ],
+    );
+    let lines = support::gateway::ws_lines(&busy);
+    let answer = support::gateway::ws_text_json(&lines[0]);
+    assert_eq!(answer["type"].as_str(), Some("terminal.error"), "{lines:?}");
+    assert_eq!(answer["code"].as_str(), Some("busy"), "{lines:?}");
+
+    // With `takeover` it wins: it is ready, and it gets the host's redraw.
+    let taken = gateway.ws_with(
+        &path,
+        &[("Authorization", &control)],
+        &[
+            "--send",
+            OPEN_CONTROL_TAKEOVER,
+            "--max-messages",
+            "2",
+            "--timeout",
+            "30",
+            "--binary",
+            "len",
+        ],
+    );
+    let lines = support::gateway::ws_lines(&taken);
+    let ready = support::gateway::ws_text_json(&lines[0]);
+    assert_eq!(ready["type"].as_str(), Some("terminal.ready"), "{lines:?}");
+    assert_eq!(ready["mode"].as_str(), Some("control"), "{lines:?}");
+    assert!(
+        lines.iter().any(|line| line.starts_with("binary ")),
+        "the new owner never got a redraw: {lines:?}"
+    );
+
+    // And the evicted controller is told why, by a stable token rather than the
+    // host's sentence.
+    let mut rest = String::new();
+    first_out
+        .read_to_string(&mut rest)
+        .expect("read the evicted controller's remaining output");
+    let closed = rest
+        .lines()
+        .filter(|line| line.starts_with("text "))
+        .map(support::gateway::ws_text_json)
+        .find(|value| value["type"].as_str() == Some("terminal.closed"))
+        .unwrap_or_else(|| panic!("the evicted controller was never told: {rest}"));
+    assert_eq!(closed["reason"].as_str(), Some("taken_over"), "{rest}");
+    let _ = first.kill();
+    let _ = first.wait();
 }
