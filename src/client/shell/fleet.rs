@@ -268,6 +268,8 @@ impl ClientShellState {
         switching_to: Option<HostId>,
     ) {
         self.fleet = Some(FleetShellState::new(model, active, switching_to));
+        // A picker that is open is showing rows from the previous model.
+        self.refresh_host_picker_rows();
     }
 
     /// Whether the shell is already showing exactly this fleet view.
@@ -285,8 +287,9 @@ impl ClientShellState {
             fleet.active == *active
                 && fleet.switching_to.as_ref() == switching_to
                 // `generation` changes on every rebuild, so the rows — not the
-                // counter — decide whether anything is different.
-                && fleet.model.groups == model.groups
+                // counter — decide whether anything is different. Picker rows
+                // count: one can move (a host's version) while no group does.
+                && fleet.model.same_rows(model)
         })
     }
 
@@ -436,7 +439,7 @@ impl ClientShellState {
     /// `FleetState::set_active_host` refuses it, and the active host is
     /// already the routing target — clicking either must not emit an action
     /// that the loop would only log and drop.
-    fn switch_action(
+    pub(super) fn switch_action(
         &self,
         host: HostId,
         then_focus: Option<FleetFocusTarget>,

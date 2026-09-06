@@ -598,6 +598,44 @@ impl ClientShellState {
         if self.route_worktree_overlay_key(key, outcome) {
             return;
         }
+        // Fork (E2 PR 6): the Fleet console's host picker. Placed before the
+        // navigator's branch for the same reason it is written like it — one
+        // list, one selection, `enter` to act and `esc` to leave.
+        if matches!(self.overlay, Some(ClientShellOverlay::HostPicker(_))) {
+            let (code, modifiers) = crate::config::normalize_key_combo((key.code, key.modifiers));
+            match code {
+                KeyCode::Esc => {
+                    self.overlay = None;
+                    outcome.repaint = true;
+                }
+                KeyCode::Enter => self.accept_host_picker(outcome),
+                KeyCode::Down | KeyCode::Char('j') if modifiers.is_empty() => {
+                    self.move_host_picker_selection(1);
+                    outcome.repaint = true;
+                }
+                KeyCode::Up | KeyCode::Char('k') if modifiers.is_empty() => {
+                    self.move_host_picker_selection(-1);
+                    outcome.repaint = true;
+                }
+                KeyCode::Home if modifiers.is_empty() => {
+                    self.move_host_picker_selection(isize::MIN);
+                    outcome.repaint = true;
+                }
+                KeyCode::End if modifiers.is_empty() => {
+                    self.move_host_picker_selection(isize::MAX);
+                    outcome.repaint = true;
+                }
+                // A digit selects the n-th host but does not switch: the
+                // choice is confirmed with `enter`, so a mistyped digit costs
+                // nothing.
+                KeyCode::Char(digit @ '1'..='9') if modifiers.is_empty() => {
+                    let index = usize::from(digit as u8 - b'1');
+                    outcome.repaint |= self.select_host_picker_row(index);
+                }
+                _ => {}
+            }
+            return;
+        }
         if matches!(self.overlay, Some(ClientShellOverlay::Navigator(_))) {
             let (code, modifiers) = crate::config::normalize_key_combo((key.code, key.modifiers));
             let search_focused = matches!(
