@@ -2251,6 +2251,12 @@ rotate lines, the `ls -l` modes. Never paste the URL or the cookie.
 >   `src/config.rs` re-exports `validate_fleet_host_target` next to
 >   `validate_fleet_host_name` (PR 2 owns that file otherwise; this is an
 >   additive `pub(crate) use` item, no behaviour).
+> - **Where machine diagnostics surface.** `FleetConfig::diagnostics()` still
+>   never touches the filesystem, so `herdr config check`, the TUI banner and
+>   `server reload-config` do **not** report saved-machine problems; only a
+>   fleet resolution does (`herdr fleet status` stderr + exit 1, and
+>   `FleetRuntime::start`, i.e. `herdr gateway` startup). **PR 10** should say
+>   so in `gateway.md` rather than implying `config check` covers it.
 > - `src/fleet/machines.rs` is in `PURE_MODULES`;
 >   `src/fleet/hosts_source.rs` is the one fleet module that names
 >   `crate::client` (`EndpointCatalog::load_profiles`, five
