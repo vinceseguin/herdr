@@ -17,7 +17,13 @@
 //!   pane id from the old machine cannot be replayed against the new one.
 //!
 //! E2 PR 5. PR 6 adds the picker overlay on top of the same action, PR 7 the
-//! notification target, PR 8 the reconnect notice.
+//! notification target. PR 8 turns the pane-area notice into the console's
+//! answer to "the machine I am pointed at is not there": it names the host,
+//! its connection state and the reason, and — because the notice is exactly
+//! the state in which there is no pane to type into — it is also the gate that
+//! *drops* pane-bound input. Dropped, never queued: a keystroke held while a
+//! host reconnects would be replayed into a shell that has moved on, or into a
+//! pane id the reconnected server no longer has.
 
 use ratatui::{
     buffer::Buffer,
@@ -27,7 +33,7 @@ use ratatui::{
 
 use crate::fleet::hosts::HostId;
 use crate::fleet::refs::{FleetPaneRef, FleetWorkspaceRef};
-use crate::fleet::sidebar::FleetSidebarModel;
+use crate::fleet::sidebar::{FleetSidebarModel, HostRowState};
 use crate::protocol::{ClientShellSnapshot, FrameData, PaneSurfaceFrame};
 
 use super::{
@@ -48,6 +54,18 @@ pub(crate) enum FleetSidebarHit {
     Workspace(FleetWorkspaceRef),
     /// Another host's agent row: switch, then focus it there.
     Agent(FleetPaneRef),
+}
+
+impl FleetSidebarHit {
+    /// The host this row belongs to. Every variant carries one: that is the
+    /// type's whole reason to exist.
+    pub(super) fn host(&self) -> &HostId {
+        match self {
+            Self::HostHeader(host) | Self::HostCollapse(host) => host,
+            Self::Workspace(workspace) => &workspace.host,
+            Self::Agent(pane) => &pane.host,
+        }
+    }
 }
 
 /// What the shell asks the client loop to do about the fleet.
@@ -94,8 +112,13 @@ pub(super) struct FleetShellState {
     /// with the reason. Every other fleet row is exactly one line, so this is
     /// the only height the renderer would otherwise have to derive per frame.
     header_heights: Vec<u16>,
-    /// The one line the pane area shows while `switching_to` is set, built
-    /// when it changes rather than on every frame.
+    /// The one line the pane area shows instead of a surface, built when the
+    /// model or the switch marker changes rather than on every frame.
+    ///
+    /// `Some` is the console's "there is nothing to type into" state: a switch
+    /// waiting on its host, or an active host that is connecting, unavailable
+    /// or incompatible. [`FleetShellState::input_allowed`] reads exactly this,
+    /// so what the pane area says and where input may go can never disagree.
     pane_notice: Option<String>,
     /// What the shell composes against while the active host has no
     /// projection or no surface: an empty one.
@@ -163,9 +186,56 @@ impl FleetPlaceholder {
     }
 }
 
-/// The pane-area line for a switch still waiting on its host's first surface.
-fn pane_notice(switching_to: Option<&HostId>) -> Option<String> {
-    switching_to.map(|host| format!("switching to {host}…"))
+/// The pane-area line, or `None` when the active host can draw its own.
+///
+/// Precomputed on every model install and every switch-marker change, never
+/// on the compose path: this is multiplicative work's neighbour, and a frame
+/// must not format.
+///
+/// A switch is only reported as a switch while its host is actually connected.
+/// A host that is down says so instead — otherwise "switching to lab-2…" is
+/// what a console shows forever about a machine that is never coming back.
+fn pane_notice(
+    model: &FleetSidebarModel,
+    active: &HostId,
+    switching_to: Option<&HostId>,
+) -> Option<String> {
+    let switching = || switching_to.map(|host| format!("switching to {host}…"));
+    let Some(group) = model.group(active) else {
+        return switching();
+    };
+    // A host with rows has been connected at least once, so a retry is a
+    // *re*connect. The connector's attempt counter cannot answer this on its
+    // own: it counts from 1 for a host that has never been up, which is how
+    // a first connection used to read as "reconnecting (attempt 1)".
+    let connected_before = !group.workspaces.is_empty() || !group.agents.is_empty();
+    let reason = group.header.reason.as_deref().unwrap_or_default();
+    match group.header.state {
+        HostRowState::Connected => switching(),
+        HostRowState::Connecting { attempt } if attempt <= 1 && !connected_before => {
+            Some(notice_line(active, "connecting", reason))
+        }
+        HostRowState::Connecting { attempt } => Some(notice_line(
+            active,
+            &format!("reconnecting (attempt {attempt})"),
+            reason,
+        )),
+        HostRowState::Unavailable if connected_before => {
+            Some(notice_line(active, "reconnecting", reason))
+        }
+        HostRowState::Unavailable => Some(notice_line(active, "unavailable", reason)),
+        HostRowState::Incompatible => Some(notice_line(active, "incompatible", reason)),
+    }
+}
+
+/// `"lab-2 · reconnecting · host closed the connection"`, reason omitted when
+/// there is none.
+fn notice_line(host: &HostId, state: &str, reason: &str) -> String {
+    if reason.is_empty() {
+        format!("{host} · {state}")
+    } else {
+        format!("{host} · {state} · {reason}")
+    }
 }
 
 impl FleetShellState {
@@ -173,7 +243,7 @@ impl FleetShellState {
         Self {
             heights_generation: model.generation,
             header_heights: header_heights(&model),
-            pane_notice: pane_notice(switching_to.as_ref()),
+            pane_notice: pane_notice(&model, &active, switching_to.as_ref()),
             placeholder: Box::new(FleetPlaceholder::new()),
             model,
             active,
@@ -202,6 +272,47 @@ impl FleetShellState {
         self.switching_to.as_ref() == Some(host)
     }
 
+    /// What the pane area says instead of showing the active host, if
+    /// anything.
+    ///
+    /// A borrow, not a built `String`: this is read on the compose path.
+    pub(super) fn pane_area_notice(&self) -> Option<&str> {
+        self.pane_notice.as_deref()
+    }
+
+    /// Whether pane-bound input may leave the console right now.
+    ///
+    /// The same fact as [`FleetShellState::pane_area_notice`], deliberately:
+    /// what the pane area is showing *is* whether there is a pane to type
+    /// into. Input produced while this is false is dropped, never buffered —
+    /// a keystroke replayed after a reconnect would reach a shell that has
+    /// moved on, and one replayed after a switch would reach another machine.
+    pub(super) fn input_allowed(&self) -> bool {
+        self.pane_notice.is_none()
+    }
+
+    /// Index of the active host's first workspace row in the console's
+    /// spaces list.
+    ///
+    /// A console's spaces section is host headers plus every expanded group's
+    /// rows, so an index into the *active host's* `workspace_entries` — which
+    /// is what upstream's reveal and drag arithmetic produces — is that many
+    /// rows short. Mirrors `render_fleet_spaces`'s item order exactly.
+    pub(super) fn active_spaces_offset(&self) -> usize {
+        let mut offset = 0;
+        for group in &self.model.groups {
+            // The header of this group.
+            offset += 1;
+            if group.header.host == self.active {
+                return offset;
+            }
+            if !group.header.collapsed {
+                offset += group.workspaces.len();
+            }
+        }
+        offset
+    }
+
     /// What to compose when the active host has no projection or no surface.
     ///
     /// The real projection is preferred when there is one: the sidebar then
@@ -216,11 +327,10 @@ impl FleetShellState {
         )
     }
 
-    /// Draw the pane-area notice, if a switch is waiting on its host.
+    /// Draw the pane-area notice, if there is one.
     ///
     /// Only ever called for a frame composed against the placeholder surface,
-    /// so it cannot paint over a real pane. PR 8 adds the active host's
-    /// reconnect notice on the same line.
+    /// so it cannot paint over a real pane.
     pub(super) fn render_pane_notice(
         &self,
         buffer: &mut Buffer,
@@ -298,6 +408,85 @@ impl ClientShellState {
         self.snapshot.is_some()
     }
 
+    /// Whether pane-bound input may leave this client right now.
+    ///
+    /// Always true for the single-host client, which has exactly one server
+    /// and no notice to draw.
+    pub(super) fn fleet_input_allowed(&self) -> bool {
+        self.fleet
+            .as_ref()
+            .is_none_or(FleetShellState::input_allowed)
+    }
+
+    /// Throw away everything an input batch addressed at a pane.
+    ///
+    /// The console is showing a notice, not a pane: there is nothing on the
+    /// other end to receive this. `FleetLink::send` would drop it a moment
+    /// later anyway — this makes the drop the shell's own decision, so it
+    /// happens once, before the message is built into the write path, and can
+    /// never turn into a queue. Everything else the batch produced (a focus
+    /// report, a theme update, a host switch, an overlay action) still goes.
+    ///
+    /// Two pieces of shell state are the queue in disguise, and go with the
+    /// messages: keys parked behind a copy operation (`handle_key` holds them
+    /// while a copy-mode read is in flight and replays them when it settles,
+    /// which can be after the host is back), and a pane mouse gesture (its
+    /// button-up is synthesized on the next focus loss, to whichever host is
+    /// connected by then). Leases are left alone: they only ever produce a
+    /// release for a key the host may have seen the press of, and a release
+    /// to a shell that has moved on is harmless where a replayed keystroke is
+    /// not.
+    ///
+    /// Returns whether anything was dropped, so the caller repaints and the
+    /// user sees the notice answer the keystroke.
+    pub(super) fn drop_pane_bound_input(&mut self, outcome: &mut ClientShellInput) -> bool {
+        let before = outcome.requests.len();
+        outcome.requests.retain(|request| {
+            !matches!(
+                request,
+                crate::protocol::ClientMessage::ClientShellPaneInput { .. }
+                    | crate::protocol::ClientMessage::ClientShellPopupInput { .. }
+            )
+        });
+        self.copy_input_queue.clear();
+        self.pane_mouse_gesture = None;
+        let dropped = outcome.requests.len() != before;
+        if dropped {
+            tracing::debug!(
+                host = %self.fleet.as_ref().map(|fleet| fleet.active.to_string()).unwrap_or_default(),
+                dropped = before - outcome.requests.len(),
+                "dropping pane input for a fleet host the console cannot show"
+            );
+        }
+        dropped
+    }
+
+    /// Rows before the active host's own workspace rows, in a console.
+    ///
+    /// Zero for the single-host client, whose spaces list is its workspaces.
+    pub(super) fn fleet_active_spaces_offset(&self) -> usize {
+        self.fleet
+            .as_ref()
+            .map_or(0, FleetShellState::active_spaces_offset)
+    }
+
+    /// Whether this screen row belongs to a host other than the active one
+    /// (its header, or one of its workspace or agent rows).
+    ///
+    /// The active host's *own* header is deliberately not excluded: the slot
+    /// before its first workspace is the line above that workspace, which in
+    /// a console is that header — exactly as the single-host client's slot
+    /// before its first workspace is the section title line.
+    pub(super) fn is_other_host_row(&self, row: u16) -> bool {
+        let Some(fleet) = self.fleet.as_ref() else {
+            return false;
+        };
+        self.hits
+            .fleet_rows
+            .iter()
+            .any(|(rect, hit)| row >= rect.y && row < rect.bottom() && !fleet.is_active(hit.host()))
+    }
+
     /// Update the "switching to this host" marker in place.
     ///
     /// Returns whether anything changed. In place, and not through
@@ -310,7 +499,7 @@ impl ClientShellState {
         if fleet.switching_to == switching_to {
             return false;
         }
-        fleet.pane_notice = pane_notice(switching_to.as_ref());
+        fleet.pane_notice = pane_notice(&fleet.model, &fleet.active, switching_to.as_ref());
         fleet.switching_to = switching_to;
         true
     }

@@ -26,6 +26,9 @@ const ROWS: u16 = 40;
 const RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(20);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The connector backs off between attempts, so a host that comes back is not
+/// picked up instantly.
+const RECONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[test]
 fn fleet_console_shows_the_active_host_and_routes_input_to_it() {
@@ -281,6 +284,107 @@ fn host_picker_switches_hosts_from_the_keyboard() {
         "prefix+q did not end the console:\n{}",
         console.screen_text()
     );
+}
+
+/// The console when the machine it is showing goes away under it.
+///
+/// Three things have to be true at once, and only a real server can prove
+/// them: the pane area stops showing lab-1's frame and says why, lab-2 is
+/// untouched, and what is typed at the notice reaches no machine at all. Then
+/// lab-1 comes back on the same socket and the console picks it up again —
+/// never having exited, which is the whole difference between a fleet console
+/// and the single-host client.
+#[test]
+fn active_host_drop_shows_reconnect_and_recovers() {
+    let mut lab = Lab::new("tui-drop");
+    let up = lab.up("2");
+    assert!(
+        up.status.success(),
+        "fleet-lab up 2 failed: {}{}",
+        stdout_of(&up),
+        stderr_of(&up)
+    );
+    for session in ["lab-1", "lab-2"] {
+        support::wait_for_socket(&lab_client_socket(&lab, session), SOCKET_TIMEOUT);
+    }
+    let pane_2 = lab_pane_id(&lab, 2);
+    append_lab_config(&lab, &lab_fleet_config(2));
+
+    let mut console = FleetConsole::spawn(&lab, COLS, ROWS);
+    assert_screen(
+        &console,
+        "herdr-fleet-lab:lab-1",
+        RENDER_TIMEOUT,
+        "the active host's pane never rendered",
+    );
+
+    // The machine the console is pointed at goes away.
+    let stop = lab.herdr("lab-1", &["server", "stop"]);
+    assert!(
+        stop.status.success(),
+        "stopping lab-1: {}{}",
+        stdout_of(&stop),
+        stderr_of(&stop)
+    );
+
+    assert_screen(
+        &console,
+        "reconnecting",
+        RENDER_TIMEOUT,
+        "the pane area never said the active host was gone",
+    );
+    console.redraw();
+    let screen = console.screen_text();
+    assert!(
+        screen.contains("lab-1 · reconnecting"),
+        "the notice names the host it is waiting for:\n{screen}"
+    );
+    assert!(
+        !screen.contains("herdr-fleet-lab:lab-1"),
+        "lab-1's last frame is still on screen after it went away:\n{screen}"
+    );
+    // Host failure is host-local: lab-2 is still listed, connected, with its
+    // own rows.
+    assert!(
+        screen.contains("▾ lab-2") && screen.contains("· lab-2"),
+        "the other host's group went with it:\n{screen}"
+    );
+
+    // Typed at the notice, this must reach no machine — not lab-2, and not
+    // lab-1 when it comes back.
+    console.send(b"never-lands\r");
+    assert!(
+        !pane_text(&lab, "lab-2", &pane_2).contains("never-lands"),
+        "input meant for a host that is down reached another machine:\n{}",
+        pane_text(&lab, "lab-2", &pane_2)
+    );
+
+    // lab-1 comes back on the same socket.
+    let mut restarted = lab.spawn_server("lab-1");
+    support::wait_for_socket(&lab_client_socket(&lab, "lab-1"), SOCKET_TIMEOUT);
+    assert!(
+        support::wait_until(RECONNECT_TIMEOUT, Duration::from_secs(2), || {
+            console.redraw();
+            let screen = console.screen_text();
+            screen.contains("▾ lab-1") && !screen.contains("reconnecting")
+        }),
+        "the console never picked the host back up:\n{}",
+        console.screen_text()
+    );
+    assert!(
+        !console.screen_text().contains("never-lands"),
+        "what was typed while the host was down was queued, not dropped:\n{}",
+        console.screen_text()
+    );
+
+    assert!(
+        console.detach(EXIT_TIMEOUT),
+        "prefix+q did not end the console:\n{}",
+        console.screen_text()
+    );
+    let _ = lab.herdr("lab-1", &["server", "stop"]);
+    let _ = restarted.kill();
+    let _ = restarted.wait();
 }
 
 #[test]
