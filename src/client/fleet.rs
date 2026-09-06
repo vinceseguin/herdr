@@ -19,7 +19,7 @@ use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::fleet::connector::{ActiveGeometry, FleetConnector, FleetConnectorOptions, FleetEvent};
@@ -498,7 +498,10 @@ fn retarget_host(
     // An answer from the old host is dropped by `translate`, so a request in
     // flight would hold the single endpoint lane until its 60 s timeout.
     endpoint_commands.reset();
-    debug!(from = %previous, to = %host, "the fleet console switched host");
+    // Same event as the launch line, with the machine it moved off: a refused
+    // switch never reaches here (it warns instead), so this is only ever a
+    // change that actually happened.
+    info!(host = %host, from = %previous, "fleet console active host");
     changes
 }
 
@@ -786,6 +789,11 @@ fn console_link(
         return Err(io::Error::other("no fleet host could be activated"));
     };
     state.set_active_host(Some(active.clone()));
+    // The console's first routing decision, at the level an operator reading
+    // the log gets by default: every later change is logged the same way, so
+    // "which machine was this console driving?" is answerable from the log
+    // alone.
+    info!(host = %active, "fleet console active host");
 
     let connector = Rc::new(connector);
     let link = ClientLink {
@@ -1556,6 +1564,7 @@ mod console_config_tests {
 mod console_tests {
     use super::*;
 
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use crate::config::Config;
@@ -1565,6 +1574,53 @@ mod console_tests {
     };
     use crate::fleet::connector::INACTIVE_SURFACE;
     use crate::protocol::{ClientMessage, ClientPaneInputEvent};
+
+    /// Collects the log lines this thread emits, so a test can assert the
+    /// console said which machine it is driving.
+    ///
+    /// Thread-local (`set_default`), so the hosts' own supervisor threads
+    /// never write into it — only the console's own routing decisions do.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+
+        fn text(&self) -> String {
+            let buffer = self.0.lock().expect("captured log");
+            String::from_utf8_lossy(&buffer).into_owned()
+        }
+    }
+
+    impl io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut buffer = self
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("the captured log mutex was poisoned"))?;
+            buffer.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     /// A console terminal that is not the inactive size, so the two are never
     /// confused in an assertion.
@@ -1833,6 +1889,8 @@ mod console_tests {
 
     #[test]
     fn a_switch_moves_the_connector_the_link_and_the_fleet_state_together() {
+        let log = CapturedLog::default();
+        let _log_guard = log.install();
         let dir = scratch_dir("switch-routing");
         let alpha = serving(&dir, "alpha");
         let beta = serving(&dir, "beta");
@@ -1895,6 +1953,19 @@ mod console_tests {
             crate::fleet::connector::test_support::resize_geometry(&alpha.received()),
             crate::fleet::connector::test_support::resize_geometry(&beta.received())
         );
+
+        // The log says which machine the console drives: once at launch, once
+        // per switch, with the host it moved off.
+        let logged = log.text();
+        assert!(
+            logged.contains("fleet console active host") && logged.contains("host=alpha"),
+            "the launch line names the host the console opened on: {logged}"
+        );
+        assert!(
+            logged.contains("host=beta") && logged.contains("from=alpha"),
+            "the switch line names both machines: {logged}"
+        );
+
         drop(link);
         drop(console);
     }
