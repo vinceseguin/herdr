@@ -402,8 +402,8 @@ fn a_drag_over_another_hosts_rows_has_no_drop_target() {
 
     let beta = fleet_row(&state, &FleetSidebarHit::HostHeader(host("beta")));
     assert!(
-        state.is_fleet_row(beta.y),
-        "beta's header is a fleet row, not a workspace slot"
+        state.is_other_host_row(beta.y),
+        "beta's header is another host's row, not a workspace slot"
     );
     let alpha_rows = state
         .hits
@@ -412,8 +412,116 @@ fn a_drag_over_another_hosts_rows_has_no_drop_target() {
         .map(|hit| hit.rect.y)
         .collect::<Vec<_>>();
     assert!(
-        !alpha_rows.is_empty() && alpha_rows.iter().all(|row| !state.is_fleet_row(*row)),
+        !alpha_rows.is_empty() && alpha_rows.iter().all(|row| !state.is_other_host_row(*row)),
         "the active host's own rows stay draggable: {alpha_rows:?}"
+    );
+    // The slot *before* the active host's first workspace is the line above
+    // it — its own header. That line must stay a drop target, or nothing
+    // could ever be dragged to the top of the list in a console.
+    let alpha = fleet_row(&state, &FleetSidebarHit::HostHeader(host("alpha")));
+    assert_eq!(
+        alpha.y.saturating_add(1),
+        alpha_rows[0],
+        "alpha's header sits directly above its first workspace"
+    );
+    assert!(
+        !state.is_other_host_row(alpha.y),
+        "the active host's own header is the slot before its first workspace"
+    );
+
+    // A single-host client has no fleet rows at all.
+    let single = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    assert!(!single.is_other_host_row(alpha.y));
+}
+
+#[test]
+fn keys_parked_behind_a_copy_operation_do_not_outlive_the_notice() {
+    let mut fleet = fleet_state();
+    let mut state = console(&fleet);
+    drop_active_host(&mut fleet);
+    refresh(&mut state, &fleet, None);
+    let _ = screen(&mut state);
+
+    // A copy-mode read is in flight, so `handle_key` parks what is typed
+    // instead of routing it. That parking lot is a queue by another name.
+    state.copy_operation_in_flight = true;
+    let outcome = type_x(&mut state);
+    assert!(pane_inputs(&outcome).is_empty(), "{:?}", outcome.requests);
+    assert!(
+        state.copy_input_queue.is_empty(),
+        "a key typed at the notice was parked for replay: {:?}",
+        state.copy_input_queue
+    );
+
+    // The read settles after the host is back. Nothing typed while it was
+    // down may come out now.
+    state.copy_operation_in_flight = false;
+    fleet.apply(
+        &host("alpha"),
+        HostEvent::Connected {
+            server_version: "0.8.2-fork".into(),
+            methods: vec!["pane.focus".into()],
+        },
+    );
+    refresh(&mut state, &fleet, None);
+    state.set_pane_surface(surface());
+    let after = type_x(&mut state);
+    assert_eq!(
+        pane_inputs(&after),
+        vec!["pane_1".to_string()],
+        "one keystroke in, one keystroke out: {:?}",
+        after.requests
+    );
+}
+
+#[test]
+fn a_pane_mouse_gesture_does_not_finish_on_the_host_that_comes_back() {
+    let mut fleet = fleet_state();
+    let mut state = console(&fleet);
+    // A pane that reports the mouse: a button-down starts a gesture whose
+    // button-up the shell synthesizes later, on focus loss, if the terminal
+    // never delivers one.
+    let mut reporting = surface();
+    reporting.panes[0].mouse_reporting = true;
+    reporting.surface_revision = 2;
+    state.set_pane_surface(reporting);
+    let _ = screen(&mut state);
+    let pane = state.hits.panes[0].inner_rect;
+    let outcome =
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: pane.x,
+            row: pane.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+    assert_eq!(pane_inputs(&outcome), vec!["pane_1".to_string()]);
+    assert!(
+        state.pane_mouse_gesture.is_some(),
+        "the press opened a gesture"
+    );
+
+    drop_active_host(&mut fleet);
+    refresh(&mut state, &fleet, None);
+    let _ = screen(&mut state);
+    let _ = type_x(&mut state);
+    assert!(
+        state.pane_mouse_gesture.is_none(),
+        "the gesture was kept across the host going down"
+    );
+
+    fleet.apply(
+        &host("alpha"),
+        HostEvent::Connected {
+            server_version: "0.8.2-fork".into(),
+            methods: vec!["pane.focus".into()],
+        },
+    );
+    refresh(&mut state, &fleet, None);
+    let outcome = state.handle_raw_events(vec![RawInputEvent::OuterFocusLost]);
+    assert!(
+        pane_inputs(&outcome).is_empty(),
+        "a button-up for a press the host never finished was sent after the reconnect: {:?}",
+        outcome.requests
     );
 }
 

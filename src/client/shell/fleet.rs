@@ -56,6 +56,18 @@ pub(crate) enum FleetSidebarHit {
     Agent(FleetPaneRef),
 }
 
+impl FleetSidebarHit {
+    /// The host this row belongs to. Every variant carries one: that is the
+    /// type's whole reason to exist.
+    pub(super) fn host(&self) -> &HostId {
+        match self {
+            Self::HostHeader(host) | Self::HostCollapse(host) => host,
+            Self::Workspace(workspace) => &workspace.host,
+            Self::Agent(pane) => &pane.host,
+        }
+    }
+}
+
 /// What the shell asks the client loop to do about the fleet.
 ///
 /// The shell cannot switch hosts itself: the connector, the link and the fleet
@@ -415,9 +427,19 @@ impl ClientShellState {
     /// never turn into a queue. Everything else the batch produced (a focus
     /// report, a theme update, a host switch, an overlay action) still goes.
     ///
+    /// Two pieces of shell state are the queue in disguise, and go with the
+    /// messages: keys parked behind a copy operation (`handle_key` holds them
+    /// while a copy-mode read is in flight and replays them when it settles,
+    /// which can be after the host is back), and a pane mouse gesture (its
+    /// button-up is synthesized on the next focus loss, to whichever host is
+    /// connected by then). Leases are left alone: they only ever produce a
+    /// release for a key the host may have seen the press of, and a release
+    /// to a shell that has moved on is harmless where a replayed keystroke is
+    /// not.
+    ///
     /// Returns whether anything was dropped, so the caller repaints and the
     /// user sees the notice answer the keystroke.
-    pub(super) fn drop_pane_bound_input(&self, outcome: &mut ClientShellInput) -> bool {
+    pub(super) fn drop_pane_bound_input(&mut self, outcome: &mut ClientShellInput) -> bool {
         let before = outcome.requests.len();
         outcome.requests.retain(|request| {
             !matches!(
@@ -426,6 +448,8 @@ impl ClientShellState {
                     | crate::protocol::ClientMessage::ClientShellPopupInput { .. }
             )
         });
+        self.copy_input_queue.clear();
+        self.pane_mouse_gesture = None;
         let dropped = outcome.requests.len() != before;
         if dropped {
             tracing::debug!(
@@ -446,13 +470,21 @@ impl ClientShellState {
             .map_or(0, FleetShellState::active_spaces_offset)
     }
 
-    /// Whether this screen row belongs to a fleet row (a host header, or
-    /// another host's workspace or agent).
-    pub(super) fn is_fleet_row(&self, row: u16) -> bool {
+    /// Whether this screen row belongs to a host other than the active one
+    /// (its header, or one of its workspace or agent rows).
+    ///
+    /// The active host's *own* header is deliberately not excluded: the slot
+    /// before its first workspace is the line above that workspace, which in
+    /// a console is that header — exactly as the single-host client's slot
+    /// before its first workspace is the section title line.
+    pub(super) fn is_other_host_row(&self, row: u16) -> bool {
+        let Some(fleet) = self.fleet.as_ref() else {
+            return false;
+        };
         self.hits
             .fleet_rows
             .iter()
-            .any(|(rect, _)| row >= rect.y && row < rect.bottom())
+            .any(|(rect, hit)| row >= rect.y && row < rect.bottom() && !fleet.is_active(hit.host()))
     }
 
     /// Update the "switching to this host" marker in place.

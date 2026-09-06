@@ -173,12 +173,15 @@ fn active_host_connected(active: &HostId, changes: &[FleetChange]) -> bool {
 /// Two things have to be true the moment a host comes back, and neither is
 /// true on its own:
 ///
-/// * The host must render at the console's current geometry. The connector
-///   re-reads the shared geometry in its hello, so a host that reconnects is
-///   already asked for the right size — but a resize that happened while the
-///   handshake was in flight is not in that hello. Announcing here closes that
-///   window: the connector writes a resize only when the size actually differs
-///   from what it announced, so the common case costs nothing.
+/// * The host must render at the console's current geometry. A *terminal*
+///   resize is already covered: the connector adopts it whether or not the
+///   host is up, hellos with it, and re-checks it under the link lock after
+///   the hello. A pane-area change that is not a terminal resize is not — the
+///   sidebar dragged wider, collapsed, or a snapshot that changed the tab bar
+///   goes out as a `ClientShellResize` through the link, and the link drops
+///   a write to a host that is down. Announcing here is what tells the host
+///   about it: the connector writes a resize only when the size actually
+///   differs from what it announced, so the common case costs nothing.
 /// * The shell must stop showing the frame the host sent *before* it went
 ///   away. That frame is the old size and the old boot; blitting it again
 ///   would be a console lying about a machine it just lost. Dropping it puts

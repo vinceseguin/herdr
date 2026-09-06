@@ -469,12 +469,12 @@ impl ClientShellState {
         {
             return None;
         }
-        // Fork (E2 PR 8): a Fleet console's spaces body also holds host
-        // headers and other hosts' rows. A drag can only ever reorder the
-        // active host's workspaces, so a pointer over one of those rows has no
-        // target — without this the nearest-slot search below snaps the
-        // indicator onto a fleet row, several rows away from the pointer.
-        if self.is_fleet_row(point.1) {
+        // Fork (E2 PR 8): a Fleet console's spaces body also holds other
+        // hosts' headers and rows. A drag can only ever reorder the active
+        // host's workspaces, so a pointer over another host has no target —
+        // without this the nearest-slot search below snaps the indicator onto
+        // that host's rows, several lines away from the pointer.
+        if self.is_other_host_row(point.1) {
             return None;
         }
         let mut slots = self
@@ -504,7 +504,7 @@ impl ClientShellState {
             let row = last_hit.rect.bottom();
             // …and the row after the active host's last workspace belongs to
             // the next host's header in a console, which is not a slot.
-            if row < self.hits.new_workspace.y && !self.is_fleet_row(row) {
+            if row < self.hits.new_workspace.y && !self.is_other_host_row(row) {
                 slots.push((before, row));
             }
         }
