@@ -12,12 +12,6 @@
 //! `restrict_socket_permissions` makes the same choice — so the helpers keep
 //! the same signatures and only log at `debug`.
 
-// Consumed by PR 4 (the token store behind the auth middleware) and PR 8
-// (pairing files, device records and the runtime marker). Every item below is
-// exercised by this module's own tests; the allow only covers the non-test
-// build until those PRs call them.
-#![allow(dead_code)]
-
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -40,6 +34,9 @@ pub const CONTROL_TOKEN_FILE: &str = "control.token";
 /// Paired devices (ids, scopes and digests — never a secret).
 pub const DEVICES_FILE: &str = "devices.json";
 /// One file per outstanding `herdr gateway pair` code.
+// PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first caller;
+// until then only this module's tests reach it.
+#[allow(dead_code)]
 pub const PAIRINGS_DIR: &str = "pairings";
 /// `{pid, listen, started_unix}` of the running gateway, removed on clean exit.
 pub const RUNTIME_FILE: &str = "gateway.json";
@@ -52,6 +49,9 @@ pub fn gateway_dir() -> PathBuf {
 }
 
 /// `<config>/gateway/pairings/`.
+// PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first caller;
+// until then only this module's tests reach it.
+#[allow(dead_code)]
 pub fn pairings_dir(gateway_dir: &Path) -> PathBuf {
     gateway_dir.join(PAIRINGS_DIR)
 }
@@ -156,6 +156,10 @@ pub fn verify_private_dir(path: &Path) -> io::Result<()> {
 ///
 /// Called before every read of a secret: a token that became `0644` after it
 /// was written is not a token we can keep trusting.
+// Reads of secrets go through `read_private_file`, which verifies the open
+// descriptor. This standalone check is for a file the gateway only stats:
+// PR 8's `herdr gateway status` on the runtime marker, and this PR's tests.
+#[allow(dead_code)]
 pub fn verify_private_file(path: &Path) -> io::Result<()> {
     verify_private_metadata(path, &fs::symlink_metadata(path)?)
 }

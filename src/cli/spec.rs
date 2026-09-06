@@ -158,9 +158,6 @@ fn gateway_command() -> Command {
         .about("Serve the fleet over HTTP and WebSocket")
         .arg(option("bind", "ADDR").help("Listen on ADDR instead of the configured address"))
         .arg(option("config", "PATH").help("Read configuration from PATH"))
-        // Same staging note the hand-rolled `herdr gateway help` prints, so the
-        // clap surface does not advertise options that run nothing yet.
-        .after_help(crate::gateway::GATEWAY_STAGING_NOTE)
 }
 
 fn config_command() -> Command {
@@ -1145,10 +1142,6 @@ mod tests {
         assert!(super::write_requested_help(&args, &mut output, || {}).unwrap());
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Usage: herdr gateway"), "{output}");
-        assert!(
-            output.contains(crate::gateway::GATEWAY_STAGING_NOTE),
-            "{output}"
-        );
     }
 
     #[cfg(not(feature = "gateway"))]
