@@ -3,8 +3,8 @@
 //! Unix-only, like the rest of the fleet's socket tests: they bind a local
 //! socket by path and half-close it. The fake endpoint speaks exactly the
 //! frozen exchange a herdr server speaks — `TerminalHello` → `Welcome` →
-//! `ObserveTerminal` → `Terminal` frames — so a change to either side of that
-//! contract fails here rather than against a lab.
+//! `ObserveTerminal`/`ControlTerminal` → `Terminal` frames — so a change to
+//! either side of that contract fails here rather than against a lab.
 
 use std::io;
 use std::path::PathBuf;
@@ -48,13 +48,20 @@ enum Answer {
     WrongEncoding,
     /// `Welcome { TerminalAnsi }`, then one frame larger than `MAX_FRAME_SIZE`.
     OversizedFrame,
+    /// `Welcome { TerminalAnsi }`, then the server's refusal of a second
+    /// controller — verbatim from `headless.rs`.
+    AttachTaken,
+    /// `Welcome { TerminalAnsi }`, then the shutdown an evicted controller
+    /// gets when somebody else attaches with `takeover: true`.
+    AttachTakenOver,
 }
 
 /// What the fake endpoint saw and sent.
 #[derive(Default)]
 struct Seen {
     hello: Option<(u16, u16)>,
-    observe_target: Option<String>,
+    /// The `ObserveTerminal`/`ControlTerminal` that fixed the mode.
+    attach: Option<ClientMessage>,
     after: Vec<ClientMessage>,
     /// The client's half-close (or close) reached the fake's read loop.
     closed: bool,
@@ -95,7 +102,10 @@ impl FakeEndpoint {
             lock(&thread_seen).hello = Some((cols, rows));
 
             let welcome = match answer {
-                Answer::Ansi | Answer::OversizedFrame => ServerMessage::Welcome {
+                Answer::Ansi
+                | Answer::OversizedFrame
+                | Answer::AttachTaken
+                | Answer::AttachTakenOver => ServerMessage::Welcome {
                     version: PROTOCOL_VERSION,
                     encoding: RenderEncoding::TerminalAnsi,
                     error: None,
@@ -114,16 +124,36 @@ impl FakeEndpoint {
             if protocol::write_message(&mut stream, &welcome).is_err() {
                 return;
             }
-            if !matches!(answer, Answer::Ansi | Answer::OversizedFrame) {
+            if matches!(answer, Answer::Refused | Answer::WrongEncoding) {
                 return;
             }
 
-            let Ok(ClientMessage::ObserveTerminal { target }) =
-                protocol::read_message::<_, ClientMessage>(&mut stream, MAX_FRAME_SIZE)
-            else {
+            let attach =
+                match protocol::read_message::<_, ClientMessage>(&mut stream, MAX_FRAME_SIZE) {
+                    Ok(
+                        message @ (ClientMessage::ObserveTerminal { .. }
+                        | ClientMessage::ControlTerminal { .. }),
+                    ) => message,
+                    _ => return,
+                };
+            lock(&thread_seen).attach = Some(attach);
+
+            if let Some(reason) = match answer {
+                Answer::AttachTaken => Some(
+                    "terminal attach failed: terminal t1 already has an attached client; retry with --takeover"
+                        .to_string(),
+                ),
+                Answer::AttachTakenOver => Some("terminal attach taken over".to_string()),
+                _ => None,
+            } {
+                let _ = protocol::write_message(
+                    &mut stream,
+                    &ServerMessage::ServerShutdown {
+                        reason: Some(reason),
+                    },
+                );
                 return;
-            };
-            lock(&thread_seen).observe_target = Some(target);
+            }
 
             if matches!(answer, Answer::OversizedFrame) {
                 // The payload is the frame's bytes plus bincode's header, so
@@ -183,12 +213,30 @@ impl FakeEndpoint {
     }
 
     fn observe(&self, pane: &str) -> io::Result<TerminalSession> {
-        negotiate_observe(
+        self.open(SessionRequest {
+            mode: TerminalMode::Observe,
+            pane: pane.to_string(),
+            cols: 80,
+            rows: 24,
+            takeover: false,
+        })
+    }
+
+    fn control(&self, pane: &str, takeover: bool) -> io::Result<TerminalSession> {
+        self.open(SessionRequest {
+            mode: TerminalMode::Control,
+            pane: pane.to_string(),
+            cols: 80,
+            rows: 24,
+            takeover,
+        })
+    }
+
+    fn open(&self, request: SessionRequest) -> io::Result<TerminalSession> {
+        negotiate(
             self.connect()?,
             READ_TIMEOUT,
-            pane,
-            80,
-            24,
+            &request,
             StreamLease::detached(),
         )
     }
@@ -197,8 +245,16 @@ impl FakeEndpoint {
         lock(&self.seen).hello
     }
 
+    fn attach(&self) -> Option<ClientMessage> {
+        lock(&self.seen).attach.clone()
+    }
+
     fn observed_target(&self) -> Option<String> {
-        lock(&self.seen).observe_target.clone()
+        match lock(&self.seen).attach.clone() {
+            Some(ClientMessage::ObserveTerminal { target })
+            | Some(ClientMessage::ControlTerminal { target, .. }) => Some(target),
+            _ => None,
+        }
     }
 
     fn after(&self) -> Vec<ClientMessage> {
@@ -345,7 +401,8 @@ async fn a_resize_reaches_the_host() {
 async fn an_observe_session_forwards_only_what_the_policy_admits() {
     let endpoint = FakeEndpoint::start("gate", Answer::Ansi);
     let mut session = endpoint.observe("w1:p1").expect("observe opens");
-    let policy = SessionPolicy::new(TerminalMode::Observe, TokenScope::Read);
+    let policy = SessionPolicy::new(TerminalMode::Observe, TokenScope::Read)
+        .expect("a read credential may observe");
 
     let answer = |outcome: ClientOutcome| match outcome {
         ClientOutcome::Answer(text) => {
@@ -515,6 +572,207 @@ fn a_target_that_could_not_be_a_reference_is_refused() {
             parse_target(host, pane).is_none(),
             "accepted {host:?}/{pane:?}"
         );
+    }
+}
+
+/// The attach message is the whole difference between watching and driving,
+/// and `takeover` is the whole difference between asking and taking. Both go
+/// on the wire exactly as the client asked.
+#[test]
+fn a_control_session_claims_the_attach_slot_with_the_flag_it_was_given() {
+    for takeover in [false, true] {
+        let endpoint = FakeEndpoint::start(&format!("control-{takeover}"), Answer::Ansi);
+        let _session = endpoint.control("w1:p1", takeover).expect("control opens");
+        assert!(wait_until(Duration::from_secs(5), || endpoint
+            .attach()
+            .is_some()));
+        match endpoint.attach() {
+            Some(ClientMessage::ControlTerminal {
+                target,
+                takeover: sent,
+            }) => {
+                assert_eq!(target, "w1:p1");
+                assert_eq!(sent, takeover);
+            }
+            other => panic!("expected a ControlTerminal, got {other:?}"),
+        }
+    }
+}
+
+/// An observer asks for the observe slot, never the attach slot — a mode
+/// mix-up here would take somebody's pane away just by watching it.
+#[test]
+fn an_observe_session_never_claims_the_attach_slot() {
+    let endpoint = FakeEndpoint::start("observe-attach", Answer::Ansi);
+    let _session = endpoint.observe("w1:p1").expect("observe opens");
+    assert!(wait_until(Duration::from_secs(5), || endpoint
+        .attach()
+        .is_some()));
+    assert!(
+        matches!(
+            endpoint.attach(),
+            Some(ClientMessage::ObserveTerminal { .. })
+        ),
+        "an observer claimed the attach slot: {:?}",
+        endpoint.attach()
+    );
+}
+
+/// The control path end to end, through the real gate: what reaches the host,
+/// byte for byte, and what still does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_session_forwards_input_byte_exact() {
+    let endpoint = FakeEndpoint::start("control-input", Answer::Ansi);
+    let mut session = endpoint.control("w1:p1", false).expect("control opens");
+    let policy = SessionPolicy::new(TerminalMode::Control, TokenScope::Control)
+        .expect("a control credential may control");
+
+    // Text is UTF-8 bytes verbatim; `bytes` is base64 of the same, and the two
+    // spellings must produce the same PTY input.
+    for raw in [
+        r#"{"type":"terminal.input","text":"echo hi\n"}"#,
+        r#"{"type":"terminal.input","bytes":"ZWNobyBoaQo="}"#,
+    ] {
+        assert_eq!(
+            handle_client_text(&policy, &mut session, raw).await,
+            ClientOutcome::Continue,
+            "{raw}"
+        );
+    }
+    // A resize from a controller is the real PTY size, so it still goes.
+    assert_eq!(
+        handle_client_text(
+            &policy,
+            &mut session,
+            r#"{"type":"terminal.resize","cols":60,"rows":20}"#
+        )
+        .await,
+        ClientOutcome::Continue
+    );
+    // The ceiling is the controller's too: a host must not be asked to render
+    // a viewport no terminal has.
+    match handle_client_text(
+        &policy,
+        &mut session,
+        r#"{"type":"terminal.resize","cols":65535,"rows":24}"#,
+    )
+    .await
+    {
+        ClientOutcome::Answer(text) => {
+            let value: serde_json::Value = serde_json::from_str(&text).expect("json answer");
+            assert_eq!(value["code"], "bad_request", "{text}");
+        }
+        other => panic!("an oversized resize was not refused: {other:?}"),
+    }
+    assert_eq!(
+        handle_client_text(&policy, &mut session, r#"{"type":"terminal.release"}"#).await,
+        ClientOutcome::Release
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(5), || endpoint
+            .after()
+            .iter()
+            .any(|message| matches!(message, ClientMessage::Detach))),
+        "the host never saw the release: {:?}",
+        endpoint.after()
+    );
+    let after = endpoint.after();
+    let inputs: Vec<Vec<u8>> = after
+        .iter()
+        .filter_map(|message| match message {
+            ClientMessage::Input { data } => Some(data.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        inputs,
+        vec![b"echo hi\n".to_vec(), b"echo hi\n".to_vec()],
+        "input did not reach the host byte-exact: {after:?}"
+    );
+    assert!(
+        after.iter().any(|message| matches!(
+            message,
+            ClientMessage::Resize {
+                cols: 60,
+                rows: 20,
+                ..
+            }
+        )),
+        "the controller's resize never reached the host: {after:?}"
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|message| matches!(message, ClientMessage::Resize { cols: 65535, .. })),
+        "an out-of-bounds resize reached the host: {after:?}"
+    );
+}
+
+/// A control-capable credential watching read-only still cannot type: mode
+/// wins, so a device with the control token cannot type into a pane it opened
+/// to watch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_credential_in_observe_mode_still_cannot_type() {
+    let endpoint = FakeEndpoint::start("observe-control-token", Answer::Ansi);
+    let mut session = endpoint.observe("w1:p1").expect("observe opens");
+    let policy = SessionPolicy::new(TerminalMode::Observe, TokenScope::Control)
+        .expect("a control credential may observe");
+
+    match handle_client_text(
+        &policy,
+        &mut session,
+        r#"{"type":"terminal.input","text":"echo INJECTED\n"}"#,
+    )
+    .await
+    {
+        ClientOutcome::Answer(text) => {
+            let value: serde_json::Value = serde_json::from_str(&text).expect("json answer");
+            assert_eq!(value["code"], "forbidden", "{text}");
+        }
+        other => panic!("an observer typed: {other:?}"),
+    }
+    assert!(
+        !endpoint
+            .after()
+            .iter()
+            .any(|message| matches!(message, ClientMessage::Input { .. })),
+        "input reached the host: {:?}",
+        endpoint.after()
+    );
+}
+
+/// A pane somebody else is driving is `busy`, not "the host is down" and not a
+/// silent close: the client is told the one thing it can act on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_taken_attach_slot_answers_busy_before_ready() {
+    let endpoint = FakeEndpoint::start("busy", Answer::AttachTaken);
+    let mut session = endpoint.control("w1:p1", false).expect("control opens");
+    match await_attach(&mut session).await {
+        Attached::Refused { text, close } => {
+            let value: serde_json::Value = serde_json::from_str(&text).expect("json answer");
+            assert_eq!(value["type"], "terminal.error", "{text}");
+            assert_eq!(value["code"], "busy", "{text}");
+            assert_eq!(close.code, close_code::AGAIN);
+        }
+        Attached::Ready(_) => panic!("a taken pane must not report ready"),
+    }
+}
+
+/// The evicted controller's side of a takeover. Not an error — it asked for
+/// nothing wrong — but a named reason, so a UI can say who lost the pane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_evicted_controller_is_told_it_was_taken_over() {
+    let endpoint = FakeEndpoint::start("taken-over", Answer::AttachTakenOver);
+    let mut session = endpoint.control("w1:p1", false).expect("control opens");
+    match await_attach(&mut session).await {
+        Attached::Refused { text, close } => {
+            let value: serde_json::Value = serde_json::from_str(&text).expect("json answer");
+            assert_eq!(value["type"], "terminal.closed", "{text}");
+            assert_eq!(value["reason"], "taken_over", "{text}");
+            assert_eq!(close.code, close_code::NORMAL);
+        }
+        Attached::Ready(_) => panic!("an evicted controller must not report ready"),
     }
 }
 
