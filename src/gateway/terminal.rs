@@ -44,7 +44,7 @@ use axum::routing::get;
 use axum::Router;
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::TryClone as _;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::client::terminal_control_command_from_json;
 use crate::fleet::hosts::{HostId, HostSpec};
@@ -80,7 +80,9 @@ const COMMAND_CHANNEL_CAPACITY: usize = 16;
 /// A `terminal.release` right after a keystroke is the ordinary case — a
 /// browser closing a terminal it just typed into — and the keystroke has to
 /// reach the pty before the socket is half-closed under the writer. Bounded so
-/// a wedged write cannot hold the task open.
+/// a wedged write cannot hold the task open, and kept *under*
+/// `HostTransports`' three-second release wait so a session that is draining
+/// when the gateway stops still lets its `StreamLease` go in time.
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long the gateway waits for the host to confirm the session before it
 /// tells the client the terminal is ready.
@@ -91,6 +93,9 @@ const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// rather than a socket that hangs: on timeout the client gets its
 /// `terminal.ready` and the stream continues.
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
+/// The `terminal.closed` reason a gateway shutdown produces, wherever a
+/// session notices the stop latch.
+const GATEWAY_STOPPING: &str = "the gateway is stopping";
 
 /// The terminal stream. Merged by [`crate::gateway::server::router`], which is
 /// what puts it behind the auth layer.
@@ -265,7 +270,7 @@ async fn run_terminal(
     // a shutdown — a pane that is not there, an attach slot somebody else
     // holds. Saying `terminal.ready` before that would make a client open a
     // terminal it does not have and then take it away again.
-    let first_frame = match await_attach(&mut session).await {
+    let first_frame = match await_attach(&mut session, &mut stopping).await {
         Attached::Ready(frame) => frame,
         Attached::Refused { text, close } => {
             tracing::info!(
@@ -318,7 +323,7 @@ async fn run_terminal(
             // while a stream is open.
             changed = stopping.changed() => {
                 if changed.is_err() || *stopping.borrow_and_update() {
-                    let _ = socket.send(Message::Text(terminal_closed(Some("the gateway is stopping")).into())).await;
+                    let _ = socket.send(Message::Text(terminal_closed(Some(GATEWAY_STOPPING)).into())).await;
                     close = Some(frame(close_code::AWAY, "gateway stopping"));
                     break;
                 }
@@ -429,19 +434,47 @@ enum Attached {
 }
 
 /// Wait for the host to accept or refuse the session.
-async fn await_attach(session: &mut TerminalSession) -> Attached {
-    match tokio::time::timeout(ATTACH_TIMEOUT, session.frames.recv()).await {
-        Ok(Some(TerminalEvent::Frame(frame))) => Attached::Ready(Some(frame)),
-        Ok(Some(TerminalEvent::Closed(reason))) => {
-            Attached::from(ending_answer(Ending::Closed(reason)))
-        }
-        Ok(Some(TerminalEvent::Failed(error))) => {
-            Attached::from(ending_answer(Ending::Failed(error)))
-        }
-        Ok(None) => Attached::from(ending_answer(Ending::Eof)),
-        // Nothing yet. The connection is open and the policy is settled, so
-        // this is a slow host, not a refusal: let the session run.
-        Err(_) => Attached::Ready(None),
+///
+/// Selects on the stop latch as the main loop does, and for the same reason: a
+/// session that is waiting on a host is still a session holding a
+/// [`StreamLease`], and `HostTransports::shutdown` waits only three seconds for
+/// the last lease before it drops a transport. Without this arm a stopping
+/// gateway could tear an ssh bridge down under a stream that is still opening.
+async fn await_attach(
+    session: &mut TerminalSession,
+    stopping: &mut watch::Receiver<bool>,
+) -> Attached {
+    let deadline = tokio::time::Instant::now() + ATTACH_TIMEOUT;
+    loop {
+        // Both futures are cancel-safe, so the arm that loses drops nothing:
+        // `recv` leaves the queued event in the channel.
+        let event = tokio::select! {
+            changed = stopping.changed() => {
+                if changed.is_err() || *stopping.borrow_and_update() {
+                    return Attached::Refused {
+                        text: terminal_closed(Some(GATEWAY_STOPPING)),
+                        close: frame(close_code::AWAY, "gateway stopping"),
+                    };
+                }
+                // The latch only ever moves to `true`; anything else is not a
+                // stop, so keep waiting for the host.
+                continue;
+            }
+            event = tokio::time::timeout_at(deadline, session.frames.recv()) => event,
+        };
+        return match event {
+            Ok(Some(TerminalEvent::Frame(frame))) => Attached::Ready(Some(frame)),
+            Ok(Some(TerminalEvent::Closed(reason))) => {
+                Attached::from(ending_answer(Ending::Closed(reason)))
+            }
+            Ok(Some(TerminalEvent::Failed(error))) => {
+                Attached::from(ending_answer(Ending::Failed(error)))
+            }
+            Ok(None) => Attached::from(ending_answer(Ending::Eof)),
+            // Nothing yet. The connection is open and the policy is settled, so
+            // this is a slow host, not a refusal: let the session run.
+            Err(_) => Attached::Ready(None),
+        };
     }
 }
 
@@ -553,14 +586,31 @@ async fn handle_client_text(
     // The CLI vocabulary bounds a resize below only; the host renders this
     // session at whatever it asks for, so the ceiling is applied here, the
     // same one `terminal.open` was held to.
-    if let ClientMessage::Resize { cols, rows, .. } = &message {
-        if let Err(error) = check_geometry(*cols, *rows) {
-            return ClientOutcome::Answer(terminal_error(
-                TerminalErrorCode::BadRequest,
-                &format!("terminal.resize {error}"),
-            ));
+    let message = match message {
+        ClientMessage::Resize { cols, rows, .. } => {
+            if let Err(error) = check_geometry(cols, rows) {
+                return ClientOutcome::Answer(terminal_error(
+                    TerminalErrorCode::BadRequest,
+                    &format!("terminal.resize {error}"),
+                ));
+            }
+            // The terminal hello declared no cell geometry and no pixel mouse,
+            // and a resize must not smuggle either back in: for a *controller*
+            // this resize reaches the real pty (`headless.rs` hands
+            // `cell_*_px` to `runtime.resize`), so a browser-chosen pixel cell
+            // size would change what the pane reports to every other client of
+            // that host. The gateway renders nothing and knows no cell size, so
+            // the only honest answer is the zero it opened with.
+            ClientMessage::Resize {
+                cols,
+                rows,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                pixel_mouse: false,
+            }
         }
-    }
+        other => other,
+    };
     let release = matches!(message, ClientMessage::Detach);
     if session.send(message).await.is_err() {
         // The writer thread is gone; the frame arm will end the session.
