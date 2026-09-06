@@ -52,8 +52,8 @@ Option 3.
   adds no client-side host model, sidebar group, picker or notification
   prefix of its own.
 - **E2 is retired.** Fork PRs #22 and #24–#32 are reverted in one PR
-  (`revert: retire the fork fleet tui superseded by upstream multi-machine
-  client`). PR #23 (connector client options, active-surface tracking,
+  (`chore: retire the fork fleet tui superseded by upstream multi-machine
+  client`, fork PR #33). PR #23 (connector client options, active-surface tracking,
   `take_events`) stays: it lives entirely in `src/fleet/connector.rs` and is
   what a long-lived consumer such as the gateway drives the connector with.
 - **E1 stays, headless.** `src/fleet/**` (pure state, connector, transports,
