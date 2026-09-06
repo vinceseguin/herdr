@@ -14,6 +14,13 @@
 //! 2 for a usage error.
 
 mod auth;
+// PR 4 (`herdr gateway` serving HTTP) is the first production caller of the
+// fleet runtime: it builds a `FleetRuntime` at startup, keeps a `FleetHandle`
+// in the router's state and serves `report()` from `/api/fleet`. Until then
+// every item in the module is reached only from its own tests, so the module
+// carries one allow rather than a dozen; PR 4 removes this line.
+#[allow(dead_code)]
+mod fleet;
 mod paths;
 mod policy;
 
