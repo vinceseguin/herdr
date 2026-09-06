@@ -33,7 +33,9 @@ ROOT_STRUCT = "Config"
 # `[fleet]` is fork-owned (it holds the open-ended `[[fleet.hosts]]` array of
 # tables) and is documented in prose under docs/fork/, not in the upstream
 # website config reference.
-SKIPPED_SUBTREES = ("keys.command", "fleet")
+# `[gateway]` is fork-owned for the same reason: it configures `herdr gateway`,
+# which only fork builds have, and is documented in docs/fork/gateway.md.
+SKIPPED_SUBTREES = ("keys.command", "fleet", "gateway")
 
 FIELD_RE = re.compile(r"^\s*pub ([a-z_][a-z0-9_]*):\s*(.+?),?\s*$")
 STRUCT_RE = re.compile(r"^\s*pub(?:\(crate\))? struct ([A-Za-z0-9_]+)\s*\{\s*$")

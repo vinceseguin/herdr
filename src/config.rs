@@ -22,11 +22,12 @@ pub use self::{
         IndexedKeybind, Keybinds, LiveKeybindConfig,
     },
     model::{
-        validated_sidebar_bounds, AgentPanelSortConfig, Config, ConfigReloadReport,
-        ConfigReloadStatus, FleetConfig, FleetHostConfig, FleetHostKind, HostCursorModeConfig,
-        NewTerminalCwdConfig, ShellModeConfig, SidebarCollapsedModeConfig, StatusIndicatorStyle,
-        TabBarPositionConfig, ToastClipboardPosition, ToastConfig, ToastDelivery,
-        ToastHerdrPosition, UpdateChannelConfig, FLEET_LOCAL_HOST_NAME, MAX_TOAST_DELAY_SECONDS,
+        parse_gateway_origin, validated_sidebar_bounds, AgentPanelSortConfig, Config,
+        ConfigReloadReport, ConfigReloadStatus, FleetConfig, FleetHostConfig, FleetHostKind,
+        GatewayConfig, GatewayOrigin, HostCursorModeConfig, NewTerminalCwdConfig, ShellModeConfig,
+        SidebarCollapsedModeConfig, StatusIndicatorStyle, TabBarPositionConfig,
+        ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
+        UpdateChannelConfig, FLEET_LOCAL_HOST_NAME, MAX_TOAST_DELAY_SECONDS,
     },
     sidebar::{
         AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarTokenStyle,
@@ -127,6 +128,7 @@ impl Config {
             .chain(self.invalid_sidebar_bounds_diagnostic())
             .chain(self.invalid_headless_size_diagnostic())
             .chain(self.fleet.diagnostics())
+            .chain(self.gateway.diagnostics())
             .collect()
     }
 

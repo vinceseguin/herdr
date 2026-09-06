@@ -415,6 +415,22 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # session = "agents"      # optional named session on that host; required for kind = "local"
 # enabled = true
 
+[gateway]
+# Herdr Fleet gateway (`herdr gateway`): HTTP + WebSocket for phones and browsers.
+# Loopback by default. Any other bind address also needs `allowed_origins`.
+# bind = "127.0.0.1:7788"
+# Browser origins allowed to call the API, as scheme://host[:port]. Required for a
+# non-loopback bind; a loopback bind allows its own origins when this is empty.
+# allowed_origins = ["https://gateway.tailnet-name.ts.net"]
+# The origin pairing URLs and QR codes advertise. Implicitly allowed; an https
+# scheme marks device cookies Secure.
+# public_url = "https://gateway.tailnet-name.ts.net"
+# Failed authentications per peer address before it is refused for the window.
+# auth_failure_limit = 5
+# auth_failure_window_secs = 60
+# How long a pairing URL from `herdr gateway pair` stays valid (30..=86400).
+# pairing_ttl_secs = 600
+
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.
 # allow_nested = false
@@ -951,6 +967,85 @@ mod tests {
             assert!(
                 line.is_empty() || line.starts_with('#'),
                 "the [fleet] sample must stay commented out: {line}"
+            );
+        }
+    }
+
+    /// The `[gateway]` section of `DEFAULT_CONFIG`, header line included.
+    fn default_config_gateway_block() -> &'static str {
+        let start = DEFAULT_CONFIG
+            .find("\n[gateway]\n")
+            .expect("DEFAULT_CONFIG has a [gateway] section")
+            + 1;
+        let rest = &DEFAULT_CONFIG[start..];
+        let end = rest[1..]
+            .find("\n[")
+            .map(|offset| offset + 2)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// Uncomment the sample TOML lines of the `[gateway]` block, leaving the
+    /// prose comments alone, so a key added to the sample later is validated
+    /// too instead of being silently skipped.
+    fn uncommented_default_gateway_block() -> String {
+        default_config_gateway_block()
+            .lines()
+            .map(|line| {
+                let body = line.strip_prefix("# ").unwrap_or(line);
+                let key = body.split(" = ").next().unwrap_or_default();
+                let is_toml = !key.is_empty()
+                    && key.len() < body.len()
+                    && key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_');
+                if is_toml {
+                    body
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn default_config_gateway_block_parses_without_diagnostics() {
+        let block = uncommented_default_gateway_block();
+        assert!(
+            block.contains("\nbind = \"127.0.0.1:7788\""),
+            "sample keys should be uncommented:\n{block}"
+        );
+
+        let config: config::Config = toml::from_str(&block).expect("gateway sample is valid TOML");
+        assert_eq!(config.gateway.bind, "127.0.0.1:7788");
+        assert!(config.gateway.bind_addr().is_some());
+        assert_eq!(
+            config.gateway.allowed_origins,
+            vec!["https://gateway.tailnet-name.ts.net".to_string()]
+        );
+        assert_eq!(
+            config.gateway.public_url,
+            "https://gateway.tailnet-name.ts.net"
+        );
+        assert_eq!(config.gateway.auth_failure_limit, 5);
+        assert_eq!(config.gateway.auth_failure_window_secs, 60);
+        assert_eq!(config.gateway.pairing_ttl_secs, 600);
+        assert!(
+            config.gateway.diagnostics().is_empty(),
+            "{:?}",
+            config.gateway.diagnostics()
+        );
+    }
+
+    #[test]
+    fn default_config_gateway_block_is_commented_out() {
+        let block = default_config_gateway_block();
+        assert!(block.starts_with("[gateway]\n"), "{block}");
+        for line in block.lines().skip(1) {
+            assert!(
+                line.is_empty() || line.starts_with('#'),
+                "the [gateway] sample must stay commented out: {line}"
             );
         }
     }

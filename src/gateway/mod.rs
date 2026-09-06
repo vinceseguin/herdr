@@ -13,6 +13,10 @@
 //! Exit codes follow the fleet CLI's convention: 0 when help was printed,
 //! 2 for a usage error.
 
+mod auth;
+mod paths;
+mod policy;
+
 /// The invocation line, shared with `herdr --help` so the two never drift.
 pub(crate) const GATEWAY_COMMAND_LINE: &str = "herdr gateway [--bind ADDR] [--config PATH]";
 
