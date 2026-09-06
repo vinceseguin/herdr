@@ -48,11 +48,24 @@ pub struct HandshakeParams {
     pub surface_size: ClientSurfaceSize,
     pub pixel_mouse: bool,
     pub mouse_capture: bool,
+    /// Whether this client wants to be a host's *foreground* surface.
+    ///
+    /// Upstream #3670 added `EndpointClientHello.surface_active`. `false` tells
+    /// a host "read me out, but I am not looking at you": the server never
+    /// makes this endpoint the foreground client, so the host's pane geometry
+    /// is left exactly as it was. Snapshots still flow. See
+    /// [`crate::fleet::connector::INACTIVE_SURFACE`] for what a `true` client
+    /// costs the host.
+    pub surface_active: bool,
     pub read_timeout: Duration,
 }
 
 impl HandshakeParams {
     /// A read-only client at `surface_size`, with the local welcome deadline.
+    ///
+    /// Passive: `surface_active` is `false`, so a host running #3670 or later
+    /// keeps its own geometry while this client is connected. `surface_size`
+    /// is still announced, because a server that predates the field reads it.
     pub fn read_only(surface_size: ClientSurfaceSize) -> Self {
         Self {
             cell_width_px: 0,
@@ -60,6 +73,7 @@ impl HandshakeParams {
             surface_size,
             pixel_mouse: false,
             mouse_capture: false,
+            surface_active: false,
             read_timeout: LOCAL_HANDSHAKE_READ_TIMEOUT,
         }
     }
@@ -92,6 +106,10 @@ impl HandshakeParams {
             surface_size: crate::fleet::connector::INACTIVE_SURFACE,
             pixel_mouse,
             mouse_capture,
+            // A console *is* looking at whichever host is active, and the
+            // connector activates one; a foreground client is what makes the
+            // active host render at the console's geometry.
+            surface_active: true,
             read_timeout: LOCAL_HANDSHAKE_READ_TIMEOUT,
         }
     }
@@ -138,10 +156,10 @@ pub fn endpoint_handshake(
         endpoint_keybindings: false,
         mouse_capture: params.mouse_capture,
         // Upstream #3670: `false` lets a server drop this endpoint from surface
-        // interest. Kept `true` for now — the pre-sync behaviour, and what a
-        // generation-1 server that predates the field assumes; E3 may flip it
-        // for hosts with no active surface.
-        surface_active: true,
+        // interest, which is what makes a read-only consumer passive. A server
+        // that predates the field ignores it (the hello has no
+        // `deny_unknown_fields`) and treats every client as active.
+        surface_active: params.surface_active,
         snapshot_codecs: vec![SNAPSHOT_CODEC_V1.into()],
         surface_codecs: vec![SURFACE_CODEC_V1.into()],
         input_codecs: vec![INPUT_CODEC_V1.into()],
@@ -333,6 +351,19 @@ mod tests {
         assert_eq!(message, "another client owns this shell");
     }
 
+    /// The passivity switch, at the only two places it is decided.
+    ///
+    /// A read-only consumer (`herdr fleet status`, the gateway) must never
+    /// become a host's foreground client; a console must, because whichever
+    /// host is active renders into its terminal.
+    #[test]
+    fn only_a_console_hello_asks_to_be_the_foreground_client() {
+        let read_only = HandshakeParams::read_only(ClientSurfaceSize { cols: 20, rows: 5 });
+        assert!(!read_only.surface_active);
+        let console = HandshakeParams::for_client(9, 19, false, false);
+        assert!(console.surface_active);
+    }
+
     #[test]
     fn anything_but_an_endpoint_welcome_is_incompatible() {
         for message in [
@@ -412,6 +443,16 @@ mod socket_tests {
         let hello: EndpointClientHello = serde_json::from_str(&data).expect("hello decodes");
         assert_eq!(hello.generation, ENDPOINT_PROTOCOL_GENERATION);
         assert_eq!(hello.surface_size, ClientSurfaceSize { cols: 20, rows: 5 });
+        assert!(
+            !hello.surface_active,
+            "a read-only hello must be passive on the wire, not only in the params"
+        );
+        // The field is what a #3670 server reads; assert the JSON too, because
+        // a rename on either side would still pass the typed check above.
+        assert!(
+            data.contains("\"surface_active\":false"),
+            "the hello JSON must carry surface_active=false: {data}"
+        );
         assert!(!hello.direct_graphics);
         assert!(!hello.endpoint_keybindings);
         assert_eq!(hello.snapshot_codecs, vec![SNAPSHOT_CODEC_V1.to_string()]);
@@ -456,6 +497,10 @@ mod socket_tests {
         assert_eq!(hello.cell_height_px, 19);
         assert!(hello.pixel_mouse);
         assert!(hello.mouse_capture);
+        assert!(
+            hello.surface_active,
+            "a console is the foreground client of whichever host is active"
+        );
         assert_eq!(
             hello.surface_size,
             crate::fleet::connector::INACTIVE_SURFACE,

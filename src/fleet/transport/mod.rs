@@ -29,6 +29,16 @@ pub trait HostTransport: Send {
     fn read_timeout(&self) -> Duration;
     /// Operator-facing description, used in log fields and failure reasons.
     fn describe(&self) -> String;
+    /// The ssh policy this transport was built with, or `None` for a transport
+    /// that never runs ssh.
+    ///
+    /// Test-only: [`transport_for`] is the single place the daemon switch
+    /// reaches an ssh host, and a dropped argument there would hand a gateway
+    /// an interactive ssh child with no other symptom.
+    #[cfg(test)]
+    fn ssh_noninteractive_for_test(&self) -> Option<bool> {
+        None
+    }
 }
 
 /// Build the transport for one host spec.
@@ -49,6 +59,7 @@ pub fn transport_for(
             target.clone(),
             session.clone(),
             options.manage_ssh_config,
+            options.ssh_noninteractive,
         ))),
     }
 }
@@ -68,6 +79,14 @@ mod tests {
     }
 
     #[test]
+    fn a_local_transport_runs_no_ssh() {
+        let options = FleetConnectorOptions::default();
+        let transport = transport_for(&spec(HostKind::Local { session: None }), &options)
+            .expect("local transport");
+        assert_eq!(transport.ssh_noninteractive_for_test(), None);
+    }
+
+    #[test]
     fn local_hosts_get_a_local_transport() {
         let options = FleetConnectorOptions::default();
         let transport = transport_for(&spec(HostKind::Local { session: None }), &options)
@@ -77,6 +96,29 @@ mod tests {
             "unexpected description: {}",
             transport.describe()
         );
+    }
+
+    /// `transport_for` is the only place the daemon switch reaches an ssh
+    /// transport, so a dropped field here would silently give a gateway an
+    /// interactive ssh child.
+    #[test]
+    fn the_daemon_ssh_policy_reaches_the_transport() {
+        let spec = spec(HostKind::Ssh {
+            target: "workbox".to_string(),
+            session: None,
+        });
+        for noninteractive in [false, true] {
+            let options = FleetConnectorOptions {
+                ssh_noninteractive: noninteractive,
+                ..FleetConnectorOptions::default()
+            };
+            let transport = transport_for(&spec, &options).expect("ssh transport");
+            assert_eq!(
+                transport.ssh_noninteractive_for_test(),
+                Some(noninteractive),
+                "the daemon ssh policy did not reach the transport"
+            );
+        }
     }
 
     #[test]

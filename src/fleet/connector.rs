@@ -54,17 +54,20 @@ use crate::protocol::{
 /// (`server::headless`'s `ClientShellConnected` arm), and the foreground
 /// client's surface is the host's effective geometry. A 20x5 fleet client
 /// therefore reflowed every pane on every configured host and sent each agent
-/// a 20x5 SIGWINCH — for a read-only `herdr fleet status`. The endpoint
-/// protocol has no observer mode and E1 changes no server code, so the fix is
-/// the value: herdr's own default headless geometry, which a host with no
-/// attached client is *already* using, making the common fleet case (headless
-/// servers running agents) a no-op resize.
+/// a 20x5 SIGWINCH — for a read-only `herdr fleet status`. E1 changes no
+/// server code, so the value was the fix: herdr's own default headless
+/// geometry, which a host with no attached client is *already* using, making
+/// the common fleet case (headless servers running agents) a no-op resize.
 ///
-/// The residual is unavoidable without a protocol change: a host that already
-/// has an attached client, or one whose `headless_size` is configured
-/// differently, is resized for as long as the fleet client is connected and
-/// restored when it disconnects. E2 should keep a fleet connection open only
-/// while the fleet console is in use.
+/// Since upstream #3670 the size is no longer the whole story.
+/// [`HandshakeParams::read_only`] announces `surface_active: false`, and a
+/// server carrying that field never makes such a client the foreground one —
+/// so a read-only consumer (`herdr fleet status`, the gateway) changes no
+/// host's geometry at all, whatever this constant says. The value still
+/// matters for two callers: a server *older* than #3670, which ignores the
+/// field and sizes itself by the hello, and [`HandshakeParams::for_client`],
+/// whose console genuinely is a foreground client for whichever host is
+/// active.
 ///
 /// The cost decision (e) was protecting is still paid where it matters: this
 /// client drops an inactive host's frames in the reader thread before anything
@@ -135,6 +138,15 @@ pub struct FleetConnectorOptions {
     /// `manage_ssh_config`): keepalive fallbacks and a private control master,
     /// exactly as `herdr --remote` uses them.
     pub manage_ssh_config: bool,
+    /// Whether ssh transports run their per-connection `ssh` child
+    /// noninteractively: `BatchMode=yes`, no password prompts, a bounded
+    /// connect, and **stderr discarded** rather than inherited.
+    ///
+    /// `false` is `herdr --remote`'s behaviour and what a CLI wants — ssh's own
+    /// warnings reach the operator's terminal. A daemon or a full-screen
+    /// consumer has no terminal to prompt on and no place to paint an ssh
+    /// warning, so it sets `true`; see [`FleetConnectorOptions::for_daemon`].
+    pub ssh_noninteractive: bool,
     /// Largest endpoint frame accepted from a host.
     pub max_frame_size: usize,
     /// How long one endpoint request may wait for its answer before it is
@@ -152,6 +164,25 @@ impl FleetConnectorOptions {
         Self {
             manage_ssh_config: config.remote.manage_ssh_config,
             ..Self::default()
+        }
+    }
+
+    /// Read-only options for a daemon with no controlling terminal.
+    ///
+    /// Everything [`Self::for_config`] decides, plus noninteractive ssh: a
+    /// gateway cannot answer a password prompt, and `bridge_connection` sends
+    /// the ssh child's stderr to `/dev/null` instead of inheriting the
+    /// daemon's. The handshake stays [`HandshakeParams::read_only`], so every
+    /// host sees a passive client.
+    // The gateway is this constructor's only production caller, and it is
+    // compiled out by `--no-default-features`. The allow is therefore scoped to
+    // exactly that build rather than being unconditional, so a future default
+    // build that stops calling it still fails the lint.
+    #[cfg_attr(not(feature = "gateway"), allow(dead_code))]
+    pub fn for_daemon(config: &crate::config::Config) -> Self {
+        Self {
+            ssh_noninteractive: true,
+            ..Self::for_config(config)
         }
     }
 
@@ -183,6 +214,7 @@ impl Default for FleetConnectorOptions {
             handshake: HandshakeParams::read_only(INACTIVE_SURFACE),
             active: ActiveGeometry::default(),
             manage_ssh_config: false,
+            ssh_noninteractive: false,
             max_frame_size: MAX_FRAME_SIZE,
             endpoint_timeout: ENDPOINT_REQUEST_TIMEOUT,
         }
@@ -1836,6 +1868,39 @@ mod tests {
     use crate::fleet::hosts::HostKind;
     use crate::fleet::state::{FleetState, HostConnection};
     use crate::fleet::transport::LocalTransport;
+
+    /// The daemon options: passive hello, batch-mode ssh, everything else as
+    /// `for_config` decided.
+    #[test]
+    fn the_daemon_options_are_passive_and_noninteractive() {
+        let config: crate::config::Config =
+            toml::from_str("[remote]\nmanage_ssh_config = false\n").expect("config parses");
+        let daemon = FleetConnectorOptions::for_daemon(&config);
+        assert!(daemon.ssh_noninteractive);
+        assert!(!daemon.handshake.surface_active);
+        assert_eq!(daemon.handshake.surface_size, INACTIVE_SURFACE);
+        assert_eq!(daemon.manage_ssh_config, config.remote.manage_ssh_config);
+        assert_eq!(daemon.max_frame_size, MAX_FRAME_SIZE);
+
+        // Nothing but the ssh policy separates it from `for_config`.
+        let cli = FleetConnectorOptions::for_config(&config);
+        assert!(!cli.ssh_noninteractive);
+        assert_eq!(
+            FleetConnectorOptions {
+                ssh_noninteractive: false,
+                ..daemon
+            }
+            .handshake,
+            cli.handshake
+        );
+    }
+
+    /// The interactive default is what a CLI gets: `herdr fleet status` keeps
+    /// ssh's own prompts and error output.
+    #[test]
+    fn ssh_is_interactive_by_default() {
+        assert!(!FleetConnectorOptions::default().ssh_noninteractive);
+    }
 
     fn endpoint_requests(messages: &[ClientMessage]) -> Vec<(String, String)> {
         messages

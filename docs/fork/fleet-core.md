@@ -504,13 +504,24 @@ name carries the pid, so nothing collides) and the `ControlPersist` master stays
 up until it times out. A long-running consumer (the gateway, E3) must call
 `shutdown` on exit.
 
-### The ssh child inherits stderr
+### Interactive vs. noninteractive ssh
 
-`bridge_connection` spawns `ssh` with `stderr` inherited, exactly as
-`herdr --remote` does. In a CLI that is what you want — ssh's own errors reach
-your terminal. **A full-screen or daemon consumer (the gateway, E3) must
-redirect it**, or an ssh
-warning will be painted straight over the TUI.
+`FleetConnectorOptions::ssh_noninteractive` picks the ssh policy for every
+bridged connection, and `transport_for` hands it to `SshTransport`.
+
+- **`false` (the default, `for_config`)** — `bridge_connection` spawns `ssh`
+  with `stderr` **inherited** and no forced options, exactly as
+  `herdr --remote` does. In a CLI that is what you want: ssh's own errors reach
+  your terminal and its auth flow can prompt.
+- **`true` (`for_daemon`)** — `BatchMode=yes`, `NumberOfPasswordPrompts=0`,
+  `StrictHostKeyChecking=yes`, a bounded connect and keepalives, with the ssh
+  child's `stderr` on `/dev/null`. This is what a gateway or any other daemon
+  must use: it has no terminal to prompt on, and an inherited ssh warning would
+  otherwise go to the daemon's own stderr.
+
+A full-screen consumer is in the same position as a daemon — an ssh warning on
+the inherited stderr is painted straight over the TUI — so it uses
+`ssh_noninteractive: true` as well.
 
 ## Reconnecting
 
@@ -543,18 +554,32 @@ By design (plan decision (f), ADR 0001), the fleet connector:
 - never turns one host's failure into a fleet-wide failure, and never calls
   `std::process::exit` or panics because of what a host said.
 
-One caveat that is **not** a no-op, and that every consumer must respect: a connecting
-client shell becomes that host's *foreground* client, and the foreground
-client's surface size is the host's effective pane geometry. The fleet
+It also never changes a host's pane geometry — as of E3. `HandshakeParams` has
+a `surface_active` flag, written straight into the generation-1
+`endpoint.hello.v1`:
+
+- `HandshakeParams::read_only` (`herdr fleet status`, the gateway) sends
+  **`surface_active: false`**. Upstream #3670 taught the server to leave such an
+  endpoint out of foreground selection: it is never made the host's foreground
+  client, its `ClientResize` is ignored, and it claims no shell-tab geometry —
+  while snapshots keep flowing. A read-only consumer is therefore genuinely
+  passive, and may hold its connections for as long as it likes.
+- `HandshakeParams::for_client` (a full-screen console) sends
+  **`surface_active: true`**, because whichever host is active really is
+  rendering into that terminal.
+
+One residual: a host running a herdr **older than #3670** has no
+`surface_active` field to read (the hello has no `deny_unknown_fields`, so it
+ignores it) and still treats every connecting client shell as its foreground
+client, whose surface size is the host's effective pane geometry. The fleet
 handshakes inactive hosts at herdr's own default headless geometry
 (`DEFAULT_HEADLESS_COLS` × `DEFAULT_HEADLESS_ROWS`), so the common case — a
-headless server running agents — is a no-op resize. A host that already has an
-attached client, or a `[server]` `headless_cols`/`headless_rows` of its own, is
-still resized while the fleet client is connected and restored when it
-disconnects. **A consumer should
-therefore hold fleet connections only while something is reading them.** A
-truly passive reader needs an endpoint observer capability, which is a server
-change and out of scope here.
+headless server running agents — is still a no-op resize there; a pre-#3670
+host that already has an attached client, or a `[server]`
+`headless_cols`/`headless_rows` of its own, is resized while the fleet client is
+connected and restored when it disconnects. **Against such a host, hold fleet
+connections only while something is reading them.** This is documented, not
+worked around: the fix is on the host, which needs no fork code.
 
 ## For developers
 
@@ -605,7 +630,8 @@ Known gaps a consumer with an active host owns:
   of the active host re-handshakes with the size the connector was built with,
   not the last size sent through `HostCommand::Resize`. Add a setter (or have
   the connector remember the last active resize) when a consumer needs it.
-- The ssh child's stderr is inherited (see above) — redirect it.
+- The ssh child's stderr is inherited unless `ssh_noninteractive` is set (see
+  above) — a daemon or a TUI must set it.
 - On unix, `SshStdioBridge::drop` joins its accept thread, and each bridged
   connection waits for its `ssh` child without killing it, so **dropping an ssh
   transport while a bridged stream is still open blocks until that child
@@ -617,11 +643,24 @@ Known gaps a consumer with an active host owns:
 ### Driving the connector (E3)
 
 ```text
-FleetConnector::start(specs, options)   // no active host
+FleetConnector::start(specs, FleetConnectorOptions::for_daemon(config))
+  → set_active(None)                    // no active host, no geometry claimed
+  → take_events()                       // the merged receiver, owned by one task
   → apply every FleetEvent::Host to FleetState::apply
   → broadcast the returned FleetChange values over /api/events
   → serve FleetStatusReport (herdr.fleet.status.v1) on /api/fleet
 ```
+
+`FleetConnectorOptions::for_daemon` is the constructor a headless consumer
+wants: everything `for_config` decides, plus `ssh_noninteractive: true`. Its
+handshake is `read_only`, so every host sees `surface_active: false`.
+
+`take_events()` hands the receiver to the caller by value, which is what a
+`select!` loop needs while it still calls `send` on the connector. The caller
+then owns closing it: **drop the receiver before calling
+`FleetConnector::shutdown`**, or a supervisor parked on a full channel can only
+exit once the shutdown wait has elapsed. `src/gateway/fleet.rs` does exactly
+that — stop the fold task, then join the supervisors on a blocking thread.
 
 Terminal streaming uses the per-host observe/control path, not this connector's
 surfaces. `FleetStatusReport` and `FleetChange` are append-only: new fields are

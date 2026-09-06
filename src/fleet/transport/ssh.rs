@@ -42,6 +42,10 @@ pub struct SshTransport {
     target: String,
     session_name: String,
     manage_ssh_config: bool,
+    /// Whether the per-connection `ssh` child runs in batch mode with its
+    /// stderr discarded. Read on every bridge start, not only the first: a
+    /// retired session rebuilds the bridge with the same policy.
+    noninteractive: bool,
     /// Declared before `ssh` on purpose, and torn down first in [`Drop`]: the
     /// bridge's ssh children ride the control master that dropping `ssh`
     /// closes.
@@ -57,11 +61,19 @@ pub struct SshTransport {
 }
 
 impl SshTransport {
+    /// A transport for one ssh host.
+    ///
+    /// `noninteractive` picks the ssh policy for every bridged connection:
+    /// `false` is `herdr --remote`'s interactive path (the operator's own auth
+    /// flow, ssh's errors on the inherited stderr), `true` is the daemon path
+    /// (`BatchMode=yes`, no password prompts, stderr discarded). See
+    /// [`crate::fleet::connector::FleetConnectorOptions::ssh_noninteractive`].
     pub fn new(
         host: HostId,
         target: String,
         session: Option<String>,
         manage_ssh_config: bool,
+        noninteractive: bool,
     ) -> Self {
         let session_name =
             session.unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
@@ -73,6 +85,7 @@ impl SshTransport {
             target,
             session_name,
             manage_ssh_config,
+            noninteractive,
             bridge: None,
             ssh: None,
             herdr: None,
@@ -172,9 +185,11 @@ impl SshTransport {
             local_socket,
             session_name,
             options.as_ref(),
-            // Interactive ssh, as `herdr --remote` uses: the managed ssh
-            // config, control master and the user's own auth flow.
-            false,
+            // Interactive ssh (`false`) is what `herdr --remote` uses: the
+            // managed ssh config, the control master and the user's own auth
+            // flow, with ssh's errors on the inherited stderr. A daemon flips
+            // this to batch mode and sends that stderr to /dev/null.
+            self.noninteractive,
             sink,
         )?;
         self.bridge = Some(bridge);
@@ -224,6 +239,11 @@ impl HostTransport for SshTransport {
 
     fn describe(&self) -> String {
         format!("ssh {} (session {})", self.target, self.session_name)
+    }
+
+    #[cfg(test)]
+    fn ssh_noninteractive_for_test(&self) -> Option<bool> {
+        Some(self.noninteractive)
     }
 }
 
@@ -482,6 +502,15 @@ mod tests {
     }
 
     fn ssh_transport(host_id: &str, target: &str, session: Option<&str>) -> SshTransport {
+        ssh_transport_with(host_id, target, session, false)
+    }
+
+    fn ssh_transport_with(
+        host_id: &str,
+        target: &str,
+        session: Option<&str>,
+        noninteractive: bool,
+    ) -> SshTransport {
         SshTransport::new(
             host(host_id),
             target.to_string(),
@@ -490,6 +519,7 @@ mod tests {
             // running user's `~/.ssh/config` into a managed config and would
             // start a control master against the shim.
             false,
+            noninteractive,
         )
     }
 
@@ -617,6 +647,84 @@ mod tests {
                 "the fleet transport must never {forbidden}; trace: {trace}"
             );
         }
+    }
+
+    /// The daemon switch reaches the real `ssh` argv.
+    ///
+    /// A gateway cannot answer a password prompt and has no terminal for ssh
+    /// to warn on, so `bridge_connection` must run the child with
+    /// `BatchMode=yes` (and, out of the shim's reach, `stderr` on /dev/null).
+    /// The shim traces argv, so this asserts the flag on the wire rather than
+    /// on the field that was set.
+    #[test]
+    fn a_noninteractive_transport_runs_ssh_in_batch_mode() {
+        let _guard = ssh_env_lock().lock().expect("ssh env lock");
+        let endpoint = FakeEndpoint::start("bridge-batch");
+        let shim = FakeSsh::install(
+            "bridge-batch",
+            Some(1),
+            Bridge::ProxyTo(endpoint.socket.clone()),
+        );
+
+        let mut transport = ssh_transport_with("lab-ssh", "herdr-ssh-lab", Some("lab-1"), true);
+        let _stream = transport.connect().expect("connect through the bridge");
+        assert!(
+            wait_until(Duration::from_secs(10), || shim
+                .trace()
+                .contains("remote-client-bridge")),
+            "the bridge command never ran; trace: {}",
+            shim.trace()
+        );
+
+        let trace = shim.trace();
+        let bridge = bridge_argv_lines(&trace);
+        assert_eq!(bridge.len(), 1, "trace: {trace}");
+        for option in [
+            "-o BatchMode=yes",
+            "-o NumberOfPasswordPrompts=0",
+            "-o ConnectTimeout=10",
+        ] {
+            assert!(
+                bridge[0].contains(option),
+                "a daemon transport must run ssh with {option}; trace: {trace}"
+            );
+        }
+        // The remote command itself is untouched: only the local ssh policy
+        // changes, so a batch-mode host runs exactly what an interactive one
+        // runs.
+        assert!(
+            bridge[0].ends_with(&expected_bridge_argv("herdr-ssh-lab", "lab-1")["ARGV ".len()..]),
+            "trace: {trace}"
+        );
+    }
+
+    /// The default is still `herdr --remote`'s interactive ssh, so a CLI keeps
+    /// the operator's auth flow and ssh's own error output.
+    #[test]
+    fn an_interactive_transport_does_not_add_batch_mode() {
+        let _guard = ssh_env_lock().lock().expect("ssh env lock");
+        let endpoint = FakeEndpoint::start("bridge-interactive");
+        let shim = FakeSsh::install(
+            "bridge-interactive",
+            Some(1),
+            Bridge::ProxyTo(endpoint.socket.clone()),
+        );
+
+        let mut transport = ssh_transport_with("lab-ssh", "herdr-ssh-lab", Some("lab-1"), false);
+        let _stream = transport.connect().expect("connect through the bridge");
+        assert!(
+            wait_until(Duration::from_secs(10), || shim
+                .trace()
+                .contains("remote-client-bridge")),
+            "the bridge command never ran; trace: {}",
+            shim.trace()
+        );
+
+        let trace = shim.trace();
+        assert!(
+            !trace.contains("BatchMode"),
+            "an interactive transport must not force batch mode; trace: {trace}"
+        );
     }
 
     #[test]
