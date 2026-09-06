@@ -668,7 +668,7 @@ exactly these E1 contracts (verified in the code):
 | 1 | chore: add gateway cargo feature with axum, qrcode and token dependencies | A · Foundations | — | ✅ |
 | 2 | feat(gateway): gateway config section, token store, bind and origin policy | A · Foundations | 1 | ✅ |
 | 3 | feat(gateway): passive async fleet runtime folding connector events into shared state | A · Foundations | 1 | ✅ |
-| 4 | feat(gateway): herdr gateway serves health, fleet report and embedded assets over http | B · HTTP | 2, 3 | ⬜ |
+| 4 | feat(gateway): herdr gateway serves health, fleet report and embedded assets over http | B · HTTP | 2, 3 | ✅ |
 | 5 | feat(gateway): websocket fleet event stream | C · Streams | 4 | ⬜ |
 | 6 | feat(gateway): websocket terminal observe stream over per-host transports | C · Streams | 4 | ⬜ |
 | 7 | feat(gateway): terminal control mode gated by the control scope | C · Streams | 6 | ⬜ |
@@ -1711,7 +1711,194 @@ modes, the `stty size` line, the exit lines. Paste no token.
 - The runtime marker `gateway.json` is what `herdr gateway status` (PR 8),
   the systemd unit's docs and E5 read.
 
+**Landed** (merged; gate `EXIT=0` for both `ci` and `ci-no-default`)
+
+- **The exact shapes PRs 5–8 extend.** `src/gateway/server.rs`:
+
+  ```rust
+  #[derive(Clone)]
+  pub(crate) struct AppState {
+      pub(crate) fleet: FleetHandle,          // PR 3's handle, cloned per request
+      pub(crate) auth: Arc<AuthState>,
+      pub(crate) info: Arc<GatewayInfo>,
+  }
+  pub(crate) struct AuthState {
+      pub(crate) tokens: TokenStore,          // immutable for the process, see below
+      pub(crate) devices: Mutex<DeviceStore>,
+      pub(crate) limiter: Mutex<AuthLimiter>,
+      pub(crate) origins: OriginAllowlist,
+      pub(crate) devices_persisted_at: Mutex<Option<Instant>>,
+  }
+  pub(crate) struct GatewayInfo {
+      pub(crate) client_version: String,
+      pub(crate) loopback: bool,
+      pub(crate) public_url: String,          // added; `/api/gateway` carries it
+      pub(crate) features: Vec<&'static str>, // `GatewayInfo::features()` is the one place to append
+  }
+  pub(crate) fn router(state: AppState) -> Router {
+      Router::new()
+          .merge(http::routes())              // ← every later PR adds `.merge(<area>::routes())` here
+          .fallback(assets::serve)
+          .layer(axum::middleware::from_fn_with_state(state.clone(), middleware::authenticate))
+          .layer(DefaultBodyLimit::max(64 * 1024))
+          .with_state(state)
+  }
+  pub(crate) async fn serve<F>(listener: TcpListener, state: AppState, shutdown: F) -> io::Result<()>
+  pub(crate) fn shutdown_signal() -> impl Future<Output = ()> + Send + 'static   // NOT async: see below
+  ```
+
+  **The merge convention:** each area module `src/gateway/<area>.rs` exposes
+  `pub(crate) fn routes() -> Router<AppState>` and `router()` merges it — PR 5
+  `events::routes()`, PR 6/7 `terminal::routes()`, PR 8 `pairing::routes()`.
+  A route added that way inherits the auth layer and the body limit; a route
+  added anywhere else does not, so do not add one anywhere else.
+- **`Authed` is the route-level gate, and it is unforgeable.**
+  `src/gateway/middleware.rs`: `pub(crate) struct Authed(pub(crate) Principal)`
+  with a `FromRequestParts` impl that only reads a request *extension* the
+  middleware inserted (a client cannot set an extension), rejecting with
+  `401` otherwise. **Every `/api/*` handler takes `Authed`**, so a handler that
+  forgets authentication does not compile. `pub(crate) fn require(&Principal,
+  TokenScope) -> Result<(), ApiError>` is the scope half and is called
+  explicitly by *both* PR 4 routes with `TokenScope::Read`, even though read is
+  the weakest scope: a route must state what it needs rather than inherit it.
+  PR 7 must still re-check the scope inside the terminal state machine — a
+  handshake-time `require` cannot police what a long-lived socket does later.
+- **`ApiError`** (`src/gateway/http.rs`) is the one error shape:
+  `{"error":"<snake_case_code>"}` plus optional `message` and (for `forbidden`)
+  `needed`. Constructors: `unauthorized()` (401, adds `WWW-Authenticate:
+  Bearer`), `forbidden(scope)` (403 + `needed`), `origin_not_allowed()` (403),
+  `too_many_requests(Duration)` (429 + `Retry-After`, floored at 1 s),
+  `not_found()` (404), `new(status, code)`, `.with_message(…)`, `.code()`,
+  `.status()`. Every JSON answer carries `Content-Type: application/json`,
+  `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`; no `Server`
+  header is sent.
+- **The middleware order, and one deliberate rule.** Origin → public paths →
+  rate limit → credential. An **origin refusal does not record a limiter
+  failure**: a hostile page can make a browser send a request but cannot read
+  the answer, so counting it would let any web site lock the operator out of
+  their own gateway. Public = `/health` plus any `GET`/`HEAD` outside `/api/`
+  (which is how PR 8's `/pair` page is reachable without a special case);
+  `/api` and `/api/…` always need a principal, and so does any non-`GET`
+  method. Bearer is consulted before the `herdr_gateway_device` cookie and a
+  bad bearer is never upgraded by a cookie. A query-string token is ignored.
+- **`shutdown_signal()` is a plain `fn` returning a future, and `run.rs` calls
+  it *before* it prints `listening on …`.** Registering `SIGINT`/`SIGTERM`
+  lazily on first poll loses a race that is easy to hit: a supervisor (or
+  `tests/support/gateway.rs`) that stops the process the instant it reads that
+  line otherwise hits the default disposition and the gateway is killed instead
+  of drained. This cost two failing integration tests before it was found; do
+  not turn it back into an `async fn`.
+- **Logging goes to stderr, not to a file.** `crate::logging::init_file_logging`
+  defaults its filter to `herdr=info`, which silently drops every
+  `target: "gateway"` event the epic mandates. `run.rs::init_gateway_logging`
+  builds a `tracing_subscriber` on stderr with `HERDR_LOG` or
+  `herdr=info,gateway=info` — and stderr is what a supervisor collects from a
+  foreground daemon anyway. PR 10's systemd unit documents `HERDR_LOG`.
+- **`tests/support/gateway.rs`** (`pub mod gateway;` in `tests/support/mod.rs`)
+  is the fixture for every later integration test:
+  `GatewayEnv { config_home, runtime_dir }` with `for_lab(&Lab)`, `config_dir()`,
+  `gateway_dir()`, `command()`, `append_config(&str)`, `run_gateway(&[&str])`
+  (to completion, for refusal paths); `fleet_config(&[String])`;
+  `Gateway::spawn(&Lab, extra_config)` and `Gateway::spawn_in(GatewayEnv)`
+  (both `--bind 127.0.0.1:0`, both parse the `listening on http://…` line);
+  `read_token()`, `control_token()`, `authorization()`,
+  `control_authorization()`, `http_get(path, &[(name, value)]) -> HttpResponse
+  { status, headers, body, header(name), json() }`, `stop() -> Option<i32>`
+  (SIGTERM + bounded wait), `Drop` (SIGTERM). Add helpers; never rename one.
+  **A test must never run a bare `herdr gateway`** — it now starts a real
+  server on the configured port. PR 1's
+  `gateway_without_a_subcommand_is_a_usage_error` was renamed to
+  `gateway_with_an_unknown_option_is_a_usage_error` for exactly that reason.
+- **Deviation 1 — `#[allow(dead_code)]` stays on `mod fleet;`.** The plan told
+  PR 4 to delete it. PR 4 consumes `FleetRuntime::{start, handle, shutdown}` and
+  `FleetHandle::report`, but `ChangeStream`, `ChangeItem`,
+  `subscribe_with_report`, `host_connection`, `host_spec` and the module's own
+  `wait_for` test helper are still unreached, and narrowing them means editing
+  `src/gateway/fleet.rs`, which PR 9 held open concurrently. The allow now
+  carries a comment naming PR 5 and PR 6; **PR 6 removes it** (PR 5 should
+  narrow the comment to PR 6's items).
+- **Deviation 2 — the dead-code allows in `auth.rs`/`policy.rs`/`paths.rs` are
+  now per item**, each naming PR 8: `TokenScope::all`, `TokenDigest::to_hex`,
+  `TokenStore::{load, rotate, digest}`, `DeviceStore::{devices, insert,
+  revoke_scope, revoke_id}`, `sanitize_label`, `PairingCode`/`PairingError`/
+  `PairingStore` and their helpers, `AuthLimiter::tracked_peers`,
+  `paths::{PAIRINGS_DIR, pairings_dir, verify_private_file}`,
+  `OriginAllowlist::{origins, requires_secure_cookies}`, and in `http.rs`
+  `ApiError::{with_message, code, status}`. The three module-level
+  `#![allow(dead_code)]` lines are gone. `src/config/model.rs`'s
+  `effective_*`/`DEFAULT_GATEWAY_BIND_ADDR` allows stay: those items are still
+  test-only in a `--no-default-features` build, where the gateway does not
+  exist.
+- **What PR 6 needs that PR 4 does not provide.** `AppState` has **no**
+  `Config`: `run.rs` keeps the config on the stack and hands the pieces
+  (`GatewayConfig`) to `AuthState`/`GatewayInfo`. `FleetConnectorOptions::
+  for_daemon(&Config)` therefore has nothing to read from a handler. PR 6 must
+  add `config: Arc<Config>` to `AppState` and build it as `Arc::new(config)` in
+  `run()` (`Config` is **not** `Clone`, so `serve_until_signal` currently takes
+  `&Config`).
+- **What PR 8 needs that PR 4 does not provide.** PR 8's spec says
+  `rotate-token` takes effect "on the next request, no restart needed".
+  `AuthState.tokens` is a plain `TokenStore` fixed at startup (PR 2 deliberately
+  shipped no `loaded_at` file stamp), so that is **not** true today. PR 8 must
+  either wrap it (`Mutex<TokenStore>` plus a stamp check, or a reload on a
+  `SIGHUP`) or change its own contract to "restart to apply". The device store
+  is already `Mutex<DeviceStore>` and is reloadable in place; the middleware
+  touches `last_seen` in memory and persists it at most once a minute, on
+  `spawn_blocking`.
+- **Runtime marker.** `<config>/gateway/gateway.json` is `0600` and holds
+  `{pid, listen, started_unix}` with `listen` the **bound** address (so a
+  `--bind …:0` records its real port). It is written before the address is
+  printed and removed on a clean stop; a crash leaves it behind, which is
+  PR 8's `status` to interpret (it must check that the pid is alive).
+- **`/api/gateway` carries one field the plan did not list**, `public_url`
+  (empty unless `[gateway] public_url` is set), so a client can tell what
+  origin the operator advertises. `features` is `["fleet"]`; append through
+  `GatewayInfo::features()`.
+- **Reference notes for PR 10.** Routes: `GET /health` (unauthenticated,
+  `{"ok":true}`), `GET /api/gateway`, `GET /api/fleet` (both `read` scope), and
+  the embedded app at every other `GET`/`HEAD` path (extension-less paths fall
+  back to `index.html`; an unknown extension is `404`; an unknown `/api/*` path
+  answers JSON `not_found`, never HTML). Error codes so far: `unauthorized`,
+  `forbidden` (+`needed`), `origin_not_allowed`, `too_many_requests`
+  (+`Retry-After`), `not_found`, `method_not_allowed`, `internal_error`.
+  Exit codes: 0 clean stop or help, 1 refusal to start, 2 usage.
+  Env: `HERDR_LOG` (default `herdr=info,gateway=info`), `HERDR_CONFIG_PATH`
+  (what `--config` sets). Files: `<config>/gateway/{read.token,control.token,
+  gateway.json}` — note `<config>` follows `XDG_CONFIG_HOME`, **not**
+  `--config`, because `config_dir()` and `config_path()` are separate in
+  herdr; say so in `docs/fork/gateway.md`.
+- **Real-server evidence recorded** (fleet lab, 2 sessions, gateway on
+  `127.0.0.1:7788`): `/health` 200 `{"ok":true}`; `/api/fleet` 401
+  `{"error":"unauthorized"}` bare and 200 with the read token, body
+  `herdr.fleet.status.v1` with `[('lab-1','connected',['lab-1']),
+  ('lab-2','connected',['lab-2'])]` and `agents == []`; `/api/gateway`
+  `{"client_version":"0.8.2-fork","features":["fleet"],"loopback":true,
+  "public_url":"","schema":"herdr.gateway.info.v1","scope":"read"}`; a foreign
+  `Origin` 403 and the gateway's own 200; `/` and `/settings` 200 `text/html`,
+  `/nope.png` 404; five failed authentications then 429 with
+  `Retry-After: 59` while `/health` stayed 200; `drwx------` on the gateway
+  directory and `-rw-------` on all three files; a **fresh** lab pane still
+  reported `40 120` from `stty size` with the gateway attached (passive);
+  stopping `lab-2` moved it to `unavailable` (`reason: server is shutting
+  down`) while `lab-1` stayed `connected` and `/api/fleet` still answered 200;
+  `SIGTERM` exited 0 and removed `gateway.json`; `--bind 0.0.0.0:7788` exited 1
+  naming `allowed_origins`. **Note for later PRs:** the rate-limit probe blocks
+  the loopback peer for the rest of the window, so run it *last* or from a
+  second gateway — the first validation pass had to be repeated because every
+  later request answered 429.
+
 ### PR 5 — feat(gateway): websocket fleet event stream · deps: 4
+
+> **From PR 4 (landed):** add the route as `pub(crate) fn routes() ->
+> Router<AppState>` in `src/gateway/events.rs` and `.merge(events::routes())`
+> in `server::router` — that is the only place a route inherits the auth layer
+> and the 64 KiB body limit. The handler takes `Authed(principal)` (unforgeable:
+> it reads a request extension the middleware inserted) and calls
+> `middleware::require(&principal, TokenScope::Read)` explicitly. Append
+> `"events"` inside `GatewayInfo::features()`, not at a call site. Errors are
+> `http::ApiError`. Narrow `src/gateway/mod.rs`'s `#[allow(dead_code)]` on
+> `mod fleet;` to name only PR 6's items once `ChangeStream`/`ChangeItem`/
+> `subscribe_with_report` are live.
 
 > **From PR 3 (landed):** use `FleetHandle::subscribe_with_report()` — the
 > report-less `subscribe()` is private, because a subscriber with no starting
@@ -1821,6 +2008,17 @@ Evidence: the message lines (with `reason` text), the two exit codes.
   and epic; add flags, never change the output line format.
 
 ### PR 6 — feat(gateway): websocket terminal observe stream over per-host transports · deps: 4
+
+> **From PR 4 (landed):** `AppState` carries **no** `Config`, so
+> `FleetConnectorOptions::for_daemon(&Config)` has nothing to read from a
+> handler — add `config: Arc<Config>` to `AppState` and build it with
+> `Arc::new(config)` in `run::run` (`Config` is not `Clone`;
+> `serve_until_signal` takes `&Config` today). Register the route through
+> `terminal::routes()` + `.merge(…)` and take `Authed`; append `"terminal"` in
+> `GatewayInfo::features()`. **Delete** `src/gateway/mod.rs`'s
+> `#[allow(dead_code)]` on `mod fleet;` in this PR: PR 6 is the last consumer
+> of `host_connection`/`host_spec`, and it was left in place only because PR 4
+> ran concurrently with PR 9 in that file.
 
 > **From PR 3 (landed):** `FleetHandle::host_connection(&HostId)` and
 > `host_spec(&HostId)` are the fail-fast pair — `None` means the host is not
@@ -2107,6 +2305,23 @@ Evidence: the pane greps (lab-1 ≥ 1, lab-2 0), the `forbidden`/`busy`/
   "take over" on `busy` and a banner on `taken_over`.
 
 ### PR 8 — feat(gateway): pairing urls with qr codes, device cookies, status and token rotation · deps: 4
+
+> **From PR 4 (landed):** `AuthState.tokens` is a plain `TokenStore` fixed at
+> startup, so "`rotate-token` takes effect on the next request, no restart
+> needed" is **not** true as shipped — make it a reloadable holder (a
+> `Mutex<TokenStore>` plus the file stamp PR 2 deliberately omitted) or change
+> this PR's contract to "restart to apply", and say which in the docs.
+> `AuthState.devices` is already `Mutex<DeviceStore>` and the middleware
+> touches `last_seen` in memory, persisting at most once a minute on
+> `spawn_blocking` — `revoke_scope` on that same mutex takes effect at once.
+> `/pair` needs no new public-path rule: any `GET`/`HEAD` outside `/api/` is
+> already unauthenticated. When minting the cookie, `SameSite=Strict` is what
+> stops a cross-site request that carries it, because PR 4's origin check
+> passes a request with **no** `Origin` header. `OriginAllowlist::
+> requires_secure_cookies` and `paths::{pairings_dir, verify_private_file}`
+> carry `#[allow(dead_code)]` attributes naming this PR; remove them as you
+> consume each one. `gateway.json` can be stale after a crash, so `status`
+> must check that its `pid` is alive before reporting "running".
 
 **Goal:** the operator's loop: `herdr gateway pair [--control] [--ttl-secs
 N]` prints a one-time pairing URL and a terminal QR code; opening it on the
