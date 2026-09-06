@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 
 /// Driver for `scripts/fork/fleet-lab.sh`, shared by the fork lab tests.
 pub mod fleet_lab;
+/// A Fleet console under a PTY, shared by the fork TUI tests.
+#[cfg(unix)]
+pub mod fleet_tui;
 
 static PID_REGISTRY: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 static RUNTIME_DIR_REGISTRY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();

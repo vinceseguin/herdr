@@ -113,7 +113,12 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "status" => status::run_status_command(&args[2..])?,
         "completion" | "completions" => completion::run_completion_command(&args[2..])?,
         "config" => run_config_command(&args[2..])?,
-        "fleet" => fleet::run_fleet_command(&args[2..])?,
+        "fleet" => {
+            let Some(exit_code) = fleet::run_fleet_command(&args[2..])? else {
+                return Ok(CommandOutcome::NotCli);
+            };
+            exit_code
+        }
         "channel" => run_channel_command(&args[2..])?,
         "workspace" => workspace::run_workspace_command(&args[2..])?,
         "worktree" => worktree::run_worktree_command(&args[2..])?,
