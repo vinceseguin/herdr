@@ -23,6 +23,8 @@ mod copy_mode;
 mod detect;
 mod events;
 mod fleet;
+#[cfg(feature = "gateway")]
+mod gateway;
 mod ghostty;
 mod handoff_runtime;
 mod input;
@@ -610,6 +612,8 @@ fn main() -> io::Result<()> {
         println!("       herdr api <subcommand> ...");
         println!("       herdr completion <shell>");
         println!("       herdr fleet status [--json] [--watch]");
+        #[cfg(feature = "gateway")]
+        println!("       {}", crate::gateway::GATEWAY_COMMAND_LINE);
         println!("       herdr config <subcommand> ...");
         println!("       herdr channel <subcommand> ...");
         println!("       herdr workspace <subcommand> ...");
@@ -758,6 +762,8 @@ fn main() -> io::Result<()> {
                 "config",
                 "channel",
                 "fleet",
+                #[cfg(feature = "gateway")]
+                "gateway",
                 "machine",
                 "workspace",
                 "worktree",

@@ -31,7 +31,12 @@ pub(super) fn command() -> Command {
         .subcommand(completion::command())
         .subcommand(update_command())
         .subcommand(status_command())
-        .subcommand(fleet_command())
+        .subcommand(fleet_command());
+    // The gateway subcommand only exists in a build that carries the feature,
+    // so a `--no-default-features` build advertises no `gateway` command.
+    #[cfg(feature = "gateway")]
+    let command = command.subcommand(gateway_command());
+    let command = command
         .subcommand(config_command())
         .subcommand(channel_command())
         .subcommand(machine::command())
@@ -145,6 +150,17 @@ fn fleet_command() -> Command {
                 .arg(option("timeout-ms", "MS").help("Wait at most MS for hosts to answer"))
                 .arg(flag("watch").help("Keep running and print one line per change")),
         )
+}
+
+#[cfg(feature = "gateway")]
+fn gateway_command() -> Command {
+    Command::new("gateway")
+        .about("Serve the fleet over HTTP and WebSocket")
+        .arg(option("bind", "ADDR").help("Listen on ADDR instead of the configured address"))
+        .arg(option("config", "PATH").help("Read configuration from PATH"))
+        // Same staging note the hand-rolled `herdr gateway help` prints, so the
+        // clap surface does not advertise options that run nothing yet.
+        .after_help(crate::gateway::GATEWAY_STAGING_NOTE)
 }
 
 fn config_command() -> Command {
@@ -1107,6 +1123,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The gateway subcommand is feature-gated on both sides: present with
+    /// its options in a fork build, absent from an upstream-shaped one.
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn spec_renders_gateway_help_with_its_options() {
+        let cmd = super::command();
+        let gateway = command_path(&cmd, &["gateway"]);
+        assert!(gateway.get_about().is_some());
+        for option in ["bind", "config"] {
+            assert!(
+                gateway.get_arguments().any(|arg| arg.get_id() == option),
+                "missing --{option}"
+            );
+        }
+
+        let args = ["herdr", "gateway", "--help"].map(str::to_string);
+        let mut output = Vec::new();
+        assert!(super::write_requested_help(&args, &mut output, || {}).unwrap());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Usage: herdr gateway"), "{output}");
+        assert!(
+            output.contains(crate::gateway::GATEWAY_STAGING_NOTE),
+            "{output}"
+        );
+    }
+
+    #[cfg(not(feature = "gateway"))]
+    #[test]
+    fn spec_has_no_gateway_subcommand_without_the_feature() {
+        assert!(
+            !super::command()
+                .get_subcommands()
+                .any(|subcommand| subcommand.get_name() == "gateway"),
+            "gateway must not be advertised in a --no-default-features build"
+        );
     }
 
     #[test]

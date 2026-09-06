@@ -20,7 +20,28 @@ include = [
     "Cargo.toml",
 ]
 
+[features]
+# The fork's HTTP/WebSocket gateway (`herdr gateway`). On by default in fork
+# builds; `--no-default-features` drops the command, its listening socket and
+# every optional dependency below, leaving the upstream-shaped binary that fork
+# CI's `check-no-default-features` job builds.
+default = ["gateway"]
+gateway = [
+    "dep:axum",
+    "dep:qrcode",
+    "dep:subtle",
+    "dep:getrandom",
+    "tokio/net",
+    "tokio/signal",
+]
+
 [dependencies]
+# gateway: HTTP router and WebSocket upgrade on the existing tokio runtime.
+# Hand-rolling HTTP/1.1 plus RFC 6455 would be ~1.5 kLOC of security-sensitive
+# parsing. `ws` pulls tokio-tungstenite transitively, so no direct WebSocket
+# dependency is needed, and `axum::http` re-exports the `http` crate, so no
+# direct `http` or `hyper` dependency is needed either.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "json", "query"], optional = true }
 base64 = "0.22.1"
 bincode = { version = "2", features = ["serde"] }
 bytes = "1"
@@ -28,17 +49,27 @@ clap = { version = "4.5", default-features = false, features = ["std", "help", "
 clap_complete = "4.5"
 crossterm = "0.29"
 ctrlc = { version = "3", features = ["termination"] }
+# gateway: 32-byte token and pairing secrets from the OS CSPRNG. No CSPRNG
+# exists in the tree; getrandom is already a transitive dependency at 0.3.x,
+# so the lock gains no new subtree (`rand` would).
+getrandom = { version = "0.3", optional = true }
 interprocess = "2.4.2"
 jsonc-parser = { version = "0.33.1", default-features = false, features = ["cst", "serde_json"] }
 libc = "0.2"
 portable-pty = "=0.9.0"
 png = "0.17"
+# gateway: terminal QR code for `herdr gateway pair`. `default-features =
+# false` keeps only the built-in unicode renderer and drops the `image` stack.
+qrcode = { version = "0.14", default-features = false, optional = true }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1.14"
 serde_json = "1"
 sha2 = "0.10"
+# gateway: constant-time token digest comparison (`ConstantTimeEq`). Nothing
+# in the tree compares secrets in constant time and subtle has no dependencies.
+subtle = { version = "2.6", optional = true }
 time = { version = "0.3.47", features = ["formatting"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util"] }
 toml = "0.8"
