@@ -74,6 +74,14 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_CHANNEL_CAPACITY: usize = 2;
 /// Commands buffered between the browser and the host.
 const COMMAND_CHANNEL_CAPACITY: usize = 16;
+/// How long a session waits for its writer thread to drain before it tears the
+/// connection down.
+///
+/// A `terminal.release` right after a keystroke is the ordinary case — a
+/// browser closing a terminal it just typed into — and the keystroke has to
+/// reach the pty before the socket is half-closed under the writer. Bounded so
+/// a wedged write cannot hold the task open.
+const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long the gateway waits for the host to confirm the session before it
 /// tells the client the terminal is ready.
 ///
@@ -387,6 +395,9 @@ async fn run_terminal(
         }
     }
 
+    // Before the socket is torn down: anything the client asked for that is
+    // still in flight has to land first.
+    session.drain().await;
     let _ = socket.send(Message::Close(close)).await;
     drop(session);
     tracing::info!(
@@ -774,6 +785,9 @@ enum TerminalEvent {
 struct TerminalSession {
     frames: mpsc::Receiver<TerminalEvent>,
     commands: Option<mpsc::Sender<ClientMessage>>,
+    /// Resolves when the writer thread has stopped, so [`Self::drain`] knows
+    /// every queued command reached the host.
+    writer_done: Option<tokio::sync::oneshot::Receiver<()>>,
     /// A third handle on the same socket, kept only to half-close it.
     close: LocalStream,
     _lease: StreamLease,
@@ -795,16 +809,20 @@ impl TerminalSession {
             })?;
 
         let writer_lease = lease.clone();
+        let (writer_done_tx, writer_done_rx) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("herdr-gw-term-w".to_string())
             .spawn(move || {
                 let _lease = writer_lease;
+                // Dropped when this thread ends, which is what wakes `drain`.
+                let _done = writer_done_tx;
                 write_commands(stream, commands_rx);
             })?;
 
         Ok(Self {
             frames: frames_rx,
             commands: Some(commands_tx),
+            writer_done: Some(writer_done_rx),
             close,
             _lease: lease,
         })
@@ -816,6 +834,23 @@ impl TerminalSession {
             return Err(());
         };
         commands.send(message).await.map_err(|_| ())
+    }
+
+    /// Let every queued command reach the host before the socket is torn down.
+    ///
+    /// [`Drop`] half-closes the write side, which is what makes a host drop an
+    /// abandoned session promptly — but a writer thread still holding queued
+    /// commands would then fail its next write. A client that types and
+    /// immediately releases would silently lose the keystroke, which is the one
+    /// failure this whole module exists to avoid.
+    async fn drain(&mut self) {
+        // Dropping the sender is what tells the writer the queue is final;
+        // without it `blocking_recv` waits for a command that never comes.
+        self.commands = None;
+        let Some(done) = self.writer_done.take() else {
+            return;
+        };
+        let _ = tokio::time::timeout(WRITER_DRAIN_TIMEOUT, done).await;
     }
 }
 
