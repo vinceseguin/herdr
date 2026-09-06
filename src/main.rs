@@ -596,6 +596,7 @@ fn main() -> io::Result<()> {
         println!("Usage: herdr [options]");
         println!("       herdr --session <name> [options]");
         println!("       herdr --remote <ssh-target> [--session <name>]");
+        println!("       herdr fleet                      (alias: herdr --fleet)");
         println!("       herdr session attach <name>");
         println!("       herdr completion zsh");
         if build_info::is_fork() {
@@ -626,6 +627,10 @@ fn main() -> io::Result<()> {
             (
                 "herdr status [server|client]",
                 "Show local client and running server status",
+            ),
+            (
+                "herdr fleet",
+                "Open the Fleet console over every configured host",
             ),
             ("herdr update", "Download and install the latest version"),
             ("herdr completion zsh", "Generate shell completions for zsh"),
@@ -691,6 +696,7 @@ fn main() -> io::Result<()> {
         println!();
         println!("Options:");
         println!("  --session <name>    Use or create a named persistent session");
+        println!("  --fleet             Open the Fleet console over every configured host");
         println!("  --remote <target>   Attach through SSH to a remote Herdr server");
         println!("  --remote-keybindings <local|server>");
         println!("                      Keybindings for --remote app attach (default: local)");
@@ -730,6 +736,7 @@ fn main() -> io::Result<()> {
     // Reject unknown flags
     let known_flags = [
         "--session",
+        "--fleet",
         "--remote",
         "--remote-keybindings",
         "--version",
@@ -768,6 +775,17 @@ fn main() -> io::Result<()> {
             eprintln!("run 'herdr --help' for usage");
             std::process::exit(2);
         }
+    }
+
+    // `herdr fleet` and `herdr --fleet` are the same console. `--remote` is
+    // already refused above for any non-default launch command, so the two
+    // cannot combine here.
+    if args.get(1).map(|s| s.as_str()) == Some("fleet")
+        || args.iter().skip(1).any(|arg| arg == "--fleet")
+    {
+        let loaded_config = config::Config::load();
+        exit_if_nested_disabled(&loaded_config.config);
+        return client::run_fleet();
     }
 
     if let Some(remote_launch) = remote_launch {

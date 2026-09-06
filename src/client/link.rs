@@ -28,8 +28,6 @@ pub(super) enum LinkWriteError {
     Io(io::Error),
     /// A console detach: there is no server to tell, the loop is the thing
     /// that stops. Only [`ServerLink::Fleet`] produces it.
-    // Produced by the fleet link, whose only constructor lands in E2 PR 4.
-    #[allow(dead_code)]
     Detached,
     /// The active fleet host has no usable connection right now, so the
     /// connector did not take the message. A raw write is simply dropped
@@ -42,8 +40,7 @@ pub(super) enum LinkWriteError {
 /// The client loop's write half: one local server, or one host of a fleet.
 pub(super) enum ServerLink {
     Single(LocalStream),
-    /// Built by the Fleet console (E2 PR 4); unreachable until then.
-    #[allow(dead_code)]
+    /// Built by the Fleet console: one explicit host at a time.
     Fleet(FleetLink),
 }
 
@@ -60,14 +57,12 @@ pub(super) struct FleetLink {
 }
 
 impl FleetLink {
-    // Constructed by the fleet console (E2 PR 4).
-    #[allow(dead_code)]
     pub(super) fn new(connector: Rc<FleetConnector>, active: HostId) -> Self {
         Self { connector, active }
     }
 
     /// The host every write currently goes to.
-    // Read by the fleet console (E2 PR 4/5) when it switches hosts.
+    // Read by the fleet console's host switch (E2 PR 5).
     #[allow(dead_code)]
     pub(super) fn active(&self) -> &HostId {
         &self.active
@@ -147,7 +142,7 @@ impl ServerLink {
 
     /// Points a fleet link at another host. A no-op for a single-host client,
     /// which has exactly one server for its whole life.
-    // Called by the fleet console's host switch (E2 PR 4/5/6).
+    // Called by the fleet console's host switch (E2 PR 5/6).
     #[allow(dead_code)]
     pub(super) fn set_active(&mut self, host: HostId) {
         match self {
@@ -167,6 +162,10 @@ pub(super) struct ClientLink {
     /// `None` for a single-host client, whose inbound messages come from its
     /// own reader thread.
     pub(super) fleet_events: Option<tokio::sync::mpsc::Receiver<FleetEvent>>,
+    /// The console's own state — every host's connection and projection.
+    /// `None` for a single-host client. Travels with the link because the two
+    /// must agree about the active host from the loop's first iteration.
+    pub(super) fleet: Option<super::fleet::FleetClientState>,
 }
 
 impl ClientLink {
@@ -175,6 +174,7 @@ impl ClientLink {
         Self {
             link: ServerLink::Single(stream),
             fleet_events: None,
+            fleet: None,
         }
     }
 }
