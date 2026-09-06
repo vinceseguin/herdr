@@ -276,9 +276,6 @@ impl FleetHandle {
     ///
     /// Handlers use it to fail a request fast (a terminal on a host that is
     /// down is a stream-local error, never a 5xx) without building a report.
-    // PR 6 (`/api/terminal/{host}/{pane}`) is the first caller outside this
-    // module's tests; the allow goes with that PR.
-    #[allow(dead_code)]
     pub fn host_connection(&self, host: &HostId) -> Option<HostConnection> {
         lock(&self.state)
             .host(host)
@@ -289,8 +286,6 @@ impl FleetHandle {
     ///
     /// This is how a terminal stream learns *what* to open (a local session, an
     /// ssh target) without a second copy of the host list living in the gateway.
-    // PR 6, as above.
-    #[allow(dead_code)]
     pub fn host_spec(&self, host: &HostId) -> Option<HostSpec> {
         lock(&self.state).host(host).map(|host| host.spec.clone())
     }

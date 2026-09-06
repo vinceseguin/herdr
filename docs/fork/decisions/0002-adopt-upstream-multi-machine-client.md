@@ -60,6 +60,15 @@ Option 3.
   report, `herdr fleet status`) is the gateway's aggregator and the shape of
   `/api/fleet`. It may source hosts from upstream's saved machine profiles
   (`src/remote/saved.rs`) in addition to `[[fleet.hosts]]`; E3 decides.
+  **Decided in E3 (decision (r), PR 9):** yes, as an *opt-in* host source —
+  `[fleet] include_machines`, default `false`. When it is on,
+  `src/fleet/hosts_source.rs::hosts_for_config` reads upstream's catalog through
+  `EndpointCatalog::load_profiles()` and `src/fleet/machines.rs` derives a host
+  id from each machine's label, so `herdr machine add` stays the one place a
+  target is typed and `herdr fleet status` and the gateway show the same fleet.
+  The switch lives in `[fleet]`, not `[gateway]`, for that reason. The fork's
+  only dependency on upstream's catalog is that one loader plus five
+  `SavedSshEndpoint` fields.
 - **Sync policy.** On every `git merge upstream/master`:
   - take **upstream's side** for `src/client/**`, `src/remote/attach.rs` and
     any new `src/remote/*` file, `src/server/**`, `src/api/**`,

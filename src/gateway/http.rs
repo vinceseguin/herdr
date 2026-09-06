@@ -216,7 +216,9 @@ impl ApiError {
         self.code
     }
 
-    #[allow(dead_code)]
+    /// The status this error answers with. Test-only: production code turns an
+    /// `ApiError` straight into a response rather than inspecting it.
+    #[cfg(test)]
     pub(crate) fn status(&self) -> StatusCode {
         self.status
     }

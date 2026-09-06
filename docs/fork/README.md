@@ -404,6 +404,31 @@ key, the `host/w1:p1` id form, connection states and reasons, ssh host setup and
 reconnect behaviour, and the `src/fleet/` module map for E3 — is in
 [`fleet-core.md`](./fleet-core.md).
 
+## Gateway
+
+`herdr gateway` serves the fleet over HTTP and WebSocket so a phone or a browser
+can watch it. It is loopback-first (`127.0.0.1:7788`), token-gated, and a
+passive reader — attaching it never resizes anybody's panes.
+
+```bash
+herdr gateway                     # run it (foreground; SIGTERM stops it cleanly)
+herdr gateway pair [--control]    # one-time pairing URL + QR code for a device
+herdr gateway status [--json]     # is one running, and what has it paired
+herdr gateway rotate-token read   # replace a token and revoke what it granted
+```
+
+`GET /api/fleet` serves the `herdr.fleet.status.v1` report, `/api/events`
+streams fleet deltas, and `/api/terminal/{host}/{pane}` streams rendered ANSI
+frames (observe, or control with the `control` scope). Full reference — every
+`[gateway]` key, the token and device stores, the pairing flow, both WebSocket
+contracts including the binary frame header, the `systemd --user` unit and
+troubleshooting — is in [`gateway.md`](./gateway.md).
+
+The whole module is behind the `gateway` cargo feature, on by default in fork
+builds; `cargo build --no-default-features` yields an upstream-shaped binary
+with no `gateway` command, which is what fork CI's
+`check-no-default-features` job protects.
+
 ## Continuous integration
 
 Fork CI is [`.github/workflows/fork-ci.yml`](../../.github/workflows/fork-ci.yml)
@@ -460,8 +485,8 @@ After every sync, re-run `gh workflow list --all -R vinceseguin/herdr` and
 
 Fork-owned paths never conflict — whole directories (`docs/fork/`, `.claude/`,
 `scripts/fork/`, including `fleet-lab.sh`, `ssh-lab.sh`, `gate.sh` and
-`dev-setup.sh`; `src/fleet/` and `src/gateway/`, and `web/` once E4 creates
-it) plus fork-only files that live inside upstream directories:
+`dev-setup.sh`; `src/fleet/` and `src/gateway/`, and `web/` — whose committed
+`web/dist` E3 embeds and E4 fills in) plus fork-only files that live inside upstream directories:
 `src/cli/fleet.rs`, `.github/workflows/fork-*.yml`, every `tests/fork_*.rs`
 (today `tests/fork_channel.rs`, `tests/fork_fleet_lab.rs`,
 `tests/fork_gateway.rs`, `tests/fork_ssh_lab.rs`), `tests/support/fleet_lab.rs`
@@ -477,10 +502,12 @@ The upstream files that currently carry fork wiring, and may conflict:
 | `justfile` | `lint-no-default` and `ci-no-default` (E3 PR 1) |
 | `src/main.rs` | `mod fleet;`, gated `mod gateway;`, the `[fleet]` block of `DEFAULT_CONFIG`, two `--help` usage lines, `"fleet"` and gated `"gateway"` in the bare-command list |
 | `src/remote/attach.rs` | `pub(crate)` visibility on the ssh stdio bridge and remote discovery, plus `start_with`/`local_forward_socket_path_scoped`/`BridgeErrorSink` (E1 PR 3) — upstream's side first, then re-apply |
-| `src/cli.rs`, `src/cli/spec.rs` | one `mod fleet;` + match arm and a gated `"gateway"` arm, `fleet_command()` and a gated `gateway_command()` |
-| `src/config/model.rs`, `src/config/io.rs`, `src/config.rs` | the `[fleet]` section, its `KNOWN_TOP_LEVEL_CONFIG_KEYS`/live-reload entry, and its diagnostics |
-| `scripts/config_reference_check.py` | one `SKIPPED_SUBTREES` entry for `fleet` |
-| `src/app/mod.rs` (tests only), `tests/support/mod.rs`, `tests/api_ping.rs`, `tests/cli/sessions.rs`, `tests/cli/mod.rs` | fork test wiring |
+| `src/cli.rs`, `src/cli/spec.rs` | one `mod fleet;` + match arm and a gated `"gateway"` arm, `fleet_command()` and a gated `gateway_command()` (with its `pair`/`status`/`rotate-token` subcommands, E3 PR 8) |
+| `build.rs` | one `cargo:rerun-if-changed=web/dist`, so a rebuilt web app re-embeds (E3 PR 4) |
+| `src/config/model.rs`, `src/config/io.rs`, `src/config.rs` | the `[fleet]` and `[gateway]` sections, their `KNOWN_TOP_LEVEL_CONFIG_KEYS`/live-reload entries, their diagnostics, and the feature-gated `parse_gateway_origin`/`GatewayConfig`/`GatewayOrigin` re-exports |
+| `src/client/mod.rs`, `src/client/terminal_sessions.rs` | `terminal_control_command_from_json` widened to `pub(crate)` and re-exported under `#[cfg(any(test, feature = "gateway"))]`, so the gateway parses the CLI's own terminal-control vocabulary (E3 PR 6) |
+| `scripts/config_reference_check.py` | `SKIPPED_SUBTREES` entries for `fleet` and `gateway` |
+| `src/app/mod.rs` (tests only), `tests/support/mod.rs`, `tests/support/gateway.rs`, `tests/api_ping.rs`, `tests/cli/sessions.rs`, `tests/cli/mod.rs` | fork test wiring |
 | `.gitignore`, the fork section at the tail of `AGENTS.md` | fork layout and rules |
 
 `src/protocol/wire.rs`, `src/protocol/endpoint.rs` and

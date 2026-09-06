@@ -349,24 +349,35 @@ the LAN is the only network surface, and it is what E5 puts on the tailnet.
 - `herdr gateway [--bind 127.0.0.1:7788] [--config <path>]`, cargo feature
   `gateway` (on by default in fork builds, so `--no-default-features` yields an
   upstream-shaped binary). Loopback by default. Any non-loopback bind requires
-  a token and an origin allowlist; refused otherwise with a clear message.
+  an origin allowlist (`allowed_origins`, or `public_url`); refused otherwise
+  with a clear message and exit 1. Tokens are required on **every** bind,
+  loopback included — a web page can make a browser call `127.0.0.1`.
 - Auth: two random 32-byte tokens generated on first run and stored `0600`
   under `<config>/gateway/` — `read` (snapshot, events, observe terminals) and
   `control` (input, resize, and E7's actions). Bearer header or a one-time
   pairing URL that exchanges into a per-device cookie; constant-time compare;
-  failure rate limiting.
+  failure rate limiting. `<config>` follows `XDG_CONFIG_HOME`, not `--config`.
 - HTTP: `GET /api/fleet` (the `herdr fleet status --json` shape), `GET /health`,
-  static assets for the web app served from bytes embedded at build time
-  (`include_bytes!` over `web/dist`).
+  `GET /api/gateway` (what this gateway is and what the caller's credential is),
+  `GET /pair`, and static assets for the web app served from bytes embedded at
+  build time (`include_bytes!` over `web/dist`).
 - WebSocket: `/api/events` streams fleet deltas (host state, agent status
   changes, workspace/tab/pane changes) as newline-free JSON messages;
-  `/api/terminal/{host}/{pane}` streams rendered ANSI frames through the
-  observe/control path (`ObserveTerminal` / `ControlTerminal`,
-  `RenderEncoding::TerminalAnsi`) and accepts `terminal.input`,
-  `terminal.resize`, `terminal.scroll`, `terminal.release` — control only with
-  the `control` scope. Frame size limits mirror `MAX_FRAME_SIZE`.
-- `herdr gateway pair [--control]` prints the pairing URL and a terminal QR
-  code; `herdr gateway status`, `herdr gateway rotate-token`.
+  `/api/terminal/{host}/{pane}` streams rendered ANSI frames as **binary**
+  messages behind a fixed 14-byte header, through the observe/control path
+  (`ObserveTerminal` / `ControlTerminal`, `RenderEncoding::TerminalAnsi`). The
+  first client message is `terminal.open {mode}`; after it the socket accepts
+  `terminal.input`, `terminal.resize`, `terminal.scroll` and `terminal.release`
+  — control only with the `control` scope, and an observer's scroll is
+  `unsupported` because the host ignores it. Frame size limits mirror
+  `MAX_FRAME_SIZE`.
+- `herdr gateway pair [--control] [--ttl-secs N] [--label TEXT] [--no-qr]
+  [--invert] [--json]` prints the pairing URL and a terminal QR code;
+  `herdr gateway status [--json]`, `herdr gateway rotate-token <read|control>`.
+  Exit codes 0 success, 1 refusal, 2 usage, 3 `status` with nothing running.
+- Hosts: `[fleet] include_machines` (default `false`) additionally aggregates
+  every machine saved with `herdr machine add`, so the console and the gateway
+  show the same fleet.
 - Ops: example `systemd --user` unit and `docs/fork/gateway.md`.
 - Tests: handler-level tests with a fake `FleetState`; an integration test that
   starts the gateway on loopback against the fleet lab and asserts `/api/fleet`,
@@ -379,6 +390,12 @@ hand-rolled (the QR code uses the small `qrcode` crate); (b) token model —
 **two scopes** vs one token + per-device role; (c) lives in the main binary
 behind a feature — **yes** vs a separate crate (would require turning the repo
 into a cargo workspace, a heavy upstream-file change).
+**Resolved:** all three took their default in
+[`plans/e3-fleet-gateway.md`](./plans/e3-fleet-gateway.md) — `axum` with its
+`ws` feature on the existing `tokio`, two token scopes, and the main binary
+behind the `gateway` feature. That plan's *Locked decisions* section records the
+rest of the epic's choices, and [`gateway.md`](./gateway.md) is the shipped
+reference.
 
 ---
 

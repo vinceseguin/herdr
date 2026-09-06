@@ -674,7 +674,7 @@ exactly these E1 contracts (verified in the code):
 | 7 | feat(gateway): terminal control mode gated by the control scope | C · Streams | 6 | ✅ |
 | 8 | feat(gateway): pairing urls with qr codes, device cookies, status and token rotation | D · Ops | 4 | ✅ |
 | 9 | feat(fleet): opt-in hosts from saved machine profiles | D · Ops | 3 | ✅ |
-| 10 | docs: gateway guide, systemd unit, adr e3 review, roadmap drift | E · Docs | 5, 7, 8, 9 | ⬜ |
+| 10 | docs: gateway guide, systemd unit, adr e3 review, roadmap drift | E · Docs | 5, 7, 8, 9 | ✅ |
 
 **Wave preview (2-agent cap, Cargo PR alone):** W1 `[1]` → W2 `[2, 3]` →
 W3 `[4, 9]` → W4 `[5, 6]` → W5 `[7, 8]` → W6 `[10]`. Critical path 1 → 2 →

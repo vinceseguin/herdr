@@ -173,3 +173,74 @@ fleet host runs a stock server. Six facts are worth recording.
   fleet as well as by the single-host client.
 
 Nothing in *Decision* is amended.
+
+### E3 review (2026-09-06)
+
+E3 built the gateway on top of the E1 core: `[gateway]` configuration, the token
+and device stores, the async fleet runtime, the HTTP surface, the `/api/events`
+and `/api/terminal/{host}/{pane}` WebSockets, control mode, and the
+`pair`/`status`/`rotate-token` operator loop. Option 4 held again — `git diff`
+over `src/protocol/`, `src/server/` and `tests/fixtures/` is empty for the whole
+epic, and a gateway is an ordinary herdr *client*. Seven facts are worth
+recording.
+
+- **Tokens on loopback earned their keep.** The decision's "loopback-first, but
+  still token-gated" looked belt-and-braces until the auth layer met a browser.
+  Any web page can make a browser issue `GET http://127.0.0.1:7788/api/fleet`;
+  the token is what stops it reading the answer, `SameSite=Strict` is what stops
+  a device cookie riding along, and refusing a device cookie on a
+  `Sec-Fetch-Site: cross-site` request that carries no `Origin` closes the gap
+  browsers leave by omitting `Origin` on navigations and `<img>` loads. The same
+  fact bounded the rate limiter: only a *presented* credential that fails counts,
+  because counting credential-less requests let five `<img>` tags lock the
+  operator out of their own gateway.
+- **The passive hello closed E1's open caveat.** The E1 review recorded that a
+  fleet client is not passive because it becomes the host's foreground client.
+  Upstream #3670's `surface_active` flag made the fix a one-field handshake
+  change (`HandshakeParams::read_only` sends `false`), so a gateway can hold every
+  host open indefinitely without reflowing anyone's panes — verified against the
+  lab, where a pane stayed at its configured geometry with the gateway attached.
+  The residual is a host running a pre-#3670 server, which is a host to upgrade,
+  not a thing to work around. E1's "hold connections only while something is
+  reading them" no longer binds a passive consumer.
+- **A daemon needs noninteractive ssh, and that is a separate switch.**
+  `FleetConnectorOptions::for_daemon` runs bridges with `BatchMode=yes`,
+  `NumberOfPasswordPrompts=0` and discarded stderr, so a host that would have
+  prompted fails fast into `connection.state == "unavailable"` instead of hanging
+  a daemon on an invisible prompt. Herdr's *discovery* probes still use the
+  interactive `ssh` constructor in `src/remote/attach.rs`; closing that needs a
+  noninteractive `RemoteSsh`, which this epic's frozen-`src/remote` rule forbids,
+  so it is documented rather than worked around.
+- **The gateway's ssh sockets are scoped, and one bridge means one stream.**
+  `SshTransport::new_scoped` derives the forward socket from
+  `socket_scope(scope, host)`, leaving E1's names byte-identical while the
+  gateway's terminal transports get their own `-gateway-` sockets. But the
+  upstream bridge accepts one connection inline, so an ssh host serves **one**
+  terminal stream at a time: a second one waits 2 s and is then refused
+  `host_busy` + close 1013. Local hosts are unlimited. The real fix is a
+  concurrent bridge in `src/remote/`, which is exactly the code this decision
+  keeps stock.
+- **Backpressure belongs in the gateway, not in the host.** Each terminal
+  session bridges the host to the WebSocket through bounded channels of depth 2,
+  so a slow phone applies backpressure to the server's own render lane rather
+  than making the gateway buffer. The gateway therefore never holds more than two
+  frames per open terminal — the property that lets "one gateway for the whole
+  fleet" scale without a memory story.
+- **The server's semantics leak through as vocabulary, and that is correct.**
+  A pane has one attach slot, so a second controller gets `busy` and the answer
+  is `takeover: true`; the evicted controller gets
+  `terminal.closed {reason:"taken_over"}`. The gateway classifies the server's
+  reason *text* to produce those codes, which is a coupling — bounded by matching
+  each wording by anchored prefix and suffix, because a pane id is interpolated
+  into the middle of it and a pane named after the busy wording would otherwise
+  forge its own error.
+- **Two credentials, two stores, and reload is not optional.** `rotate-token`
+  runs in a separate process from the daemon, so "no restart needed" required
+  both stores to carry a file stamp and re-`stat` before a comparison. Without
+  the device half a running gateway would keep honouring a revoked cookie *and*
+  write the revoked records back on its next `last_seen` flush. The accepted
+  residual is fail-open on a failed *reload* (logged at `warn`), because locking
+  every client out over a momentarily unreadable file is worse and an attacker
+  who can corrupt it already has write access to the gateway directory.
+
+Nothing in *Decision* is amended.
