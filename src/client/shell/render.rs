@@ -1,10 +1,5 @@
 use super::*;
 
-// The fleet sidebar is a sibling of `sidebar.rs` on purpose: it draws host
-// groups by reusing that module's row rendering for the active host, and a
-// `#[path]` submodule of `render` is how upstream already shares that scope.
-#[path = "../shell/fleet_sidebar.rs"]
-mod fleet_sidebar;
 #[path = "../shell/overlays.rs"]
 mod overlays;
 #[path = "../shell/sidebar.rs"]
@@ -213,9 +208,6 @@ pub(super) struct ShellRenderState<'a> {
     pub(super) selected_workspace_id: Option<&'a str>,
     pub(super) dragged_workspace_id: Option<&'a str>,
     pub(super) workspace_drop_indicator_row: Option<u16>,
-    /// The console's other hosts (fork, E2 PR 5); `None` for a single-host
-    /// client, whose sidebar is drawn exactly as before.
-    pub(super) fleet: Option<&'a super::fleet::FleetShellState>,
 }
 
 pub(super) fn render_shell(
@@ -277,7 +269,6 @@ pub(super) fn render_shell(
         hits.new_workspace = Rect::default();
         hits.workspaces.clear();
         hits.agents.clear();
-        hits.fleet_rows.clear();
         hits.tab_scroll_left = Rect::default();
         hits.tab_scroll_right = Rect::default();
         hits.new_tab = Rect::default();

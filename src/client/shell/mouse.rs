@@ -1946,9 +1946,6 @@ impl ClientShellState {
                     self.agent_panel_sort_manual = true;
                     self.agent_scroll = 0;
                     self.persist_chrome_preferences(outcome);
-                    // Every fleet group's agent order is built with this
-                    // preference, so the console's row model is now stale.
-                    self.note_fleet_sort_changed(outcome);
                     outcome.repaint = true;
                     return;
                 }
@@ -2006,12 +2003,6 @@ impl ClientShellState {
                     outcome.repaint = true;
                     outcome.resize = true;
                     self.persist_chrome_preferences(outcome);
-                    return;
-                }
-                // Host-qualified rows first: they belong to a machine the
-                // shell is not showing, and the id-only hit tests below would
-                // resolve them against the active host.
-                if self.handle_fleet_sidebar_click(point, outcome) {
                     return;
                 }
                 for hit in &self.hits.workspaces {

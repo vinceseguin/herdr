@@ -6,7 +6,6 @@ mod composition;
 mod config;
 mod context_menu;
 mod copy_mode;
-mod fleet;
 mod global_menu;
 mod graphics;
 mod input;
@@ -22,7 +21,6 @@ mod state;
 mod surface_patch;
 mod worktrees;
 
-pub(crate) use fleet::{FleetFocusTarget, FleetShellAction, FleetSidebarHit};
 pub(crate) use state::*;
 #[cfg(test)]
 pub(super) use surface_patch::apply_composed_surface_patch;

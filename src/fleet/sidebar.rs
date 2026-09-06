@@ -15,6 +15,14 @@
 //! and glyphs for a row's [`AgentStatus`] stay with the renderer (upstream's
 //! `status_icon`/`status_color`); what travels from here is the status itself.
 
+// Every item below is built for the console: PR 5 renders `FleetSidebarModel`,
+// PR 6 renders `host_picker_rows`, PR 7 reads `agent_status`. This PR lands the
+// model and its tests on their own so the render PRs are pure wiring, which
+// leaves the whole module without a production caller until PR 5. A module-wide
+// allow, rather than one per item, because there is exactly one reason and it
+// disappears in one commit: delete this attribute when PR 5 lands.
+#![allow(dead_code)]
+
 use std::cmp::Reverse;
 use std::collections::HashSet;
 
@@ -61,9 +69,6 @@ impl HostRowState {
     }
 
     /// Short lowercase name, matching [`HostConnection::state_name`].
-    // Read by the host picker overlay (E2 PR 6), which names the state in
-    // prose next to each row; the sidebar draws the state as a style instead.
-    #[allow(dead_code)]
     pub fn state_name(&self) -> &'static str {
         match self {
             Self::Connected => "connected",
@@ -122,6 +127,32 @@ pub struct AgentRow {
     pub state_change_seq: u64,
 }
 
+/// One drawable sidebar row, borrowed from the model.
+///
+/// Borrowed rather than owned (the plan sketched owned rows): the renderer
+/// walks this on every frame, and cloning a `String` per visible row per frame
+/// is exactly the per-frame allocation the model exists to avoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FleetSidebarRow<'a> {
+    HostHeader(&'a HostHeaderRow),
+    Workspace(&'a WorkspaceRow),
+    Agent(&'a AgentRow),
+}
+
+impl<'a> FleetSidebarRow<'a> {
+    /// The host this row belongs to — the routing target of a click on it.
+    ///
+    /// Borrowed from the model, not from the row, so a caller that copied a
+    /// row out of [`FleetSidebarModel::visible_rows`] can still hold the id.
+    pub fn host(&self) -> &'a HostId {
+        match self {
+            Self::HostHeader(header) => &header.host,
+            Self::Workspace(row) => &row.workspace.host,
+            Self::Agent(row) => &row.pane.host,
+        }
+    }
+}
+
 /// One host's rows: a header, its workspaces, its agents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostGroup {
@@ -131,6 +162,17 @@ pub struct HostGroup {
     pub workspaces: Vec<WorkspaceRow>,
     /// Upstream's agent-panel order; see [`host_status_rank`].
     pub agents: Vec<AgentRow>,
+}
+
+impl HostGroup {
+    /// Rows drawn for this group right now: the header alone when collapsed.
+    pub fn visible_row_count(&self) -> usize {
+        if self.header.collapsed {
+            1
+        } else {
+            1 + self.workspaces.len() + self.agents.len()
+        }
+    }
 }
 
 /// Every host's rows, in `[fleet]` order with `local` first.
@@ -188,15 +230,41 @@ impl FleetSidebarModel {
     }
 
     /// Status of one agent, addressed across hosts.
-    // Read by host-aware notifications (E2 PR 7) to decide whether a toast for
-    // another host's agent is still worth showing.
-    #[allow(dead_code)]
     pub fn agent_status(&self, pane: &FleetPaneRef) -> Option<AgentStatus> {
         self.group(&pane.host)?
             .agents
             .iter()
             .find(|agent| agent.pane.pane_id == pane.pane_id)
             .map(|agent| agent.status)
+    }
+
+    /// Rows to draw, top to bottom, collapsed groups contributing their header
+    /// only. Borrows, so walking it allocates nothing.
+    pub fn visible_rows(&self) -> impl Iterator<Item = FleetSidebarRow<'_>> {
+        self.groups.iter().flat_map(|group| {
+            let body = if group.header.collapsed {
+                &[][..]
+            } else {
+                &group.workspaces[..]
+            };
+            let agents = if group.header.collapsed {
+                &[][..]
+            } else {
+                &group.agents[..]
+            };
+            std::iter::once(FleetSidebarRow::HostHeader(&group.header))
+                .chain(body.iter().map(FleetSidebarRow::Workspace))
+                .chain(agents.iter().map(FleetSidebarRow::Agent))
+        })
+    }
+
+    /// How many rows [`FleetSidebarModel::visible_rows`] yields. O(hosts), so a
+    /// scroll metric costs nothing per frame.
+    pub fn visible_row_count(&self) -> usize {
+        self.groups
+            .iter()
+            .map(HostGroup::visible_row_count)
+            .sum::<usize>()
     }
 }
 
@@ -205,8 +273,6 @@ impl FleetSidebarModel {
 /// Same hosts, same order as the sidebar, so a `1-9` jump in the picker names
 /// the same host as the *n*-th sidebar group.
 #[derive(Debug, Clone, PartialEq, Eq)]
-// Every field is read by the picker overlay's renderer (E2 PR 6).
-#[allow(dead_code)]
 pub struct HostPickerRow {
     pub host: HostId,
     pub active: bool,
@@ -220,9 +286,6 @@ pub struct HostPickerRow {
 }
 
 /// The picker's rows, in `[fleet]` order with `local` first.
-// Rendered by the host picker overlay (E2 PR 6). The sidebar (PR 5) draws
-// `FleetSidebarModel` instead; both derive from the same `FleetState`.
-#[allow(dead_code)]
 pub fn host_picker_rows(state: &FleetState) -> Vec<HostPickerRow> {
     let active = state.active_host();
     state
@@ -605,11 +668,9 @@ mod tests {
             "the first enabled host is active"
         );
         assert!(!model.groups[1].header.active);
-        assert!(
-            model
-                .groups
-                .iter()
-                .all(|group| group.workspaces.is_empty() && group.agents.is_empty()),
+        assert_eq!(
+            model.visible_row_count(),
+            3,
             "headers only, no snapshots yet"
         );
     }
@@ -755,13 +816,7 @@ mod tests {
 
         let mut model = FleetSidebarModel::default();
         model.rebuild(&state, &HashSet::new(), AgentPanelSortConfig::Priority);
-        assert_eq!(
-            (
-                model.groups[0].workspaces.len(),
-                model.groups[0].agents.len()
-            ),
-            (1, 1)
-        );
+        assert_eq!(model.visible_row_count(), 4);
         assert!(!model.groups[0].header.collapsed);
         assert_eq!(model.groups[0].header.label, "▾ local · 1 working");
 
@@ -775,15 +830,16 @@ mod tests {
             (1, 1),
             "collapse is a render decision; the rows stay built"
         );
-        let other = &model.groups[1];
-        assert!(
-            other.workspaces.is_empty() && other.agents.is_empty(),
-            "a host without a snapshot is a header and nothing else"
-        );
+        assert_eq!(model.visible_row_count(), 2, "two headers, no body");
+        let rows = model.visible_rows().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .all(|row| matches!(row, FleetSidebarRow::HostHeader(_))));
     }
 
     #[test]
-    fn groups_hold_each_hosts_own_workspaces_and_agents_in_host_order() {
+    fn visible_rows_walk_header_then_workspaces_then_agents_per_host() {
         let mut state = FleetState::new(vec![local_spec(), ssh_spec("workbox")]);
         for (id, pane) in [(HostId::local(), "w1:p1"), (host("workbox"), "w2:p9")] {
             connect(&mut state, &id, "0.8.2-fork");
@@ -801,20 +857,12 @@ mod tests {
             );
         }
         let model = model_of(&state);
-        // The renderer walks the groups in this order, header first, then
-        // that host's workspaces, then its agents.
         let described = model
-            .groups
-            .iter()
-            .flat_map(|group| {
-                std::iter::once(format!("h:{}", group.header.host))
-                    .chain(
-                        group
-                            .workspaces
-                            .iter()
-                            .map(|row| format!("w:{}", row.workspace)),
-                    )
-                    .chain(group.agents.iter().map(|row| format!("a:{}", row.pane)))
+            .visible_rows()
+            .map(|row| match row {
+                FleetSidebarRow::HostHeader(header) => format!("h:{}", header.host),
+                FleetSidebarRow::Workspace(row) => format!("w:{}", row.workspace),
+                FleetSidebarRow::Agent(row) => format!("a:{}", row.pane),
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -828,13 +876,10 @@ mod tests {
                 "a:workbox/w2:p9",
             ]
         );
-        for group in &model.groups {
+        assert_eq!(model.visible_row_count(), described.len());
+        for row in model.visible_rows() {
             assert!(
-                group
-                    .workspaces
-                    .iter()
-                    .all(|row| row.workspace.host == group.host)
-                    && group.agents.iter().all(|row| row.pane.host == group.host),
+                matches!(row.host().as_str(), "local" | "workbox"),
                 "every row names its own host"
             );
         }
@@ -1127,10 +1172,11 @@ mod tests {
         // must still address two different panes.
         assert_eq!(
             model
-                .groups
-                .iter()
-                .flat_map(|group| group.agents.iter())
-                .map(|agent| agent.pane.to_string())
+                .visible_rows()
+                .filter_map(|row| match row {
+                    FleetSidebarRow::Agent(agent) => Some(agent.pane.to_string()),
+                    _ => None,
+                })
                 .collect::<Vec<_>>(),
             vec!["local/w1:p1", "twin/w1:p1"]
         );
@@ -1248,6 +1294,8 @@ mod tests {
         let state = FleetState::new(Vec::new());
         let model = model_of(&state);
         assert!(model.groups.is_empty());
+        assert_eq!(model.visible_row_count(), 0);
+        assert_eq!(model.visible_rows().count(), 0);
         assert!(model.group(&HostId::local()).is_none());
         assert!(model
             .agent_status(&FleetPaneRef::new(HostId::local(), "w1:p1"))

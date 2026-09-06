@@ -123,29 +123,6 @@ impl EndpointCommands {
         })
     }
 
-    /// Drop the queue and the in-flight command.
-    ///
-    /// The Fleet console calls this when it switches host: the connector
-    /// answers only the host it sent a request to, and `fleet::translate`
-    /// drops an inactive host's answer, so an in-flight command would hold
-    /// this single lane until its 60 s timeout — and its answer, if it did
-    /// arrive, would be applied against the machine the console moved to.
-    pub(super) fn reset(&mut self) {
-        if let Some(in_flight) = self.in_flight.take() {
-            debug!(
-                request_id = in_flight.request_id,
-                "dropping an endpoint command in flight to the previous host"
-            );
-        }
-        self.queued.clear();
-    }
-
-    /// Whether the single lane is free and nothing is waiting for it.
-    #[cfg(test)]
-    pub(super) fn is_idle(&self) -> bool {
-        self.in_flight.is_none() && self.queued.is_empty()
-    }
-
     pub(super) fn expire(&mut self, now: Instant) -> Option<EndpointCommandResult> {
         if let Some(reason) = self.in_flight.as_mut()?.unavailable.take() {
             // Never accepted, so unlike a timeout there is no late answer to

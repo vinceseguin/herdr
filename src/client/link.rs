@@ -61,6 +61,13 @@ impl FleetLink {
         Self { connector, active }
     }
 
+    /// The host every write currently goes to.
+    // Read by the fleet console's host switch (E2 PR 5).
+    #[allow(dead_code)]
+    pub(super) fn active(&self) -> &HostId {
+        &self.active
+    }
+
     /// Hands one command to the active host, saying exactly why it could not.
     fn deliver(&self, command: HostCommand) -> Result<(), LinkWriteError> {
         match self.connector.send(&self.active, command) {
@@ -135,6 +142,8 @@ impl ServerLink {
 
     /// Points a fleet link at another host. A no-op for a single-host client,
     /// which has exactly one server for its whole life.
+    // Called by the fleet console's host switch (E2 PR 5/6).
+    #[allow(dead_code)]
     pub(super) fn set_active(&mut self, host: HostId) {
         match self {
             Self::Single(_) => debug!(%host, "ignoring a host switch on a single-server link"),

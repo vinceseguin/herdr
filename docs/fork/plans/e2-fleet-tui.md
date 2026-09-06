@@ -371,7 +371,7 @@ the binary, commands and paths stay `herdr`.
 | 2 | feat(fleet): pure sidebar and host picker models | A · Foundations | — | ✅ |
 | 3 | refactor: route client writes and fleet events through a server link seam | B · Console loop | 1 | ✅ |
 | 4 | feat: herdr fleet opens the client shell over the fleet connector | B · Console loop | 2, 3 | ✅ |
-| 5 | feat(fleet): sidebar host groups with live status and click-to-switch | C · Fleet UX | 4 | ✅ |
+| 5 | feat(fleet): sidebar host groups with live status and click-to-switch | C · Fleet UX | 4 | ⬜ |
 | 6 | feat(fleet): host picker overlay and fleet.keys host_picker binding | C · Fleet UX | 5 | ⬜ |
 | 7 | feat(fleet): host-aware notifications and cross-host notification targets | C · Fleet UX | 5 | ⬜ |
 | 8 | feat(fleet): reconnect notice for the active host and resize on reconnect | C · Fleet UX | 5 | ⬜ |
@@ -1387,179 +1387,16 @@ bash scripts/fork/fleet-lab.sh down
 
 Evidence: the screen dumps, the two `pane read` counts, the bench table.
 
-**As built (PR 5, merged).** Deviations from the shapes above, all deliberate:
-
-- **`src/client/shell/fleet_sidebar.rs` is a `#[path]` submodule of `render`,
-  not of `shell`** — the same trick `render.rs` already uses for `sidebar.rs`,
-  `tabs.rs` and `overlays.rs`. That is what lets it reuse
-  `render::sidebar`'s row renderers for the active host through `pub(super)`
-  rather than copying them. `src/client/shell.rs` therefore gains only
-  `mod fleet;` plus a `pub(crate) use fleet::{FleetFocusTarget,
-  FleetShellAction, FleetSidebarHit};` re-export.
-- **PR 2's flat row order was removed.** The sidebar is *two* lists (spaces
-  above, agents below) and each host contributes a header to both, so the
-  renderer walks `FleetSidebarModel::groups` once per section.
-  `FleetSidebarRow`, `visible_rows` and both `visible_row_count`s therefore had
-  no consumer and no PR that would give them one (E4's phone list uses
-  `merged_agents()`, as this plan already says), so they are gone rather than
-  carrying an open-ended `#[allow(dead_code)]`; the five tests that covered
-  them assert the same facts over `groups`.
-- **Two upstream files beyond the plan's list, one line each:**
-  `src/client/shell/render.rs` (`ShellRenderState.fleet: Option<&FleetShellState>`,
-  plus `hits.fleet_rows.clear()` in the `!mouse_capture` reset and the
-  `#[path]` module line) and `src/client/shell/composition.rs` (`fleet:
-  self.fleet.as_ref()` in the render state it builds). The model has to reach
-  the renderer somehow, and those are the two places that build it.
-- **`src/client/mod.rs` is edited by this PR** (the plan reserved it for PR 3/4).
-  `dispatch_client_shell_actions` takes `&mut ClientState` instead of `&mut
-  Vec<Child>` and returns the mouse replay plus whether the console needs
-  recomposing. Reason: a fleet action
-  changes the routing target, so it needs the shell, the fleet state, the link
-  and the endpoint lane at once; and the frame its callers composed *before*
-  the dispatch describes the machine the console just left, so they must
-  recompose rather than present it. `handle_fleet_event` also gained the new
-  `apply_changes(state, changes) -> bool` signature, a `flush_pending_focus`
-  call after the active host's snapshot installs, `sync_switching_notice`, and
-  `fleet::present(state)` on the arms that change only the sidebar (another
-  host's status is nothing else in the loop would repaint for).
-- **`sidebar.rs` and `agent_sidebar.rs` were split, not just delegated.**
-  `render_sidebar`'s workspace body became `render_workspace_body` and
-  `render_agent_panel`'s chrome became `render_agent_panel_header` +
-  `render_no_matching_agents`, so both the single-host and the console paths
-  draw the identical rows; `workspace_rows`, `render_workspace_rows`,
-  `displayed_workspace_status`, `parent_group_key`, `agent_rows`,
-  `render_agent_row` and `AgentRow` became `pub(super)`. Both delegations live
-  in `sidebar.rs` (`agent_sidebar.rs` has none). The diff on `sidebar.rs` is
-  large because a block moved, not because it was rewritten.
-- **`fleet_sidebar_update(model, active, switching_to)` takes three arguments**
-  (the plan sketched two): both are read by the same frame and a separate
-  setter would let a caller install one without the other.
-  `set_fleet_switching(Option<HostId>) -> bool` updates just the marker in
-  place, so a switch finishing costs no model clone.
-- **`fleet_sidebar_matches` gates the repaint.** A rebuild is cheap; installing
-  one is a whole-console compose. An inactive host bumping its revision
-  changes no visible row, so the loop compares the rebuilt groups against what
-  the shell already holds and installs only on a difference.
-- **Header heights are 1-or-2 and cached** (`FleetShellState::header_heights`,
-  keyed by `model.generation`): the reason is drawn as a second dimmed line
-  under the header rather than folded into the label, because at an 18-36
-  column sidebar the folded form truncates the reason away. That is the one
-  variable height an inactive host has; every other fleet row is exactly one
-  line.
-- **`EndpointCommands::reset()` added and called** in `switch_host`, the hazard
-  PR 3 recorded and PR 4 deferred. Plus `is_idle()` (`#[cfg(test)]`) so a test
-  can pin that the lane is actually released.
-- **`switch_host` is split into `switch_target_allowed` + `retarget_host`**, so
-  the routing half — connector, link, fleet state, endpoint lane — is testable
-  against `test_support::FakeHost` without a terminal or a shell. Order is:
-  announce geometry → `connector.set_active` → `state.set_active_host` →
-  `link.set_active` → `endpoint_commands.reset()` → shell reset → install the
-  new host's snapshot and methods → rebuild → flush the pending focus.
-- **`reset_for_host_switch` clears `hits`, and that is the point.**
-  `ShellHitMap::workspaces`/`agents` hold the *old* host's bare server-side
-  ids and a click resolves them against whatever host is active now, so they
-  must not outlive the switch. The console is therefore unclickable for the
-  window between the switch and the new host's first frame — deliberate, and
-  the safe direction.
-- **`FleetShellAction::SortChanged`** is a third variant: agent order inside
-  every group is a function of `[ui] agent_panel_sort`, which the user can
-  toggle by clicking the agent panel's sort label, so that click pushes an
-  action that rebuilds the model. Other writers of the preference (a config
-  reload) are picked up at the next fleet change, because `apply_changes`
-  always reads the live value from the shell.
-- **`scripts/fork/tui-drive.py` gained `--redraw`** (resize the window and
-  back, then forget the text so far). A client draws frame *diffs*, so a
-  screen that changed one character only ever wrote that character: without a
-  forced full repaint, no `--dump` can be read as a screen. Every later PR's
-  screen evidence should use it.
-- **The console composes from a placeholder when the active host cannot draw**
-  — the review found that without it, switching to a host that is down or
-  still connecting bricked the console: `compose` returned `None`, so the
-  terminal kept the *previous* host's frame, the sidebar could not show the
-  switch, and — because `reset_for_host_switch` empties the hit map — no
-  further click registered anywhere. `FleetShellState` now carries an empty
-  projection/surface pair and a precomputed `pane_notice`; `compose` falls back
-  to it **only** in fleet mode and only when there is no snapshot or no
-  surface (the revision-mismatch skip and the single-host client are
-  unchanged, both pinned by tests), and `render_pane_notice` draws
-  `switching to <host>…` over the pane area. This is the `composition.rs`
-  hook the plan budgeted for **PR 8**, landed early because PR 5 is what
-  creates the state it covers; PR 8 replaces the text with the reconnect
-  notice.
-- **A terminal resize while the active host cannot render** used to leave the
-  console without a hit map for the same reason (`invalidate_pane_surface`
-  clears `hits` and waits for a surface that never comes), so the Resize arm
-  calls `fleet::present_after_resize`, which recomposes only when a switch is
-  pending or the active host is not `Connected`.
-- **Requests produced before a switch go to the host that produced them.**
-  A click on another host's row and keystrokes can arrive in one stdin batch:
-  `finish_client_shell_input` now writes `outcome.requests` *before* the
-  dispatch when the batch contains a `SwitchHost`, and
-  `dispatch_client_shell_actions` drops an `Endpoint` action that follows a
-  switch in the same batch (`FleetActionOutcome { repaint, switched }`). The
-  invariant is that a message only ever reaches the host whose ids it carries.
-- **`reset_for_host_switch` had to be a complete boot reset.** Because it drops
-  the snapshot, the new host's `set_snapshot` does *not* take upstream's
-  `boot_changed` path, so everything that path clears is cleared here —
-  including `overlay = None` (a deviation from the plan's "overlay stays": a
-  Rename/ConfirmClose/Worktree/ContextMenu overlay holds the previous host's
-  ids and the Navigator indexes its projection), the selection autoscroll and
-  highlight deadlines, copy feedback, `endpoint_notice_seen`, the mobile
-  switcher fields and `dismissed_product_announcement`.
-- Behaviour worth knowing: what is typed while the target host is not
-  connected is *dropped* by `FleetLink::send`, never queued, which is the rule
-  **PR 8** makes visible; and `switching to <host>…` stays on a host that never
-  comes back until PR 8 replaces it with the reconnect notice.
-
 **Downstream**
 
 - `FleetShellAction::SwitchHost` is the one way to change hosts; PR 6 (picker),
-  PR 7 (notification target) and E7 (picker actions) emit it. It is dispatched
-  from `dispatch_client_shell_actions`, so any surface that emits it must
-  return it in `ClientShellInput::actions` like the sidebar does.
+  PR 7 (notification target) and E7 (picker actions) emit it.
 - `hits.fleet_rows` is host-qualified; any new clickable fleet element uses
   `FleetSidebarHit`, never a bare pane id.
 - E7 adds a `Prompt`/`SendKeys` variant to `FleetShellAction` without
   switching; it reuses `FleetLink` with an explicit host.
-- **PR 6:** `host_picker_rows`, `HostPickerRow` and `HostRowState::state_name`
-  carry `#[allow(dead_code)]` naming PR 6 — delete those three attributes when
-  the overlay lands. The picker must ignore a row whose `enabled` is `false`
-  (`switch_target_allowed` refuses it anyway, with a `warn!`) and must not
-  switch to the host that is already active. `FleetShellState` is
-  `pub(super)` inside `client::shell`, so the overlay renderer belongs in that
-  module tree too.
-- **PR 7:** `FleetSidebarModel::agent_status` carries an `#[allow(dead_code)]`
-  naming PR 7 — delete it. A cross-host notification target is a
-  `FleetShellAction::SwitchHost { then_focus }`; the focus is already deferred
-  until the target host has a projection (`FleetClientState::pending_focus` +
-  `flush_pending_focus`, called from the loop's snapshot arm), so PR 7 needs no
-  second mechanism.
-- **PR 8:** `FleetShellState::switching_to` and `FleetClientState::
-  pending_switch` are wired end to end — the header draws `…` on the host being
-  switched to, and `translate` clears the flag on that host's first surface.
-  **The `composition.rs` notice hook already exists** (`FleetShellState::
-  placeholder` + `render_pane_notice`, reached from `compose` when the active
-  host has no projection or no surface): PR 8 replaces the notice *text* for a
-  host that is `Unavailable`/`Connecting` rather than adding a second path, and
-  should decide when "switching to <host>…" becomes "reconnecting to
-  <host>…". `fleet::present(state)` and `fleet::present_after_resize(state)`
-  are the fork-owned compose-and-present helpers. PR 8 also owns the deferred
-  items the PR 5 review listed: `reveal_workspace`/`workspace_drop_target_at`
-  index the active host's `workspace_entries` against a fleet row list that
-  also holds headers and other hosts' rows (Navigate-mode reveal can land one
-  row off, the drag indicator can draw on a fleet row), and a host's *first*
-  connection attempt reads as "reconnecting (attempt 1)".
 
 ### PR 6 — feat(fleet): host picker overlay and fleet.keys host_picker binding · deps: 5
-
-**From PR 5 (as built):** the picker emits `ClientShellAction::Fleet(
-FleetShellAction::SwitchHost { host, then_focus: None })`, which
-`dispatch_client_shell_actions` (`src/client/mod.rs`) already routes to
-`fleet::handle_shell_action`; nothing new is needed on the loop side. Remove
-the `#[allow(dead_code)]` on `host_picker_rows`, `HostPickerRow` and
-`HostRowState::state_name` in `src/fleet/sidebar.rs` — this PR consumes them.
-A row with `enabled == false` and the row for the active host are not switch
-targets (`switch_target_allowed` refuses both).
 
 **Goal:** `prefix+shift+h` (configurable as `[fleet.keys] host_picker`) opens a
 host picker overlay listing every host with state and counts; `enter` /
@@ -1650,13 +1487,6 @@ bash scripts/fork/fleet-lab.sh down
 
 ### PR 7 — feat(fleet): host-aware notifications and cross-host notification targets · deps: 5
 
-**From PR 5 (as built):** opening another host's notification is a
-`FleetShellAction::SwitchHost { host, then_focus: Some(FleetFocusTarget::
-Pane(id)) }`; `FleetClientState::pending_focus` + `fleet::flush_pending_focus`
-already hold that focus until the target host has installed a projection, so
-this PR adds the *target*, not a second deferral. Remove the
-`#[allow(dead_code)]` on `FleetSidebarModel::agent_status`.
-
 **From PR 4:** `translate` currently **clears** `workspace_id`, `tab_id` and
 `pane_id` on a notification from an inactive host (they would otherwise be
 validated, suppressed or focused against the active host's snapshot — every
@@ -1730,18 +1560,6 @@ bash scripts/fork/fleet-lab.sh down
   server fact.
 
 ### PR 8 — feat(fleet): reconnect notice for the active host and resize on reconnect · deps: 5
-
-**From PR 5 (as built):** `FleetShellState::switching_to` and
-`FleetClientState::pending_switch` already track a switch in flight (the
-header draws `…`; `translate` clears it on the new host's first surface), and
-`ClientShellState::reset_for_host_switch` already drops the old host's
-surface, hit map and snapshot. So the two states this PR must draw in the pane
-area are the same one: the console has no surface to compose. Note `compose`
-returns `None` without a surface, so the notice has to be drawn *instead of*
-the normal composition path, not inside it. `fleet::present(state)` is the
-fork-owned compose-and-present helper. Input typed while the active host is
-down is already dropped by `FleetLink::send` with a `debug!` — this PR makes
-that visible, it must not start queueing it.
 
 **From PR 4:** "resize on reconnect" is already true — the
 `ClientLoopEvent::Resize` arm calls `FleetClientState::announce_geometry`,

@@ -22,23 +22,11 @@ fn restore_mode_bar(
 impl ClientShellState {
     pub(crate) fn compose(&mut self, cols: u16, rows: u16) -> Option<FrameData> {
         self.last_composed_size = Some((cols, rows));
-        // A Fleet console keeps drawing its chrome while the active host has
-        // no projection or no surface, composing the pane area from an empty
-        // placeholder instead (fork, E2 PR 5). A single-host client has no
-        // fleet state and draws nothing until its server does, as before.
-        let (snapshot, surface, placeholder) =
-            match (self.snapshot.as_deref(), self.pane_surface.as_ref()) {
-                (Some(snapshot), Some(surface)) => {
-                    if snapshot.revision != surface.projection_revision {
-                        return None;
-                    }
-                    (snapshot, surface, false)
-                }
-                (snapshot, _) => {
-                    let (snapshot, surface) = self.fleet.as_ref()?.placeholder(snapshot);
-                    (snapshot, surface, true)
-                }
-            };
+        let snapshot = self.snapshot.as_deref()?;
+        let surface = self.pane_surface.as_ref()?;
+        if snapshot.revision != surface.projection_revision {
+            return None;
+        }
         let layout = self.layout(cols, rows);
         if self.last_tab_bar_width != Some(layout.tab_bar.width) {
             self.last_tab_bar_width = Some(layout.tab_bar.width);
@@ -79,14 +67,8 @@ impl ClientShellState {
                     .flatten(),
                 dragged_workspace_id,
                 workspace_drop_indicator_row,
-                fleet: self.fleet.as_ref(),
             },
         );
-        if placeholder {
-            if let Some(fleet) = self.fleet.as_ref() {
-                fleet.render_pane_notice(&mut buffer, layout.pane_surface, &self.config);
-            }
-        }
         self.hits.panes = surface
             .panes
             .iter()
