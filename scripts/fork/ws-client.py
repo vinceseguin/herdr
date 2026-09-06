@@ -17,7 +17,9 @@ flags may be added but these three line shapes never change:
     close <code>            the peer's close frame (its reason goes to stderr)
 
 Control frames are protocol noise, not messages: a ping is answered with a
-pong and reported on stderr, and neither is counted by --max-messages.
+pong and reported on stderr, and neither is counted by --max-messages. They may
+legally arrive between the fragments of a fragmented message, so they are
+handled without touching the message being reassembled.
 
 Exit codes:
 
@@ -172,8 +174,22 @@ class Connection:
         if first & 0x70:
             raise ProtocolError("a reserved bit was set")
         opcode = first & 0x0F
+        control = bool(opcode & 0x08)
         masked = bool(second & 0x80)
         length = second & 0x7F
+        # RFC 6455 §5.5: a control frame carries at most 125 bytes and is never
+        # fragmented. Both are checked here rather than at the call site,
+        # because a control frame may legally arrive *between* the fragments of
+        # a message and would otherwise be spliced into it.
+        if control and not fin:
+            raise ProtocolError(f"a fragmented control frame (opcode {opcode})")
+        # `length` is still the 7-bit field here, so 126 and 127 (the extended
+        # length markers) fail this too — which is exactly right: a control
+        # frame may not use them.
+        if control and length > 125:
+            raise ProtocolError(
+                f"a control frame (opcode {opcode}) over the 125-byte limit"
+            )
         if length == 126:
             (length,) = struct.unpack("!H", self.read_exactly(2))
         elif length == 127:
@@ -286,6 +302,12 @@ def run(args: argparse.Namespace) -> int:
     except Timeout:
         log("handshake timed out")
         return 3
+    # `socket.create_connection` and the TLS handshake raise the builtin
+    # `TimeoutError`, which is an `OSError`; it means the same thing as our own
+    # `Timeout` and must not be reported as a transport error.
+    except TimeoutError:
+        log("handshake timed out")
+        return 3
     except OSError as error:
         log(f"could not connect: {error}")
         return 1
@@ -354,6 +376,10 @@ def run(args: argparse.Namespace) -> int:
         log(f"protocol error: {error}")
         connection.close(1002)
         return 1
+    except TimeoutError:
+        log("timed out")
+        connection.close(1001)
+        return 3
     except OSError as error:
         log(f"transport error: {error}")
         connection.close(1001)

@@ -203,6 +203,14 @@ async fn run_events<S: EventSink>(
     }
 
     let mut ping = tokio::time::interval(ping_interval);
+    // `Delay`, not the default `Burst`: a socket whose peer read slowly for a
+    // while (a phone on a bad link, a browser tab that was throttled) delays
+    // this loop past several periods, and a bursting interval would then fire
+    // every missed tick back to back — closing a client that had answered
+    // every ping it was actually given a chance to answer. `Delay` restarts
+    // the period from the tick it did deliver, so the limit below always
+    // counts pings the peer had a whole interval to answer.
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // `interval` fires immediately; the first tick is consumed here so a fresh
     // socket is not pinged before it has been idle for a whole period.
     ping.tick().await;
@@ -312,6 +320,11 @@ mod tests {
         gone_after: Option<usize>,
         /// `(after N messages, fleet, events to fold)`.
         inject: Option<(usize, FleetHandle, Vec<HostEvent>)>,
+        /// A peer that answers every ping, until this many have been sent —
+        /// then it hangs up, so the test ends without a timeout.
+        answer_pings: Option<u32>,
+        /// How many pings this peer has already answered.
+        answered: u32,
     }
 
     impl Recorder {
@@ -361,6 +374,18 @@ mod tests {
         }
 
         async fn recv(&mut self) -> ClientEvent {
+            if let Some(limit) = self.answer_pings {
+                if self.pings >= limit {
+                    return ClientEvent::Closed;
+                }
+                if self.pings > self.answered {
+                    // A pong is ordinary inbound traffic to the loop, which is
+                    // the whole point: axum surfaces `Message::Pong` on
+                    // `recv`, so answering is what proves a peer alive.
+                    self.answered = self.pings;
+                    return ClientEvent::Alive;
+                }
+            }
             // A silent client: the loop must be driven by the fleet and the
             // ping timer, never by this arm resolving spuriously.
             std::future::pending().await
@@ -539,6 +564,55 @@ mod tests {
 
         assert_eq!(sink.kinds(), vec!["hello"], "{:?}", sink.sent);
         assert_eq!(sink.closed, None, "a gone peer gets no close frame");
+    }
+
+    /// A client that answers its pings is never dropped, however long it has
+    /// nothing else to say. The counter has to be *reset* by inbound traffic,
+    /// not merely incremented slower than the limit — a browser tab that is
+    /// only watching sends nothing but pongs for hours.
+    #[tokio::test]
+    async fn a_client_that_answers_pings_is_kept() {
+        const PINGS: u32 = MISSED_PONG_LIMIT * 3;
+        let (fleet, _stop) = handle(16);
+        let mut sink = Recorder {
+            answer_pings: Some(PINGS),
+            ..Recorder::default()
+        };
+
+        run_events(
+            &mut sink,
+            &fleet,
+            "0.0.0-test",
+            TokenScope::Read,
+            Duration::from_millis(5),
+        )
+        .await;
+
+        // Without the reset the loop would have given up at ping
+        // `MISSED_PONG_LIMIT + 1`; it got well past that and ended only
+        // because this peer hung up.
+        assert_eq!(sink.pings, PINGS);
+        assert_eq!(sink.kinds(), vec!["hello", "fleet"], "{:?}", sink.sent);
+    }
+
+    /// A message that will not serialize ends the socket instead of panicking
+    /// or silently pretending the client received it: a daemon must survive a
+    /// shape it cannot spell, and a client that reconnects gets a fresh report.
+    #[tokio::test]
+    async fn a_message_that_will_not_serialize_closes_the_socket() {
+        struct Unserializable;
+
+        impl serde::Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("this shape has no JSON"))
+            }
+        }
+
+        let mut sink = Recorder::default();
+
+        assert_eq!(send(&mut sink, &Unserializable).await, Err(Gone));
+        assert!(sink.sent.is_empty(), "{:?}", sink.sent);
+        assert_eq!(sink.closed, None);
     }
 
     /// The `Arc<str>` a change arrives as is forwarded, not rebuilt: this pins

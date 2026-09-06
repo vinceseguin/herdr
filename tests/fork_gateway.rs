@@ -554,3 +554,69 @@ fn events_closes_with_going_away_when_the_gateway_stops() {
         "{lines:?}"
     );
 }
+
+/// The feed is a feed: a `read` client that talks anyway is ignored, and a
+/// client that talks *too much* takes down only its own socket.
+///
+/// Both halves are one test because they share a gateway and neither needs a
+/// lab: an empty fleet still exercises the whole handshake and the inbound cap.
+#[test]
+fn events_ignores_client_chatter_and_survives_an_oversized_message() {
+    let (_home, env) = hostless_env("events-inbound");
+    let gateway = Gateway::spawn_in(env);
+
+    // Anything a client says on this socket is dropped — including a message
+    // shaped like the terminal input a `read` token may never send.
+    let chatty = gateway.ws(
+        "/api/events",
+        &[
+            "--send",
+            r#"{"type":"terminal.input","data":"rm -rf /"}"#,
+            "--max-messages",
+            "2",
+            "--timeout",
+            "20",
+        ],
+    );
+    let lines = support::gateway::ws_lines(&chatty);
+    assert_eq!(chatty.status.code(), Some(0), "{lines:?}");
+    let kinds: Vec<Option<String>> = lines
+        .iter()
+        .map(|line| {
+            support::gateway::ws_text_json(line)["kind"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![Some("hello".to_string()), Some("fleet".to_string())],
+        "{lines:?}"
+    );
+
+    // A message past the 4 KiB inbound cap ends that socket. The exit code is
+    // deliberately not asserted (the peer may see a close frame or a reset);
+    // what matters is that the *gateway* is unharmed.
+    let oversized = format!(r#"{{"pad":"{}"}}"#, "x".repeat(8 * 1024));
+    let _ = gateway.ws(
+        "/api/events",
+        &[
+            "--send",
+            &oversized,
+            "--max-messages",
+            "2",
+            "--timeout",
+            "20",
+        ],
+    );
+
+    assert_eq!(gateway.http_get("/health", &[]).status, 200);
+    let again = gateway.ws("/api/events", &["--max-messages", "2", "--timeout", "20"]);
+    let lines = support::gateway::ws_lines(&again);
+    assert_eq!(again.status.code(), Some(0), "{lines:?}");
+    assert_eq!(
+        support::gateway::ws_text_json(&lines[1])["kind"].as_str(),
+        Some("fleet"),
+        "{lines:?}"
+    );
+}
