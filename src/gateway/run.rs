@@ -31,6 +31,7 @@ use crate::gateway::fleet::FleetRuntime;
 use crate::gateway::paths;
 use crate::gateway::policy::{BindPolicy, OriginAllowlist};
 use crate::gateway::server::{self, AppState, AuthState, GatewayInfo};
+use crate::gateway::transports::HostTransports;
 use crate::gateway::GATEWAY_COMMAND_LINE;
 
 /// Exit code for a usage error, matching the fleet CLI.
@@ -220,10 +221,15 @@ async fn serve_until_signal(
     let origins = OriginAllowlist::for_bind(listen, &config.gateway);
     warn_if_a_browser_cannot_reach_it(listen, &config.gateway, &origins);
 
+    // Built here rather than inside the router so `run` keeps a handle: the
+    // teardown order below (sessions, then transports, then the connector) is
+    // the E1 drop hazard, not a preference.
+    let transports = std::sync::Arc::new(HostTransports::new(config));
     let state = AppState {
         fleet: fleet.handle(),
         auth: std::sync::Arc::new(AuthState::new(tokens, devices, &config.gateway, origins)),
         info: std::sync::Arc::new(GatewayInfo::new(listen, &config.gateway)),
+        transports: std::sync::Arc::clone(&transports),
     };
 
     // Before the address is announced, so nothing that reacts to that line can
@@ -256,6 +262,14 @@ async fn serve_until_signal(
     let outcome = server::serve(listener, state, shutdown).await;
 
     tracing::info!(target: "gateway", "gateway stopping");
+    // Sessions first: a terminal stream lives in its own task that the server
+    // does not own, so latching the stop flag is what ends it. Then the
+    // transports, whose ssh bridges unlink their forward sockets on drop and
+    // would block if a stream were still open. Then the connector.
+    let stopped = tokio::task::spawn_blocking(move || transports.shutdown()).await;
+    if let Err(error) = stopped {
+        tracing::warn!(target: "gateway", error = %error, "the transport shutdown task failed");
+    }
     fleet.shutdown().await;
     if let Err(error) = remove_runtime_marker(&marker) {
         tracing::warn!(target: "gateway", error = %error, "could not remove the gateway runtime marker");

@@ -111,8 +111,12 @@ use handshake::{
 use notifications::{handle_notify, handle_shell_notification_effects};
 #[cfg(test)]
 use notifications::{handle_notify_with_notifiers, sound_from_notify_message};
-#[cfg(test)]
-use terminal_sessions::terminal_control_command_from_json;
+// The JSON terminal-control vocabulary. The gateway's WebSocket terminal
+// stream parses client commands with this exact function so the two spellings
+// (`terminal.input`, `terminal.resize`, `terminal.scroll`, `terminal.release`)
+// cannot drift apart; `terminal_sessions` itself stays private.
+#[cfg(any(test, feature = "gateway"))]
+pub(crate) use terminal_sessions::terminal_control_command_from_json;
 
 #[cfg(unix)]
 use std::collections::HashMap;

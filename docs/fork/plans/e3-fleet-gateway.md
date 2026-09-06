@@ -670,7 +670,7 @@ exactly these E1 contracts (verified in the code):
 | 3 | feat(gateway): passive async fleet runtime folding connector events into shared state | A · Foundations | 1 | ✅ |
 | 4 | feat(gateway): herdr gateway serves health, fleet report and embedded assets over http | B · HTTP | 2, 3 | ✅ |
 | 5 | feat(gateway): websocket fleet event stream | C · Streams | 4 | ✅ |
-| 6 | feat(gateway): websocket terminal observe stream over per-host transports | C · Streams | 4 | ⬜ |
+| 6 | feat(gateway): websocket terminal observe stream over per-host transports | C · Streams | 4 | ✅ |
 | 7 | feat(gateway): terminal control mode gated by the control scope | C · Streams | 6 | ⬜ |
 | 8 | feat(gateway): pairing urls with qr codes, device cookies, status and token rotation | D · Ops | 4 | ⬜ |
 | 9 | feat(fleet): opt-in hosts from saved machine profiles | D · Ops | 3 | ✅ |
@@ -2316,8 +2316,9 @@ sockets left, the empty stderr capture.
 
 - `herdr.fleet.terminal.v1`: `terminal.open` first, `terminal.ready`, then
   binary frames with the 14-byte header; text `terminal.error {code}` codes
-  are `bad_request`, `forbidden`, `host_unavailable`, `pane_not_found`,
-  `unsupported`, `internal`; `terminal.closed {reason}` precedes a server-
+  are `bad_request`, `forbidden`, `host_unavailable`, `host_busy`,
+  `pane_not_found`, `unsupported`, `internal`; `terminal.closed {reason}`
+  precedes a server-
   initiated close. E4's xterm.js writes `frame[14..]`; a `full == 1` frame
   may be preceded by a `reset()`.
 - `HostTransports` is the only way the gateway opens a per-host stream; E7
@@ -2327,7 +2328,159 @@ sockets left, the empty stderr capture.
 - Shutdown order — sessions, then transports, then the connector — is
   fixed (E1 drop hazard).
 
+**Landed** (merged; gate `EXIT=0` for both `ci` and `ci-no-default`)
+
+- **The terminal vocabulary, frozen.** `herdr.fleet.terminal.v1`, named in the
+  `schema` field of `terminal.ready`. Client → gateway, text JSON only:
+  `terminal.open {type, mode: "observe"|"control", cols, rows, takeover?}`
+  (**first message, required within 10 s**, `deny_unknown_fields`), then the
+  CLI's own vocabulary parsed by `crate::client::terminal_control_command_from_json`
+  — `terminal.input {text|bytes}`, `terminal.resize {cols, rows,
+  cell_width_px?, cell_height_px?}`, `terminal.scroll {direction, lines,
+  source?, column?, row?, modifiers?}`, `terminal.release {}`. Gateway →
+  client: text `terminal.ready {type, schema, mode, host, pane, ref, cols,
+  rows}`, then **binary** frames, then text `terminal.error {type, code,
+  message}` or `terminal.closed {type, reason}`. Codes are `bad_request`,
+  `forbidden`, `host_unavailable`, **`host_busy`**, `pane_not_found`,
+  `unsupported`, `internal` — `host_busy` is one more than the plan listed;
+  see the ssh note below.
+- **The binary frame header PR 7 and E4 read** is 14 bytes, little-endian:
+  `[kind u8 = 0x01][seq u64][width u16][height u16][full u8]` then the
+  server's already-diffed ANSI verbatim. A client must ignore a binary message
+  whose first byte it does not know. `encode_frame` copies the payload once and
+  never re-encodes it.
+- **Decision (i) is resolved: `terminal.scroll` in observe mode is
+  `unsupported`.** `headless.rs:1408` requires `ClientConnectionMode::
+  TerminalAttach`, so an observer's `AttachScroll` is dropped on the floor, and
+  what it would move for a controller is the *shared* scrollback, not a
+  client-local viewport. Verified live: the gateway answers
+  `{"code":"unsupported","message":"the host ignores scrollback commands from
+  an observer; scroll in the client instead"}` and the socket stays open. An
+  observer's `terminal.resize` **is** honoured and is client-local
+  (`headless.rs:2205-2222`), so every observer sizes its own viewport.
+- **A viewport ceiling that the plan did not ask for.** The server clamps a
+  client's geometry to a *minimum* only and renders an observer at whatever it
+  declared, so a `read` credential could have made a host render 65535×65535 on
+  every repaint. `protocol::check_geometry` caps both dimensions at
+  `MAX_TERMINAL_COLS/ROWS = 1024` for `terminal.open` **and** for every
+  `terminal.resize` (`bad_request`, not forwarded).
+- **An ssh host serves one terminal stream at a time.** `SshStdioBridge`'s
+  accept loop (`src/remote/attach.rs:1871`) runs `bridge_connection` inline, so
+  a shared per-host `SshTransport` carries one bridged connection; a second
+  `connect` would sit in the listen backlog and time out 60 s later as
+  `host_unavailable`. `HostTransports` therefore claims an ssh host's slot
+  under the transport lock, waits `EXCLUSIVE_WAIT = 2 s` for a release (which
+  covers a browser reload), then refuses with `io::ErrorKind::ResourceBusy` →
+  `terminal.error host_busy`, close `1013`. **Local hosts are unlimited** —
+  three concurrent observers on one local pane each got `terminal.ready` and a
+  full frame. The real fix is a concurrent bridge in `src/remote/**`, which
+  this epic freezes. **PR 7 inherits this:** a control session holds that slot
+  too, so a controller and an observer cannot share one ssh host.
+- **`AppState` did not gain a `config: Arc<Config>` field** (PR 4 asked for
+  one). Nothing else in a handler reads `Config`, so an otherwise-unread field
+  would need a dead-code allow; instead `run()` builds
+  `Arc<HostTransports>` from `&config` (via `FleetConnectorOptions::for_daemon`)
+  and `AppState` carries `transports: Arc<HostTransports>`. `run` keeps the
+  other half of the `Arc` so it can order the teardown.
+- **The socket scope is a prefix, not a replacement.**
+  `SshTransport::new_scoped(host, target, session, manage_ssh_config,
+  noninteractive, scope)` derives its forward socket from
+  `socket_scope(scope, host)`, which is `host` for the empty scope and
+  `"{scope}-{host}"` otherwise — so E1's names are byte-identical and the
+  gateway's are distinct. `SshTransport::new` is **gone**; every caller passes
+  a scope, `transport_for` through `CONNECTOR_TRANSPORT_SCOPE = ""` and the
+  gateway through `GATEWAY_TRANSPORT_SCOPE = "gateway"`. Residual, documented
+  on `socket_scope`: `-` is inside a host id's alphabet, so a host literally
+  named `gateway-x` collides with the gateway's scope for host `x` when both
+  also share a target *and* a session — and the loser fails loudly with
+  `AddrInUse`, never silently to the other's bridge.
+- **`src/client/mod.rs` needed one line more than "one word".** Widening
+  `terminal_control_command_from_json` to `pub(crate)` is not enough because
+  `mod terminal_sessions` is private; the re-export is
+  `#[cfg(any(test, feature = "gateway"))] pub(crate) use
+  terminal_sessions::terminal_control_command_from_json;`. The module stays
+  private.
+- **Teardown order is enforced, not hoped for.** `WebSocketUpgrade::on_upgrade`
+  detaches its task with `tokio::spawn`, so a session outlives the server
+  future. `HostTransports` owns a `watch` stop latch: `run.rs` calls
+  `begin_shutdown` + `shutdown` (on `spawn_blocking`) **after** `server::serve`
+  returns and **before** `fleet.shutdown()`; every session selects on the latch
+  and ends, releasing a `StreamLease` that `shutdown` waits for (bounded,
+  `RELEASE_WAIT = 3 s`) before dropping the transports. A session must
+  subscribe *before* it calls `connect` — `connect` refuses once the latch is
+  set, so the two leave no gap.
+- **`decode_frame_header`/`FrameHeader` are `#[cfg(test)]`.** The gateway only
+  ever writes headers; the decoder exists so the layout has one definition the
+  round-trip test pins, and `tests/fork_gateway.rs` re-implements it once as
+  the reader E4 writes in TypeScript.
+- **`src/gateway/protocol.rs` is shared with PR 5** and is split into
+  `// ---- events (PR 5) ----` and `// ---- terminal (PR 6) ----` sections with
+  a test module each (`events_tests`, `terminal_tests`,
+  `terminal_message_tests`). `GatewayInfo::features()` is now
+  `["fleet", "events", "terminal"]`; PR 8 appends `"pairing"`. The
+  `#[allow(dead_code)]` on `mod fleet;` is **gone**.
+- **Route-level facts.** A malformed target (`HostId::new` refuses it, the pane
+  id is empty, contains `/`, or contains a control character) is `404
+  {"error":"not_found"}` **on the handshake**, before the upgrade — a control
+  character is refused because the pane id is a log field. A missing credential
+  is `401` (the auth layer answers before any extractor). Everything after the
+  upgrade — an unknown host, a pane the host cannot resolve, a scope that is
+  too narrow — is a `terminal.error` on the socket, never a 5xx.
+- **The `fable` review changed six things**, all now the contract: the ssh
+  exclusivity and `host_busy` above; the geometry ceiling above; the
+  global lease is claimed at the *top* of `connect` and the slot map carries a
+  `closed` flag, so a connect racing a shutdown cannot leave a forward socket
+  on disk; a host slot remembers the `HostSpec` it was built from and rebuilds
+  on mismatch (a host id that came to name another machine would otherwise
+  keep bridging to the old one); control characters in a pane id; and a broken
+  stream is now `TerminalEvent::Failed` → `terminal.error internal` instead of
+  a silent `terminal.closed {reason:null}`.
+- **Known, out of scope:** `just windows-lint` fails on PR 4's
+  `server::shutdown_signal` (`clippy::manual_async_fn` on its non-unix body).
+  It is the only error on that target, fork CI does not run `windows-lint`, and
+  this PR's `#[cfg(not(unix))]` code lints clean. PR 10 or PR 8 should add the
+  scoped allow with PR 4's "must not be an `async fn`" reason.
+- **Real-server evidence** (fleet lab `lab-1`/`lab-2` + `ssh-lab.sh` on port
+  2306 under `HERDR_FLEET_LAB_ROOT=/tmp/herdr-fleet-lab-e3-pr6`, gateway on
+  `127.0.0.1:7796`): `/api/gateway` `features == ["fleet","events","terminal"]`;
+  observe on `lab-2/w1:p1` → `terminal.ready` with `ref == "lab-2/w1:p1"` then
+  a binary frame decoding to `kind 1 seq 1 80x24 full 1`, 2219-byte payload
+  containing `herdr-fleet-lab:lab-2`; `terminal.input` → `forbidden` and
+  `pane read | grep -c INJECTED` = 0; `terminal.scroll` → `unsupported`;
+  `terminal.resize {cols:65535}` → `bad_request`; a live `echo` produced a
+  second frame `seq 2 full 0` of 99 bytes containing the new text; three
+  concurrent local observers all got `ready` + a full frame; the ssh host
+  streamed `herdr-fleet-lab:lab-1` over the bridge and the gateway-scoped
+  socket `/tmp/herdr-remote-<pid>-gateway-lab-ssh-herdr-ssh-lab-lab-1.sock`
+  appeared **only after** the first terminal, alongside the connector's
+  unchanged `/tmp/herdr-remote-<pid>-lab-ssh-herdr-ssh-lab-lab-1.sock`; the
+  bridge child's argv carries `BatchMode=yes`, `NumberOfPasswordPrompts=0`,
+  `StrictHostKeyChecking=yes`; a second concurrent ssh observer got
+  `host_busy` + close `1013` while the first was unaffected, and a sequential
+  reconnect worked; `SIGTERM` exited **0**, removed `gateway.json` and both
+  forward sockets, and the daemon's stderr held **zero** non-`gateway` lines.
+
 ### PR 7 — feat(gateway): terminal control mode gated by the control scope · deps: 6
+
+> **From PR 6 (landed):** the pieces are in place; `mode: "control"` currently
+> answers `terminal.error {code:"unsupported"}` *after* the scope check, so a
+> `read` credential already gets `forbidden` and PR 7 only replaces the
+> `unsupported` arm. Extend `SessionPolicy::admit`, which already has the
+> control rows and is re-run on **every** message — the route's
+> `require(&principal, TokenScope::Read)` is not the gate. `TerminalOpen.
+> takeover` is parsed and carries a narrow allow naming this PR; remove it.
+> Send `ControlTerminal { target, takeover }` where PR 6 sends
+> `ObserveTerminal { target }` (`negotiate_observe` is the split-out
+> handshake). Apply `protocol::check_geometry` to a controller's
+> `terminal.resize` too — it is the PTY size, not a client-local viewport.
+> Two server facts to handle: a second `ControlTerminal` without `takeover`
+> gets `ServerShutdown { "… already has an attached client; retry with
+> --takeover" }` **and is disconnected**, so classify that reason next to
+> `classify_shutdown_reason`'s `pane_not_found` arm and give it a code rather
+> than a plain `terminal.closed`; and a takeover evicts the previous owner the
+> same way, so its session sees a shutdown it must not report as an error.
+> Remember an ssh host serves **one** terminal stream at a time (`host_busy`),
+> so a controller and an observer cannot share one ssh host today.
 
 **Goal:** a device or bearer with the `control` scope can open a terminal
 in `mode: "control"`: the gateway sends `ControlTerminal { target, takeover

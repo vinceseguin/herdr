@@ -52,14 +52,38 @@ pub fn transport_for(
     spec: &HostSpec,
     options: &crate::fleet::connector::FleetConnectorOptions,
 ) -> Result<Box<dyn HostTransport>, String> {
+    transport_for_scoped(spec, options, CONNECTOR_TRANSPORT_SCOPE)
+}
+
+/// The connector's socket scope: the host id alone, exactly as E1 named it.
+pub const CONNECTOR_TRANSPORT_SCOPE: &str = "";
+
+/// [`transport_for`], for a consumer that needs its own connection to a host
+/// the connector already holds.
+///
+/// An ssh host's bridge binds one forward socket per (pid, scope, target,
+/// session), so two transports built with the same scope in one process
+/// collide with `AddrInUse`. `scope` is how a second consumer — the gateway's
+/// terminal streams — gets a socket of its own; [`CONNECTOR_TRANSPORT_SCOPE`]
+/// keeps the connector's names unchanged. A local host has no forward socket,
+/// so the scope does not reach it.
+pub fn transport_for_scoped(
+    spec: &HostSpec,
+    options: &crate::fleet::connector::FleetConnectorOptions,
+    scope: &str,
+) -> Result<Box<dyn HostTransport>, String> {
     match &spec.kind {
         HostKind::Local { session } => Ok(Box::new(LocalTransport::new(session.clone()))),
-        HostKind::Ssh { target, session } => Ok(Box::new(SshTransport::new(
+        HostKind::Ssh { target, session } => Ok(Box::new(SshTransport::new_scoped(
             spec.id.clone(),
             target.clone(),
             session.clone(),
             options.manage_ssh_config,
+            // Carried exactly as `transport_for` carries it: a dropped
+            // argument here hands a daemon an interactive ssh child with no
+            // other symptom, which is what the wiring test below pins.
             options.ssh_noninteractive,
+            scope,
         ))),
     }
 }
@@ -118,7 +142,57 @@ mod tests {
                 Some(noninteractive),
                 "the daemon ssh policy did not reach the transport"
             );
+            let scoped =
+                transport_for_scoped(&spec, &options, "gateway").expect("scoped ssh transport");
+            assert_eq!(
+                scoped.ssh_noninteractive_for_test(),
+                Some(noninteractive),
+                "the daemon ssh policy did not reach the scoped transport"
+            );
         }
+    }
+
+    /// A scoped transport must not answer on the socket the connector binds,
+    /// or the second one to start loses to `AddrInUse` and that host goes dark.
+    #[cfg(unix)]
+    #[test]
+    fn a_scoped_ssh_transport_binds_a_socket_of_its_own() {
+        use crate::remote::local_forward_socket_path_scoped;
+
+        let options = FleetConnectorOptions::default();
+        let spec = spec(HostKind::Ssh {
+            target: "workbox".to_string(),
+            session: Some("agents".to_string()),
+        });
+
+        let connector = SshTransport::new_scoped(
+            spec.id.clone(),
+            "workbox".to_string(),
+            Some("agents".to_string()),
+            false,
+            options.ssh_noninteractive,
+            CONNECTOR_TRANSPORT_SCOPE,
+        );
+        let gateway = SshTransport::new_scoped(
+            spec.id.clone(),
+            "workbox".to_string(),
+            Some("agents".to_string()),
+            false,
+            options.ssh_noninteractive,
+            "gateway",
+        );
+
+        assert_ne!(connector.local_socket(), gateway.local_socket());
+        // E1's names are unchanged: the connector's socket is still the one
+        // `SshTransport::new` derived from the host id alone.
+        assert_eq!(
+            connector.local_socket(),
+            local_forward_socket_path_scoped("host", "workbox", "agents")
+        );
+        // And neither is `herdr --remote`'s unscoped name.
+        let unscoped = local_forward_socket_path_scoped("", "workbox", "agents");
+        assert_ne!(connector.local_socket(), unscoped);
+        assert_ne!(gateway.local_socket(), unscoped);
     }
 
     #[test]

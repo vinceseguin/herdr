@@ -23,7 +23,8 @@ use crate::config::GatewayConfig;
 use crate::gateway::auth::{AuthLimiter, DeviceStore, TokenStore};
 use crate::gateway::fleet::FleetHandle;
 use crate::gateway::policy::OriginAllowlist;
-use crate::gateway::{assets, events, http, middleware};
+use crate::gateway::transports::HostTransports;
+use crate::gateway::{assets, events, http, middleware, terminal};
 
 /// Largest request body the gateway accepts.
 ///
@@ -48,6 +49,14 @@ pub(crate) struct AppState {
     pub(crate) fleet: FleetHandle,
     pub(crate) auth: Arc<AuthState>,
     pub(crate) info: Arc<GatewayInfo>,
+    /// How a terminal stream opens its own connection to one host.
+    ///
+    /// Separate from the fleet connector on purpose: a client socket's mode is
+    /// fixed by its first message, so a terminal cannot ride the aggregator's
+    /// stream. Lazy — a gateway nobody opens a terminal on connects nothing
+    /// extra. `run` keeps the other half of this `Arc` so it can stop the
+    /// sessions and drop the transports in that order.
+    pub(crate) transports: Arc<HostTransports>,
 }
 
 /// Credentials, devices, the failure limiter and the origin allowlist.
@@ -101,9 +110,9 @@ pub(crate) struct GatewayInfo {
 impl GatewayInfo {
     /// The features this build serves.
     ///
-    /// PR 6 appends `"terminal"`, PR 8 `"pairing"`.
+    /// PR 8 appends `"pairing"`.
     pub(crate) fn features() -> Vec<&'static str> {
-        vec!["fleet", "events"]
+        vec!["fleet", "events", "terminal"]
     }
 
     pub(crate) fn new(bind: SocketAddr, config: &GatewayConfig) -> Self {
@@ -125,6 +134,7 @@ pub(crate) fn router(state: AppState) -> Router {
     Router::new()
         .merge(http::routes())
         .merge(events::routes())
+        .merge(terminal::routes())
         .fallback(assets::serve)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -336,6 +346,7 @@ pub(crate) mod tests {
                 fleet: fleet.handle(),
                 auth: Arc::new(AuthState::new(tokens, devices, &config.gateway, origins)),
                 info: Arc::new(GatewayInfo::new(addr, &config.gateway)),
+                transports: Arc::new(HostTransports::new(&config)),
             };
             let (stop, stopped) = tokio::sync::oneshot::channel();
             let served = tokio::spawn(async move {
@@ -509,8 +520,9 @@ pub(crate) mod tests {
                 .as_array()
                 .map(|features| features.iter().filter_map(|f| f.as_str()).collect())
                 .unwrap_or_default();
-            assert!(features.contains(&"fleet"), "{features:?}");
-            assert!(features.contains(&"events"), "{features:?}");
+            for name in ["fleet", "events", "terminal"] {
+                assert!(features.contains(&name), "features: {features:?}");
+            }
         }
         server.shutdown().await;
     }

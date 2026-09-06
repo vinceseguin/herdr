@@ -61,25 +61,35 @@ pub struct SshTransport {
 }
 
 impl SshTransport {
-    /// A transport for one ssh host.
+    /// A transport for one ssh host, in one consumer's socket scope.
     ///
     /// `noninteractive` picks the ssh policy for every bridged connection:
     /// `false` is `herdr --remote`'s interactive path (the operator's own auth
     /// flow, ssh's errors on the inherited stderr), `true` is the daemon path
     /// (`BatchMode=yes`, no password prompts, stderr discarded). See
     /// [`crate::fleet::connector::FleetConnectorOptions::ssh_noninteractive`].
-    pub fn new(
+    ///
+    /// `scope` names the *consumer*. The bridge binds one forward socket per
+    /// (pid, scope, target, session), so two transports built with the same
+    /// scope in one process collide with `AddrInUse`; a consumer that needs its
+    /// own connection to a host the connector already holds — the gateway's
+    /// terminal streams — passes a scope of its own. `""` is the connector's
+    /// scope ([`crate::fleet::transport::CONNECTOR_TRANSPORT_SCOPE`]), whose
+    /// socket names are byte-identical to what E1 shipped.
+    pub fn new_scoped(
         host: HostId,
         target: String,
         session: Option<String>,
         manage_ssh_config: bool,
         noninteractive: bool,
+        scope: &str,
     ) -> Self {
         let session_name =
             session.unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
-        // Derived once: the path is per (pid, host, target, session) and the
-        // bridge binds it, so it must not move under a reconnect.
-        let local_socket = local_forward_socket_path_scoped(host.as_str(), &target, &session_name);
+        // Derived once: the path is per (pid, scope, host, target, session) and
+        // the bridge binds it, so it must not move under a reconnect.
+        let socket_scope = socket_scope(scope, &host);
+        let local_socket = local_forward_socket_path_scoped(&socket_scope, &target, &session_name);
         Self {
             host,
             target,
@@ -254,6 +264,28 @@ impl Drop for SshTransport {
         // session exits the control master.
         self.bridge = None;
         self.ssh = None;
+    }
+}
+
+/// The socket scope for one (consumer scope, host) pair.
+///
+/// An empty consumer scope is E1's original naming — the host id alone — so
+/// every socket the connector binds keeps the exact name it had. Anything else
+/// prefixes it, which is what keeps a gateway's terminal socket distinct from
+/// the connector's for the same host.
+///
+/// Known residual: the separator is in a host id's alphabet, so the connector's
+/// scope for a host literally named `gateway-<x>` equals the gateway's scope for
+/// host `<x>`. The two collide only when both also share a target *and* a
+/// session, and the loser fails loudly (`prepare_socket_path` refuses a live
+/// listener with `AddrInUse`, naming the socket) rather than being routed to
+/// the other's bridge. Closing it needs a separator `sanitize_path_component`
+/// keeps, which `src/remote/**` — frozen for E3 — does not offer.
+fn socket_scope(scope: &str, host: &HostId) -> String {
+    if scope.is_empty() {
+        host.as_str().to_string()
+    } else {
+        format!("{scope}-{}", host.as_str())
     }
 }
 
@@ -511,7 +543,7 @@ mod tests {
         session: Option<&str>,
         noninteractive: bool,
     ) -> SshTransport {
-        SshTransport::new(
+        SshTransport::new_scoped(
             host(host_id),
             target.to_string(),
             session.map(str::to_string),
@@ -520,6 +552,7 @@ mod tests {
             // start a control master against the shim.
             false,
             noninteractive,
+            crate::fleet::transport::CONNECTOR_TRANSPORT_SCOPE,
         )
     }
 

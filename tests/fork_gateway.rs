@@ -620,3 +620,357 @@ fn events_ignores_client_chatter_and_survives_an_oversized_message() {
         "{lines:?}"
     );
 }
+
+// ---- terminal (PR 6) ----
+
+/// The header of a `binary <hex>` line: `[kind][seq u64 LE][w u16][h u16][full]`.
+#[derive(Debug, PartialEq, Eq)]
+struct FrameHeader {
+    kind: u8,
+    seq: u64,
+    width: u16,
+    height: u16,
+    full: bool,
+}
+
+/// Split a `binary <hex>` line into its header and its payload.
+///
+/// This is the decoder E4's browser code implements in TypeScript, written out
+/// once here so the layout is asserted end to end rather than in a unit test
+/// alone.
+fn decode_binary_line(line: &str) -> (FrameHeader, Vec<u8>) {
+    let hex = line
+        .strip_prefix("binary ")
+        .unwrap_or_else(|| panic!("not a binary message: {line}"));
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&hex[index..index + 2], 16)
+                .unwrap_or_else(|err| panic!("not hex ({err}): {line}"))
+        })
+        .collect();
+    assert!(bytes.len() >= 14, "frame shorter than its header: {line}");
+    let header = FrameHeader {
+        kind: bytes[0],
+        seq: u64::from_le_bytes(bytes[1..9].try_into().expect("8 bytes")),
+        width: u16::from_le_bytes(bytes[9..11].try_into().expect("2 bytes")),
+        height: u16::from_le_bytes(bytes[11..13].try_into().expect("2 bytes")),
+        full: bytes[13] != 0,
+    };
+    (header, bytes[14..].to_vec())
+}
+
+/// The pane id every lab session's marker pane has.
+const LAB_PANE: &str = "w1:p1";
+
+/// Wait until every configured host is `connected`, so a terminal open is not
+/// racing the connector's first handshake.
+fn wait_for_connected_hosts(gateway: &Gateway, count: usize) {
+    let mut report = serde_json::Value::Null;
+    let ready = support::wait_until(
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(250),
+        || {
+            let response =
+                gateway.http_get("/api/fleet", &[("Authorization", &gateway.authorization())]);
+            if response.status != 200 {
+                return false;
+            }
+            report = response.json();
+            report["hosts"].as_array().is_some_and(|hosts| {
+                hosts.len() == count
+                    && hosts
+                        .iter()
+                        .all(|host| host["connection"]["state"].as_str() == Some("connected"))
+            })
+        },
+    );
+    assert!(ready, "hosts never all connected: {report}");
+}
+
+/// The whole read path against real servers: a `read` token observes lab-2's
+/// marker pane, receives a full frame carrying that pane's text, and cannot
+/// type into it.
+#[test]
+fn terminal_observe_streams_marker_pane_frames() {
+    let mut lab = Lab::new("gw-term");
+    let up = lab.up("2");
+    assert!(
+        up.status.success(),
+        "up 2 failed: {}{}",
+        stdout_of(&up),
+        stderr_of(&up)
+    );
+    let gateway = Gateway::spawn(&lab, "");
+    wait_for_connected_hosts(&gateway, 2);
+
+    let observed = gateway.ws(
+        &format!("/api/terminal/lab-2/{LAB_PANE}"),
+        &[
+            "--send",
+            r#"{"type":"terminal.open","mode":"observe","cols":80,"rows":24}"#,
+            "--max-messages",
+            "2",
+            "--timeout",
+            "30",
+            "--binary",
+            "hex",
+        ],
+    );
+    let lines = support::gateway::ws_lines(&observed);
+    assert_eq!(observed.status.code(), Some(0), "{lines:?}");
+    assert!(lines.len() >= 2, "{lines:?}");
+
+    let ready = support::gateway::ws_text_json(&lines[0]);
+    assert_eq!(ready["type"].as_str(), Some("terminal.ready"), "{lines:?}");
+    assert_eq!(ready["schema"].as_str(), Some("herdr.fleet.terminal.v1"));
+    assert_eq!(ready["mode"].as_str(), Some("observe"));
+    assert_eq!(ready["host"].as_str(), Some("lab-2"));
+    assert_eq!(ready["pane"].as_str(), Some(LAB_PANE));
+    assert_eq!(ready["ref"].as_str(), Some("lab-2/w1:p1"));
+    assert_eq!(ready["cols"].as_u64(), Some(80));
+    assert_eq!(ready["rows"].as_u64(), Some(24));
+
+    // The first frame is a full redraw at the geometry this session asked for,
+    // and it carries the pane's own text — which is how we know the stream is
+    // wired to lab-2's pane and not to some other host's.
+    let (header, body) = decode_binary_line(&lines[1]);
+    assert_eq!(header.kind, 0x01, "{lines:?}");
+    assert!(
+        header.full,
+        "the first frame must be a full redraw: {header:?}"
+    );
+    assert_eq!((header.width, header.height), (80, 24), "{header:?}");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("herdr-fleet-lab:lab-2"),
+        "the frame does not carry lab-2's marker: {text:?}"
+    );
+
+    // A read credential in observe mode is refused, by code, and the socket
+    // survives the refusal.
+    let refused = gateway.ws(
+        &format!("/api/terminal/lab-2/{LAB_PANE}"),
+        &[
+            "--send",
+            r#"{"type":"terminal.open","mode":"observe","cols":80,"rows":24}"#,
+            "--send",
+            r#"{"type":"terminal.input","text":"echo INJECTED\n"}"#,
+            "--max-messages",
+            "3",
+            "--timeout",
+            "30",
+        ],
+    );
+    let lines = support::gateway::ws_lines(&refused);
+    assert_eq!(refused.status.code(), Some(0), "{lines:?}");
+    let error = lines
+        .iter()
+        .filter(|line| line.starts_with("text "))
+        .map(|line| support::gateway::ws_text_json(line))
+        .find(|value| value["type"].as_str() == Some("terminal.error"))
+        .unwrap_or_else(|| panic!("no terminal.error in {lines:?}"));
+    assert_eq!(error["code"].as_str(), Some("forbidden"), "{lines:?}");
+
+    // Nothing reached the pane.
+    let read = lab.herdr("lab-2", &["pane", "read", LAB_PANE, "--source", "recent"]);
+    let pane_text = stdout_of(&read);
+    assert!(
+        !pane_text.contains("INJECTED"),
+        "an observer typed into the pane: {pane_text}"
+    );
+
+    // A control mode is refused too: this build serves observers only, and the
+    // refusal is `unsupported`, not a silent downgrade to observe.
+    let control = gateway.ws_with(
+        &format!("/api/terminal/lab-2/{LAB_PANE}"),
+        &[("Authorization", &gateway.control_authorization())],
+        &[
+            "--send",
+            r#"{"type":"terminal.open","mode":"control","cols":80,"rows":24}"#,
+            "--max-messages",
+            "1",
+            "--timeout",
+            "30",
+        ],
+    );
+    let lines = support::gateway::ws_lines(&control);
+    let answer = support::gateway::ws_text_json(&lines[0]);
+    assert_eq!(answer["type"].as_str(), Some("terminal.error"), "{lines:?}");
+    assert_eq!(answer["code"].as_str(), Some("unsupported"), "{lines:?}");
+
+    // And a `read` credential asking for control is told it lacks the scope,
+    // before the build's own limitation is ever consulted.
+    let unscoped = gateway.ws(
+        &format!("/api/terminal/lab-2/{LAB_PANE}"),
+        &[
+            "--send",
+            r#"{"type":"terminal.open","mode":"control","cols":80,"rows":24}"#,
+            "--max-messages",
+            "1",
+            "--timeout",
+            "30",
+        ],
+    );
+    let lines = support::gateway::ws_lines(&unscoped);
+    let answer = support::gateway::ws_text_json(&lines[0]);
+    assert_eq!(answer["code"].as_str(), Some("forbidden"), "{lines:?}");
+}
+
+/// A pane the host cannot resolve, and a host the gateway does not have: two
+/// different codes, both stream-local, neither a 5xx.
+#[test]
+fn terminal_open_reports_a_missing_pane_and_an_unknown_host() {
+    let mut lab = Lab::new("gw-term-miss");
+    let up = lab.up("1");
+    assert!(
+        up.status.success(),
+        "up 1 failed: {}{}",
+        stdout_of(&up),
+        stderr_of(&up)
+    );
+    let gateway = Gateway::spawn(&lab, "");
+    wait_for_connected_hosts(&gateway, 1);
+
+    // The host is up and answers the terminal hello, then refuses the target.
+    let missing_pane = gateway.ws(
+        "/api/terminal/lab-1/w9:p9",
+        &[
+            "--send",
+            r#"{"type":"terminal.open","mode":"observe","cols":80,"rows":24}"#,
+            "--max-messages",
+            "3",
+            "--timeout",
+            "30",
+        ],
+    );
+    let lines = support::gateway::ws_lines(&missing_pane);
+    let error = lines
+        .iter()
+        .filter(|line| line.starts_with("text "))
+        .map(|line| support::gateway::ws_text_json(line))
+        .find(|value| value["type"].as_str() == Some("terminal.error"))
+        .unwrap_or_else(|| panic!("no terminal.error in {lines:?}"));
+    assert_eq!(error["code"].as_str(), Some("pane_not_found"), "{lines:?}");
+
+    // A host that is not in `[fleet]` at all never reaches a socket.
+    let unknown_host = gateway.ws(
+        &format!("/api/terminal/lab-404/{LAB_PANE}"),
+        &[
+            "--send",
+            r#"{"type":"terminal.open","mode":"observe","cols":80,"rows":24}"#,
+            "--max-messages",
+            "1",
+            "--timeout",
+            "30",
+        ],
+    );
+    let lines = support::gateway::ws_lines(&unknown_host);
+    let answer = support::gateway::ws_text_json(&lines[0]);
+    assert_eq!(answer["type"].as_str(), Some("terminal.error"), "{lines:?}");
+    assert_eq!(
+        answer["code"].as_str(),
+        Some("host_unavailable"),
+        "{lines:?}"
+    );
+
+    // A target that could not be a fleet reference never becomes a socket at
+    // all: the handshake itself answers 404, so a client learns it spelled the
+    // pane wrong without an upgrade it would have to tear down.
+    let not_found = gateway.ws(
+        "/api/terminal/lab-1/w1%2Fp1",
+        &["--max-messages", "1", "--timeout", "30"],
+    );
+    let lines = support::gateway::ws_lines(&not_found);
+    assert_eq!(not_found.status.code(), Some(2), "{lines:?}");
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some("handshake 404"),
+        "{lines:?}"
+    );
+}
+
+/// A terminal on a host that has gone away is that socket's problem and
+/// nobody else's: the fleet report still answers and the gateway still stops
+/// cleanly.
+#[test]
+fn terminal_open_on_a_stopped_host_fails_without_touching_the_gateway() {
+    let mut lab = Lab::new("gw-term-down");
+    let up = lab.up("2");
+    assert!(
+        up.status.success(),
+        "up 2 failed: {}{}",
+        stdout_of(&up),
+        stderr_of(&up)
+    );
+    let mut gateway = Gateway::spawn(&lab, "");
+    wait_for_connected_hosts(&gateway, 2);
+
+    let stopped = lab.herdr("lab-2", &["server", "stop"]);
+    assert!(
+        stopped.status.success(),
+        "could not stop lab-2: {}{}",
+        stdout_of(&stopped),
+        stderr_of(&stopped)
+    );
+    let down = support::wait_until(
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(250),
+        || {
+            let response =
+                gateway.http_get("/api/fleet", &[("Authorization", &gateway.authorization())]);
+            response.status == 200
+                && response.json()["hosts"].as_array().is_some_and(|hosts| {
+                    hosts.iter().any(|host| {
+                        host["id"].as_str() == Some("lab-2")
+                            && host["connection"]["state"].as_str() != Some("connected")
+                    })
+                })
+        },
+    );
+    assert!(down, "lab-2 never left the connected state");
+
+    let refused = gateway.ws(
+        &format!("/api/terminal/lab-2/{LAB_PANE}"),
+        &[
+            "--send",
+            r#"{"type":"terminal.open","mode":"observe","cols":80,"rows":24}"#,
+            "--max-messages",
+            "1",
+            "--timeout",
+            "30",
+        ],
+    );
+    let lines = support::gateway::ws_lines(&refused);
+    let answer = support::gateway::ws_text_json(&lines[0]);
+    assert_eq!(
+        answer["code"].as_str(),
+        Some("host_unavailable"),
+        "{lines:?}"
+    );
+
+    // The other host is untouched, and so is the gateway.
+    let alive = gateway.ws(
+        &format!("/api/terminal/lab-1/{LAB_PANE}"),
+        &[
+            "--send",
+            r#"{"type":"terminal.open","mode":"observe","cols":80,"rows":24}"#,
+            "--max-messages",
+            "2",
+            "--timeout",
+            "30",
+            "--binary",
+            "hex",
+        ],
+    );
+    let lines = support::gateway::ws_lines(&alive);
+    assert_eq!(alive.status.code(), Some(0), "{lines:?}");
+    let (_, body) = decode_binary_line(&lines[1]);
+    assert!(
+        String::from_utf8_lossy(&body).contains("herdr-fleet-lab:lab-1"),
+        "{lines:?}"
+    );
+
+    assert_eq!(gateway.http_get("/health", &[]).status, 200);
+    assert_eq!(gateway.stop(), Some(0));
+}
