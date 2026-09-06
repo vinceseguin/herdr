@@ -26,7 +26,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{parse_gateway_origin, Config};
 use crate::gateway::auth::{unix_now, DeviceStore, PairingStore, TokenScope, TokenStore};
@@ -436,19 +436,35 @@ fn probe_health(listen: SocketAddr) -> bool {
         listen
     };
 
+    /// The only bytes this probe reads, and all it needs.
+    const STATUS_LINE: &[u8] = b"HTTP/1.1 200";
+
     let probe = || -> io::Result<bool> {
+        let deadline = Instant::now() + HEALTH_TIMEOUT;
         let mut stream = std::net::TcpStream::connect_timeout(&target, HEALTH_TIMEOUT)?;
-        stream.set_read_timeout(Some(HEALTH_TIMEOUT))?;
         stream.set_write_timeout(Some(HEALTH_TIMEOUT))?;
         stream.write_all(
             format!("GET /health HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n")
                 .as_bytes(),
         )?;
         // The status line is all that matters, and it is the first bytes on the
-        // socket; a bounded read keeps a wedged peer from holding the command.
+        // socket — but nothing guarantees it arrives in one segment, so read
+        // until it is complete. Both the buffer and one shared deadline are
+        // bounded, so a peer that dribbles bytes cannot hold the command.
         let mut raw = [0u8; 64];
-        let read = stream.read(&mut raw)?;
-        Ok(String::from_utf8_lossy(&raw[..read]).starts_with("HTTP/1.1 200"))
+        let mut filled = 0;
+        while filled < STATUS_LINE.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            stream.set_read_timeout(Some(remaining))?;
+            match stream.read(&mut raw[filled..])? {
+                0 => break,
+                read => filled += read,
+            }
+        }
+        Ok(raw[..filled].starts_with(STATUS_LINE))
     };
     probe().unwrap_or(false)
 }
@@ -507,6 +523,17 @@ pub(crate) fn rotate_token_command(args: &[String]) -> io::Result<i32> {
         }
     }
 
+    // Pending codes go first: one of them would mint a device carrying the
+    // authority that is being taken back, and a code redeemed *after* the
+    // devices were swept would survive the rotation entirely. Closing the door
+    // before sweeping the room leaves only the redemption already in flight.
+    let codes = PairingStore::new(&gateway_dir)
+        .revoke_scope(scope)
+        .unwrap_or_else(|error| {
+            eprintln!("warning: could not revoke pending pairing codes: {error}");
+            0
+        });
+
     let mut devices = match DeviceStore::load(&gateway_dir) {
         Ok(devices) => devices,
         Err(error) => {
@@ -527,14 +554,6 @@ pub(crate) fn rotate_token_command(args: &[String]) -> io::Result<i32> {
             return Ok(EXIT_REFUSED);
         }
     };
-    // A pending code for this scope would mint a device with the authority
-    // that was just revoked, so it goes too.
-    let codes = PairingStore::new(&gateway_dir)
-        .revoke_scope(scope)
-        .unwrap_or_else(|error| {
-            eprintln!("warning: could not revoke pending pairing codes: {error}");
-            0
-        });
 
     println!(
         "rotated the {} token; revoked {} and {}",
@@ -919,5 +938,32 @@ mod tests {
 
         // Nothing is listening any more.
         assert!(!probe_health(addr));
+    }
+
+    /// A status line that arrives in two segments is still read: the probe
+    /// must not decide on whatever the first `read` happened to return.
+    #[test]
+    fn a_status_line_split_across_segments_is_still_read() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let served = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut raw = [0u8; 128];
+            let _ = stream.read(&mut raw);
+            let _ = stream.write_all(b"HTTP/1.1 ");
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = stream.write_all(b"200 OK\r\nContent-Length: 0\r\n\r\n");
+        });
+
+        assert!(
+            probe_health(addr),
+            "a split status line must still read 200"
+        );
+        served.join().expect("the probe server thread");
     }
 }

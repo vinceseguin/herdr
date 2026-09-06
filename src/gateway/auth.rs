@@ -513,20 +513,24 @@ impl DeviceStore {
         })
     }
 
-    /// Reload the file when it has been replaced since it was read.
+    /// Reload the file when it has been replaced since it was read, returning
+    /// whether the records in memory were replaced.
     ///
     /// Called before a cookie is verified and before activity is recorded, so
     /// a `rotate-token` in another process revokes cookies here at once — and
-    /// so this process never persists records that a revocation removed.
-    pub fn refresh(&mut self) {
+    /// so this process never persists records that a revocation removed. A
+    /// caller that was about to write its own copy back must not do so once
+    /// this returns `true`: the copy it holds is the one that was replaced.
+    pub fn refresh(&mut self) -> bool {
         let stamp = stamp_of(&self.path);
         if stamp == self.stamp {
-            return;
+            return false;
         }
         match Self::load_file(self.path.clone()) {
             Ok(reloaded) => {
                 tracing::info!(target: "gateway", "reloaded the paired devices after the file changed on disk");
                 *self = reloaded;
+                true
             }
             Err(error) => {
                 tracing::warn!(
@@ -535,6 +539,7 @@ impl DeviceStore {
                     "could not reload the paired devices; the records already in memory stay in force"
                 );
                 self.stamp = stamp;
+                false
             }
         }
     }
@@ -630,9 +635,12 @@ impl DeviceStore {
         };
         let json = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
         paths::write_private_file(&self.path, &json)?;
-        // Our own write must not look like someone else's: stamp it now, or
-        // the next refresh would reload the file we just wrote.
-        self.stamp = stamp_of(&self.path);
+        // Deliberately *not* stamped from the file that is there now: another
+        // process may have replaced it between our rename and that `stat`, and
+        // adopting its stamp would hide the change from every later refresh.
+        // Forgetting the stamp costs one re-read on the next refresh and can
+        // never miss a revocation.
+        self.stamp = None;
         Ok(())
     }
 }
@@ -724,6 +732,14 @@ impl PairingStore {
         ttl_secs: u64,
         now_unix: u64,
     ) -> io::Result<(String, PairingCode)> {
+        // The gateway directory first: `create_private_dir` creates missing
+        // *parents* with the process umask, so a `herdr gateway pair` run
+        // before the daemon ever started would otherwise leave
+        // `<config>/gateway/` world-readable until the next startup tightened
+        // it. The codes inside are `0600` either way; the file names are not.
+        if let Some(parent) = self.dir.parent() {
+            paths::create_private_dir(parent)?;
+        }
         paths::create_private_dir(&self.dir)?;
         let id = random_secret_hex()?;
         let secret = random_secret_hex()?;
@@ -1203,6 +1219,59 @@ mod tests {
             "revoking one scope must keep the other's devices"
         );
         assert!(store.touch(&store.devices()[0].id.clone(), 200));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `rotate-token` revokes from another process while the gateway still
+    /// holds the old records in memory. A refresh must see that, and a store
+    /// that has been refreshed must never write the revoked records back.
+    #[test]
+    fn a_revocation_by_another_process_survives_this_one_persisting() {
+        let dir = temp_dir("devices-refresh");
+        paths::create_private_dir(&dir).expect("dir");
+        let mut running = DeviceStore::load(&dir).expect("empty store");
+        let cookie = running
+            .insert(TokenScope::Read, "phone", 100)
+            .expect("insert");
+        assert!(running.verify_cookie(&cookie).is_some());
+        // Settle the stamp: a store re-reads once after its own write, and
+        // then stops until something else touches the file.
+        assert!(running.refresh(), "a store re-reads the file it just wrote");
+        assert!(!running.refresh(), "an unchanged file is not reloaded");
+
+        // The other process: load, revoke, write.
+        let mut rotating = DeviceStore::load(&dir).expect("load");
+        assert_eq!(rotating.revoke_scope(TokenScope::Read).expect("revoke"), 1);
+
+        // The running gateway notices, and reports that its copy was replaced
+        // so a caller holding a pending write knows to drop it.
+        assert!(
+            running.refresh(),
+            "the file changed, so it must be reloaded"
+        );
+        assert!(running.devices().is_empty());
+        assert!(running.verify_cookie(&cookie).is_none());
+
+        // Persisting now cannot resurrect the revoked device.
+        running.persist().expect("persist");
+        let reloaded = DeviceStore::load(&dir).expect("reload");
+        assert!(reloaded.devices().is_empty());
+        assert!(reloaded.verify_cookie(&cookie).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `herdr gateway pair` can run before the daemon ever has, so it is the
+    /// first thing that may create `<config>/gateway/`. It must not create it
+    /// with the process umask.
+    #[test]
+    fn creating_a_code_leaves_the_whole_gateway_directory_private() {
+        let dir = temp_dir("pairing-parent");
+        let store = PairingStore::new(&dir);
+        store
+            .create(TokenScope::Read, "", 600, 1_000)
+            .expect("create");
+        paths::verify_private_dir(&dir).expect("the gateway directory is private");
+        paths::verify_private_dir(store.dir()).expect("the pairings directory is private");
         let _ = fs::remove_dir_all(&dir);
     }
 

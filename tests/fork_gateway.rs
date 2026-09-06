@@ -1503,6 +1503,14 @@ fn a_stale_runtime_marker_is_not_a_running_gateway() {
         "started_unix": recorded["started_unix"],
     });
     std::fs::write(&marker, stale.to_string()).expect("write a stale marker");
+    // `0600` like the gateway's own writer: otherwise the marker is refused for
+    // its mode and this test would never reach the pid check it is about.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600))
+            .expect("make the stale marker private");
+    }
 
     let status = env.run_gateway(&["status", "--json"]);
     assert_eq!(

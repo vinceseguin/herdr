@@ -470,6 +470,12 @@ fn touch_device(state: &AppState, id: &str) {
     }
     tokio::task::spawn_blocking(move || {
         let mut devices = auth.devices.lock().unwrap_or_else(|err| err.into_inner());
+        // The file can have been rewritten — a `rotate-token` revocation —
+        // while this task waited for the blocking pool. Writing the copy this
+        // process holds would put the records that revocation removed back.
+        if devices.refresh() {
+            return;
+        }
         if let Err(error) = devices.persist() {
             tracing::warn!(target: "gateway", error = %error, "could not record device activity");
         }
