@@ -41,14 +41,14 @@ impl HostId {
         Self(Self::LOCAL.to_string())
     }
 
-    /// The id as a borrowed string, for callers that build a label or a key
-    /// without going through `Display`.
+    // Every fleet consumer so far formats a host id (`Display`) or compares
+    // it; these two are the borrowed-string and reserved-name checks E2's
+    // sidebar and PR 6's ssh socket scope use.
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    // `Display` and `as_str` cover every consumer so far; this is the
-    // reserved-name check E2's ssh socket scope (PR 6) uses.
     #[allow(dead_code)]
     pub fn is_local(&self) -> bool {
         self.0 == Self::LOCAL

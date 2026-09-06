@@ -260,8 +260,13 @@ the binary, commands and paths stay `herdr`.
   is unchanged. `--session <name>` keeps its global meaning: the implicit
   `local` host is *this process's* configured session
   (`client_socket_path_for(None)` already honours it).
-- **(f) Host picker key is `[fleet.keys] host_picker = "prefix+shift+h"`**
-  *(auto default — deviation from the roadmap's `[keys]` wording, with reason)*.
+- **(f) Host picker key is `[fleet.keys] host_picker`** — **`"prefix+shift+f"`
+  as built**, not the `"prefix+shift+h"` this decision first named: that combo
+  is upstream's default `keys.swap_pane_left` (`src/config/model.rs`), so a
+  fleet default on it would either disable an upstream default or be disabled
+  itself, with a config diagnostic on a stock install either way. See PR 6's
+  *As built*. *(auto default — deviation from the roadmap's `[keys]` wording,
+  with reason)*.
   A `[keys]` leaf is enumerated by upstream's `config_reference_check.py`
   and needs a row in `docs/next/website/src/data/config-reference.json`,
   which fork rules forbid editing; `SKIPPED_SUBTREES` skips only struct-typed
@@ -369,13 +374,14 @@ the binary, commands and paths stay `herdr`.
 | --- | --- | --- | --- | --- |
 | 1 | feat(fleet): connector client options, active-surface tracking and takeable events | A · Foundations | — | ✅ |
 | 2 | feat(fleet): pure sidebar and host picker models | A · Foundations | — | ✅ |
-| 3 | refactor: route client writes and fleet events through a server link seam | B · Console loop | 1 | ⬜ |
-| 4 | feat: herdr fleet opens the client shell over the fleet connector | B · Console loop | 2, 3 | ⬜ |
-| 5 | feat(fleet): sidebar host groups with live status and click-to-switch | C · Fleet UX | 4 | ⬜ |
-| 6 | feat(fleet): host picker overlay and fleet.keys host_picker binding | C · Fleet UX | 5 | ⬜ |
-| 7 | feat(fleet): host-aware notifications and cross-host notification targets | C · Fleet UX | 5 | ⬜ |
-| 8 | feat(fleet): reconnect notice for the active host and resize on reconnect | C · Fleet UX | 5 | ⬜ |
-| 9 | docs: fleet console guide, adr e2 review, roadmap drift | D · Docs | 6, 7, 8 | ⬜ |
+| 3 | refactor: route client writes and fleet events through a server link seam | B · Console loop | 1 | ✅ |
+| 4 | feat: herdr fleet opens the client shell over the fleet connector | B · Console loop | 2, 3 | ✅ |
+| 5 | feat(fleet): sidebar host groups with live status and click-to-switch | C · Fleet UX | 4 | ✅ |
+| 6 | feat(fleet): host picker overlay and fleet.keys host_picker binding | C · Fleet UX | 5 | ✅ |
+| 7 | feat(fleet): host-aware notifications and cross-host notification targets | C · Fleet UX | 5 | ✅ |
+| 8 | feat(fleet): reconnect notice for the active host and resize on reconnect | C · Fleet UX | 5 | ✅ |
+| 9 | docs: fleet console guide, adr e2 review, roadmap drift | D · Docs | 6, 7, 8 | ✅ |
+| 10 | fix(fleet): log fleet console active-host changes | C · Fleet UX | 5 | ✅ |
 
 **Wave preview (2-agent cap):** W1 `[1, 2]` → W2 `[3]` → W3 `[4]` → W4 `[5]`
 → W5 `[6, 8]` → W6 `[7]` → W7 `[9]`. Critical path 1 → 3 → 4 → 5 → 6 → 9. No
@@ -900,6 +906,75 @@ bash scripts/fork/fleet-lab.sh down
 Evidence: `MARKER_SEEN`, the typed line reached the pane through
 `ServerLink::Single`, detach (`prefix+q`) exits cleanly, gate green.
 
+**As built (PR 3, merged).** Deviations from the shapes above, all
+deliberate:
+
+- **`ClientLink` replaces the separate `fleet_events` parameter.**
+  `run_client_loop`'s first argument is `ClientLink { link: ServerLink,
+  fleet_events: Option<mpsc::Receiver<FleetEvent>> }` — the loop's whole
+  server side in one value. Two parameters would have pushed the signature to
+  12 arguments and failed `clippy::too_many_arguments`. `ClientLink::single
+  (stream)` is the single-host constructor; PR 4 builds the fleet one.
+- **`Rc<FleetConnector>`, not `Arc`,** in both `FleetLink` and
+  `FleetClientState`. `FleetConnector` owns a `std::sync::mpsc::Receiver`
+  (the supervisors' completion channel), so it is `!Sync` and `Arc::new`
+  fails `clippy::arc_with_non_send_sync`. `run_client_loop` runs under
+  `rt.block_on` on a `new_current_thread` runtime and spawns nothing, so the
+  future needs no `Send` bound and both owners live on one thread. **PR 4's
+  exit path is `Rc::try_unwrap(connector).shutdown()`** after dropping the
+  taken receiver and the link.
+- **`LinkWriteError` has three variants:** `Io`, `Detached` and
+  `HostUnavailable(String)`. `Detach` on a fleet link returns `Detached`,
+  which `link::io_result` turns into `Ok(())` with a `debug!` — no
+  synthesized `ServerShutdown{"detached"}` is needed, because all four
+  `Detach` call sites are already `let _ = write(…)` followed by an immediate
+  clean return. `HostUnavailable` exists because `FleetConnector::send`
+  answers **only** endpoint requests it accepted: a `NotConnected` endpoint
+  request would otherwise hold `EndpointCommands`' single lane forever
+  (upstream's `expire` keeps the lane after its 60 s timeout, waiting for a
+  late answer that cannot come). A raw write still drops `NotConnected`/`Io`
+  with a `debug!` per the plan; an endpoint request records the reason on the
+  in-flight command (`InFlightCommand.unavailable`) and the next `expire`
+  tick fails it with `endpoint_unavailable` **and releases the lane**. That
+  field is only ever set by a fleet link, so the single-host path is
+  untouched.
+- **`Translated::Snapshot { snapshot, changes }`** carries the fleet model's
+  changes alongside the projection, so an active host's snapshot cannot
+  silently drop its `FleetChange`s. The active host's snapshot is cloned once
+  per snapshot event (the shell draws it, the fleet model counts its agents);
+  no other host's is.
+- **`endpoint_commands::send_next` writes through
+  `ServerLink::write_endpoint_request(boot_id, request_id, request)`**, which
+  owns the per-link correlation: the boot id on the wire for a single host,
+  `HostCommand::Endpoint { request_id }` for a fleet host. `complete
+  (request_id, result)` matches only the in-flight request id.
+- **The `select!` fleet branch is unguarded**: `ev = next_fleet_event(
+  fleet_events.as_mut())`, where `next_fleet_event` returns
+  `std::future::pending()` both when there is no receiver and when the channel
+  closed. An `if fleet_events.is_some()` guard plus a `None` arm would have
+  spun the loop once the last supervisor exited.
+- **`write_to_server` kept its name and its 21 call sites**; the raw-stream
+  body moved to `link::write_stream_message`, which `terminal_sessions.rs`
+  (four sites, its own stream) and the pre-loop `AttachTerminal` write use.
+  `finish_client_shell_input`, `install_client_shell_snapshot`,
+  `dispatch_client_shell_actions`, `write_remote_image_to_server` and
+  `write_attach_semantic_action` take `&mut ServerLink`.
+- **One helper was extracted rather than duplicated:**
+  `finish_endpoint_command(state, completed, …) -> Result<bool, ClientError>`
+  holds what the `ClientShellEndpointResponseChunk` arm used to do inline, so
+  the fleet path replays mouse events, repaints and detaches identically.
+  Its one `expect("shell endpoint response")` became a let-else returning
+  `Ok(false)` (unreachable: a non-empty replay only comes from
+  `handle_endpoint_result`, which needs a shell).
+- **Characterization:** no file under `tests/` was touched;
+  `tests/client_mode.rs`, `tests/multi_client.rs`, `tests/detach_reattach.rs`
+  and the rest of the client suite pass unchanged (3336 tests green).
+- **Hazard recorded for PR 4/5:** `translate` drops an *inactive* host's
+  `EndpointResponse`, so a request still in flight to the old host at switch
+  time is released only when the switch resets the lane. Whichever PR lands
+  the host switch must add `EndpointCommands::reset()` and call it there; it
+  does not exist yet.
+
 **Downstream**
 
 - PR 4 constructs `ServerLink::Fleet` and `Some(fleet_events)`; nothing else
@@ -928,7 +1003,13 @@ PR 5 — this PR proves the loop.
   `run_client_with_mode` (or a `run_client_with_launch(ClientLaunch)` wrapper
   it delegates to — pick whichever keeps the existing two callers untouched)
   so the fleet path shares config loading, geometry, terminal setup, panic
-  hook, runtime, `ctrlc`, and the exit handling.
+  hook, runtime, `ctrlc`, and the exit handling. **As built in PR 3:**
+  `run_client_loop` already takes a `link::ClientLink`, so the fleet branch
+  passes `ClientLink { link: ServerLink::Fleet(FleetLink::new(connector,
+  active)), fleet_events: Some(rx) }` and sets `ClientState.fleet =
+  Some(FleetClientState { .. })` — no further loop surgery. The reader thread
+  and the write stream's `set_nonblocking(false)` are already inside
+  `if let ServerLink::Single`, so a fleet console starts neither.
 - `src/cli/fleet.rs` (fork file): `run_fleet_command -> io::Result<Option<i32>>`
   (`None` for a bare `herdr fleet`); help text mentions the console.
 - `src/cli.rs` *(upstream — the `fleet` arm becomes the `server`-arm pattern)*;
@@ -955,7 +1036,7 @@ PR 5 — this PR proves the loop.
 // src/client/fleet.rs
 pub fn run_fleet() -> io::Result<()>;   // main.rs entry
 pub(super) struct FleetLaunch { pub specs: Vec<HostSpec>, pub options: FleetConnectorOptions }
-pub(super) struct FleetClientState { pub state: FleetState, pub connector: Arc<FleetConnector>,
+pub(super) struct FleetClientState { pub state: FleetState, pub connector: Rc<FleetConnector>,
     pub active: HostId, pub pending_switch: Option<HostId>, pub sidebar: FleetSidebarModel,
     pub collapsed: HashSet<HostId>, pub stderr: Option<StderrRedirect> }
 ```
@@ -971,10 +1052,12 @@ fleet-core.md", exit 1) → `ClientShellConfig::from_config(..)
 FleetConnectorOptions::for_client(&config, HandshakeParams::for_client(cell_w,
 cell_h, exact && unix, mouse_capture), ActiveGeometry { surface:
 shell_config.initial_surface_size(cols, rows), .. }))` → `take_events()` →
-`set_active(Some(first enabled host))` → `run_client_loop(ServerLink::Fleet,
-fleet_events: Some(rx), …, endpoint_methods: None)`. Exit: after the loop
-returns (any reason) drop the receiver, `Arc::try_unwrap(connector)
-.shutdown()` (fall back to `Drop` with a `warn!` if another owner remains),
+`set_active(Some(first enabled host))` → `run_client_loop(ClientLink { link:
+ServerLink::Fleet(..), fleet_events: Some(rx) }, …, endpoint_methods: None)`
+(one `ClientLink` argument, PR 3 As built). Exit: after the loop
+returns (any reason) drop the receiver, drop the link, then
+`Rc::try_unwrap(connector)` — `Rc`, not `Arc` (PR 3 As built) —
+`.shutdown()` (fall back to `Drop` with a `warn!` if another owner remains),
 restore stderr, then the existing terminal-restore/exit code. The fleet
 branch never `exit(1)`s for a host reason.
 
@@ -1045,6 +1128,93 @@ Also once with the ssh lab: `lab-1` as `kind = "ssh", target =
 log (not the terminal) holds any ssh stderr. Evidence: the dumped screen
 text, both `pane read` counts, the socket check, exit code 0.
 
+**As built (PR 4, merged).** Deviations from the shapes above, all deliberate:
+
+- **`ClientLaunch` / `run_client_with_launch`, not a fourth parameter.**
+  `run_client_with_mode` keeps its signature and its two callers and delegates
+  to `run_client_with_launch(ClientLaunch { attach_request, attach_escape,
+  log_message, fleet: Option<fleet::FleetLaunch> })`. `FleetLaunch` is a
+  marker: the hosts come from the config that path already loads and the
+  geometry from the terminal it already reads, so carrying `specs`/`options`
+  would mean loading the config twice. `run_fleet()` is
+  `run_client_with_launch(ClientLaunch::fleet())`.
+- **`ClientLink` grew a third field, `fleet: Option<FleetClientState>`**
+  (fork-owned `src/client/link.rs`), rather than a new `run_client_loop`
+  parameter: the link and the console state must name the same host from the
+  loop's first iteration, and the signature is already at clippy's argument
+  limit. `run_client_loop` destructures the link at the top and moves the
+  state straight into `ClientState.fleet`.
+- **The single-host path became `Option`-shaped, not branched.** `stream:
+  Option<LocalStream>` and `handshake: Option<HandshakeResult>`; a fleet
+  console has neither. The loop's encoding falls back to
+  `RenderEncoding::SemanticFrame` (only a `debug!` reads it) and
+  `endpoint_methods` to `None` — the active host publishes its own when it
+  connects.
+- **`Translated::EndpointMethods { methods, changes }` is a fifth variant.**
+  The active host's `HostEvent::Connected` publishes its method list to the
+  shell (which gates commands on it); every other host's stays a `Change`.
+  A test pins that another host's connection never touches the method list.
+- **The console never re-picks the active host.** `console_link` reads
+  `FleetConnector::active_host()` back and gives that id to the link and to
+  `FleetState::set_active_host`, so the connector's own duplicate-id dedupe and
+  "first *enabled* spec" rule cannot disagree with the state's. A test covers a
+  disabled first spec.
+- **`Console` is a guard, not a code path.** `open_console` returns
+  `(ClientLink, Console)`; the launch path holds the `Console` across
+  `rt.block_on`, so *every* exit runs `Rc::try_unwrap(connector).shutdown()` —
+  including a panic, which unwinds through it after the hook restored the
+  terminal. The loop's own locals (the taken receiver, the link, `ClientState
+  .fleet`) drop when the loop future completes, i.e. **before** the guard, which
+  is the "drop the receiver first" rule PR 1 recorded. `drop(console)` is
+  explicit right after `block_on` because the error path below it ends in
+  `std::process::exit(1)`, which runs no destructors.
+- **stderr (decision (j)) is a static plus a guard.** `install_console_stderr`
+  (unix) opens `herdr-client.log` with `O_APPEND` — the same flag the tracing
+  writer uses, so the two interleave safely — saves fd 2 with
+  `pty::fd::duplicate_cloexec_fd` into an `AtomicI32`, and `dup2`s the log over
+  fd 2. `restore_console_stderr()` swaps the static, so it is idempotent and
+  safe from the panic hook, which now calls it; `ConsoleStderr` restores on
+  `Drop`, so a failed `open_console` cannot print its error into a log the user
+  cannot see.
+- **A terminal resize is announced, not written twice.** In fleet mode the
+  `ClientLoopEvent::Resize` arm calls `FleetClientState::announce_geometry`
+  (→ `set_active_geometry`, which adopts unconditionally and writes only when
+  the active host is connected *and* the geometry changed) and **skips** the
+  link write: `HostCommand::Raw(ClientShellResize)` would have sent the active
+  host the same resize a second time.
+- **An inactive host's notification carries no target.** The shell resolves
+  `workspace_id`/`tab_id`/`pane_id` against the *active* host's snapshot
+  (`notification_still_current`, `notification_target_is_active`, the toast's
+  click → `PaneFocus`), and every server starts at `w1`/`w1:p1`, so another
+  host's ids would be validated, suppressed or focused on the wrong machine.
+  Until PR 7 targets across hosts, `translate` clears the three ids for
+  `host != active` and keeps the `[host] ` prefix, the agent name and the
+  sound.
+- **`tests/cli/fleet.rs` changed** (fork-owned, from E1): bare `herdr fleet` is
+  no longer a usage error, so it moved out of `fleet_usage_errors_exit_two`'s
+  list into its own assertion (not exit 2, and never the usage line).
+- Decision (h) in practice: `kitty_graphics_enabled` and
+  `pixel_geometry_enabled` are forced false in fleet mode, so
+  `initial_terminal_geometry(false, false)` reports cell size 0 and
+  `exact == false`; `remote_image_paste_key` is `None` and `is_remote_client`
+  is `false` regardless of `HERDR_REMOTE_KEYBINDINGS` (which decision (g)
+  ignores with a `warn!`).
+- `--fleet` combined with `--remote` is already rejected by `main.rs`'s
+  existing "`--remote` can only be used with the default launch command" guard
+  (exit 2); no new check was needed.
+- **Deferred, with owners:** `EndpointCommands::reset()` (PR 3's recorded
+  hazard) is **not** added — PR 4 has no host switch, and an active host that
+  drops fails its in-flight lane through the connector's
+  `report_lane_failure`, so nothing can hit the hazard yet. **PR 5 must add it
+  and call it in `switch_host`.** `herdr --fleet status` silently opens the
+  console (the trailing word is ignored); cosmetic, unfixed.
+
+**Real-server evidence (PR 4).** Two lab hosts, then the same run with lab-1
+behind `ssh-lab.sh` (`sshd` was present, so no degradation to record): the
+console renders lab-1's marker pane, `echo` reaches lab-1's pane and not
+lab-2's, `prefix+q` exits 0, no `/tmp/herdr-remote-*` socket survives, and the
+herdr log — not the terminal — carries the ssh transport's output.
+
 **Downstream**
 
 - `FleetClientState` is the loop-side owner of `FleetState`; PRs 5–8 add to
@@ -1052,8 +1222,22 @@ text, both `pane read` counts, the socket check, exit code 0.
   then_focus)` (PR 5) is the only place the active host changes.
 - `tests/support/fleet_tui.rs` and `scripts/fork/tui-drive.py` are the PTY
   fixtures for every later PR and for E7/E8 validation; add helpers, never
-  rename.
+  rename. **As built:** `FleetConsole::{spawn, spawn_with_args, screen_text,
+  wait_for_text, send, detach, wait_for_exit}` plus the free helpers
+  `append_lab_config`, `lab_fleet_config(count)`, `lab_pane_id(lab, index)`,
+  `pane_text(lab, session, pane)`, `lab_client_socket`, `assert_screen`,
+  `strip_ansi`, `app_dir_name` and `DETACH_KEYS`; the module is
+  `#[cfg(unix)] pub mod fleet_tui` in `tests/support/mod.rs` and carries a
+  file-level `#![allow(dead_code)]` because each test binary uses a different
+  subset. `FleetConsole` takes the pty writer once at spawn
+  (`MasterPty::take_writer` panics on a second call) and its `Drop` sends
+  `prefix+q`, waits 5 s, then kills. `tui-drive.py` keeps its documented flags
+  (`--cols --rows --timeout --expect --keys --dump -- cmd…`); expectations
+  match only text produced *after* the previous step, and it reaps its child
+  from `finally`.
 - The console never installs, stops or hands off a herdr (E1 decision (f)).
+  Pinned by `tests/fork_fleet_tui.rs`, which compares
+  `support::herdr_server_pids_for_runtime_dir` before and during the console.
 
 ### PR 5 — feat(fleet): sidebar host groups with live status and click-to-switch · deps: 4
 
@@ -1073,6 +1257,8 @@ focuses the target there). Profiled at 1 vs 5 hosts × 15 agents.
 - `src/client/shell/state.rs` *(upstream — three one-line additions)*:
   `ClientShellState.fleet: Option<FleetShellState>`, `ShellHitMap.fleet_rows:
   Vec<(Rect, FleetSidebarHit)>`, `ClientShellAction::Fleet(FleetShellAction)`.
+  Note `FleetSidebarRow<'a>` borrows (PR 2 As built), so a hit rect can hold a
+  cloned `HostId`/ref without cloning the model.
 - `src/client/shell.rs` *(upstream — `mod fleet; mod fleet_sidebar;`)*.
 - `src/client/shell/sidebar.rs`, `agent_sidebar.rs` *(upstream — one
   delegation each: when `state.fleet.is_some()` the section body is drawn by
@@ -1081,7 +1267,16 @@ focuses the target there). Profiled at 1 vs 5 hosts × 15 agents.
   host)*; `src/client/shell/mouse.rs` *(upstream — one `fleet_rows` hit test
   before the workspace/agent hit tests)*.
 - `src/client/fleet.rs`: `switch_host`, `apply_changes` (rebuild model →
-  `shell.fleet_sidebar_update`), handle `ClientShellAction::Fleet`. **PR 2
+  `shell.fleet_sidebar_update`), handle `ClientShellAction::Fleet`.
+  **From PR 4:** `FleetClientState { state, connector: Rc<FleetConnector>,
+  active, pending_switch }` already exists and is reached through
+  `ClientState.fleet`; `apply_changes(fleet, changes)` is already called from
+  the loop's fleet branch for every translated event (it only `debug!`s
+  today). `pending_switch` carries an `#[allow(dead_code)]` whose comment says
+  PR 5 writes it — remove the allow. `switch_host` **must** add and call
+  `EndpointCommands::reset()` (PR 3's recorded hazard: `translate` drops an
+  inactive host's `EndpointResponse`, so a request in flight to the old host
+  would hold the single lane forever); it does not exist yet. **PR 2
   as-built:** `FleetSidebarModel::rebuild(&state, &collapsed, sort)` takes the
   live `config.agent_panel_sort`, and the agent panel's sort toggle
   (`src/client/shell/mouse.rs:1938`) invalidates the model like a
@@ -1198,16 +1393,179 @@ bash scripts/fork/fleet-lab.sh down
 
 Evidence: the screen dumps, the two `pane read` counts, the bench table.
 
+**As built (PR 5, merged).** Deviations from the shapes above, all deliberate:
+
+- **`src/client/shell/fleet_sidebar.rs` is a `#[path]` submodule of `render`,
+  not of `shell`** — the same trick `render.rs` already uses for `sidebar.rs`,
+  `tabs.rs` and `overlays.rs`. That is what lets it reuse
+  `render::sidebar`'s row renderers for the active host through `pub(super)`
+  rather than copying them. `src/client/shell.rs` therefore gains only
+  `mod fleet;` plus a `pub(crate) use fleet::{FleetFocusTarget,
+  FleetShellAction, FleetSidebarHit};` re-export.
+- **PR 2's flat row order was removed.** The sidebar is *two* lists (spaces
+  above, agents below) and each host contributes a header to both, so the
+  renderer walks `FleetSidebarModel::groups` once per section.
+  `FleetSidebarRow`, `visible_rows` and both `visible_row_count`s therefore had
+  no consumer and no PR that would give them one (E4's phone list uses
+  `merged_agents()`, as this plan already says), so they are gone rather than
+  carrying an open-ended `#[allow(dead_code)]`; the five tests that covered
+  them assert the same facts over `groups`.
+- **Two upstream files beyond the plan's list, one line each:**
+  `src/client/shell/render.rs` (`ShellRenderState.fleet: Option<&FleetShellState>`,
+  plus `hits.fleet_rows.clear()` in the `!mouse_capture` reset and the
+  `#[path]` module line) and `src/client/shell/composition.rs` (`fleet:
+  self.fleet.as_ref()` in the render state it builds). The model has to reach
+  the renderer somehow, and those are the two places that build it.
+- **`src/client/mod.rs` is edited by this PR** (the plan reserved it for PR 3/4).
+  `dispatch_client_shell_actions` takes `&mut ClientState` instead of `&mut
+  Vec<Child>` and returns the mouse replay plus whether the console needs
+  recomposing. Reason: a fleet action
+  changes the routing target, so it needs the shell, the fleet state, the link
+  and the endpoint lane at once; and the frame its callers composed *before*
+  the dispatch describes the machine the console just left, so they must
+  recompose rather than present it. `handle_fleet_event` also gained the new
+  `apply_changes(state, changes) -> bool` signature, a `flush_pending_focus`
+  call after the active host's snapshot installs, `sync_switching_notice`, and
+  `fleet::present(state)` on the arms that change only the sidebar (another
+  host's status is nothing else in the loop would repaint for).
+- **`sidebar.rs` and `agent_sidebar.rs` were split, not just delegated.**
+  `render_sidebar`'s workspace body became `render_workspace_body` and
+  `render_agent_panel`'s chrome became `render_agent_panel_header` +
+  `render_no_matching_agents`, so both the single-host and the console paths
+  draw the identical rows; `workspace_rows`, `render_workspace_rows`,
+  `displayed_workspace_status`, `parent_group_key`, `agent_rows`,
+  `render_agent_row` and `AgentRow` became `pub(super)`. Both delegations live
+  in `sidebar.rs` (`agent_sidebar.rs` has none). The diff on `sidebar.rs` is
+  large because a block moved, not because it was rewritten.
+- **`fleet_sidebar_update(model, active, switching_to)` takes three arguments**
+  (the plan sketched two): both are read by the same frame and a separate
+  setter would let a caller install one without the other.
+  `set_fleet_switching(Option<HostId>) -> bool` updates just the marker in
+  place, so a switch finishing costs no model clone.
+- **`fleet_sidebar_matches` gates the repaint.** A rebuild is cheap; installing
+  one is a whole-console compose. An inactive host bumping its revision
+  changes no visible row, so the loop compares the rebuilt groups against what
+  the shell already holds and installs only on a difference.
+- **Header heights are 1-or-2 and cached** (`FleetShellState::header_heights`,
+  keyed by `model.generation`): the reason is drawn as a second dimmed line
+  under the header rather than folded into the label, because at an 18-36
+  column sidebar the folded form truncates the reason away. That is the one
+  variable height an inactive host has; every other fleet row is exactly one
+  line.
+- **`EndpointCommands::reset()` added and called** in `switch_host`, the hazard
+  PR 3 recorded and PR 4 deferred. Plus `is_idle()` (`#[cfg(test)]`) so a test
+  can pin that the lane is actually released.
+- **`switch_host` is split into `switch_target_allowed` + `retarget_host`**, so
+  the routing half — connector, link, fleet state, endpoint lane — is testable
+  against `test_support::FakeHost` without a terminal or a shell. Order is:
+  announce geometry → `connector.set_active` → `state.set_active_host` →
+  `link.set_active` → `endpoint_commands.reset()` → shell reset → install the
+  new host's snapshot and methods → rebuild → flush the pending focus.
+- **`reset_for_host_switch` clears `hits`, and that is the point.**
+  `ShellHitMap::workspaces`/`agents` hold the *old* host's bare server-side
+  ids and a click resolves them against whatever host is active now, so they
+  must not outlive the switch. The console is therefore unclickable for the
+  window between the switch and the new host's first frame — deliberate, and
+  the safe direction.
+- **`FleetShellAction::SortChanged`** is a third variant: agent order inside
+  every group is a function of `[ui] agent_panel_sort`, which the user can
+  toggle by clicking the agent panel's sort label, so that click pushes an
+  action that rebuilds the model. Other writers of the preference (a config
+  reload) are picked up at the next fleet change, because `apply_changes`
+  always reads the live value from the shell.
+- **`scripts/fork/tui-drive.py` gained `--redraw`** (resize the window and
+  back, then forget the text so far). A client draws frame *diffs*, so a
+  screen that changed one character only ever wrote that character: without a
+  forced full repaint, no `--dump` can be read as a screen. Every later PR's
+  screen evidence should use it.
+- **The console composes from a placeholder when the active host cannot draw**
+  — the review found that without it, switching to a host that is down or
+  still connecting bricked the console: `compose` returned `None`, so the
+  terminal kept the *previous* host's frame, the sidebar could not show the
+  switch, and — because `reset_for_host_switch` empties the hit map — no
+  further click registered anywhere. `FleetShellState` now carries an empty
+  projection/surface pair and a precomputed `pane_notice`; `compose` falls back
+  to it **only** in fleet mode and only when there is no snapshot or no
+  surface (the revision-mismatch skip and the single-host client are
+  unchanged, both pinned by tests), and `render_pane_notice` draws
+  `switching to <host>…` over the pane area. This is the `composition.rs`
+  hook the plan budgeted for **PR 8**, landed early because PR 5 is what
+  creates the state it covers; PR 8 replaces the text with the reconnect
+  notice.
+- **A terminal resize while the active host cannot render** used to leave the
+  console without a hit map for the same reason (`invalidate_pane_surface`
+  clears `hits` and waits for a surface that never comes), so the Resize arm
+  calls `fleet::present_after_resize`, which recomposes only when a switch is
+  pending or the active host is not `Connected`.
+- **Requests produced before a switch go to the host that produced them.**
+  A click on another host's row and keystrokes can arrive in one stdin batch:
+  `finish_client_shell_input` now writes `outcome.requests` *before* the
+  dispatch when the batch contains a `SwitchHost`, and
+  `dispatch_client_shell_actions` drops an `Endpoint` action that follows a
+  switch in the same batch (`FleetActionOutcome { repaint, switched }`). The
+  invariant is that a message only ever reaches the host whose ids it carries.
+- **`reset_for_host_switch` had to be a complete boot reset.** Because it drops
+  the snapshot, the new host's `set_snapshot` does *not* take upstream's
+  `boot_changed` path, so everything that path clears is cleared here —
+  including `overlay = None` (a deviation from the plan's "overlay stays": a
+  Rename/ConfirmClose/Worktree/ContextMenu overlay holds the previous host's
+  ids and the Navigator indexes its projection), the selection autoscroll and
+  highlight deadlines, copy feedback, `endpoint_notice_seen`, the mobile
+  switcher fields and `dismissed_product_announcement`.
+- Behaviour worth knowing: what is typed while the target host is not
+  connected is *dropped* by `FleetLink::send`, never queued, which is the rule
+  **PR 8** makes visible; and `switching to <host>…` stays on a host that never
+  comes back until PR 8 replaces it with the reconnect notice.
+
 **Downstream**
 
 - `FleetShellAction::SwitchHost` is the one way to change hosts; PR 6 (picker),
-  PR 7 (notification target) and E7 (picker actions) emit it.
+  PR 7 (notification target) and E7 (picker actions) emit it. It is dispatched
+  from `dispatch_client_shell_actions`, so any surface that emits it must
+  return it in `ClientShellInput::actions` like the sidebar does.
 - `hits.fleet_rows` is host-qualified; any new clickable fleet element uses
   `FleetSidebarHit`, never a bare pane id.
 - E7 adds a `Prompt`/`SendKeys` variant to `FleetShellAction` without
   switching; it reuses `FleetLink` with an explicit host.
+- **PR 6:** `host_picker_rows`, `HostPickerRow` and `HostRowState::state_name`
+  carry `#[allow(dead_code)]` naming PR 6 — delete those three attributes when
+  the overlay lands. The picker must ignore a row whose `enabled` is `false`
+  (`switch_target_allowed` refuses it anyway, with a `warn!`) and must not
+  switch to the host that is already active. `FleetShellState` is
+  `pub(super)` inside `client::shell`, so the overlay renderer belongs in that
+  module tree too.
+- **PR 7:** `FleetSidebarModel::agent_status` carries an `#[allow(dead_code)]`
+  naming PR 7 — delete it. A cross-host notification target is a
+  `FleetShellAction::SwitchHost { then_focus }`; the focus is already deferred
+  until the target host has a projection (`FleetClientState::pending_focus` +
+  `flush_pending_focus`, called from the loop's snapshot arm), so PR 7 needs no
+  second mechanism.
+- **PR 8:** `FleetShellState::switching_to` and `FleetClientState::
+  pending_switch` are wired end to end — the header draws `…` on the host being
+  switched to, and `translate` clears the flag on that host's first surface.
+  **The `composition.rs` notice hook already exists** (`FleetShellState::
+  placeholder` + `render_pane_notice`, reached from `compose` when the active
+  host has no projection or no surface): PR 8 replaces the notice *text* for a
+  host that is `Unavailable`/`Connecting` rather than adding a second path, and
+  should decide when "switching to <host>…" becomes "reconnecting to
+  <host>…". `fleet::present(state)` and `fleet::present_after_resize(state)`
+  are the fork-owned compose-and-present helpers. PR 8 also owns the deferred
+  items the PR 5 review listed: `reveal_workspace`/`workspace_drop_target_at`
+  index the active host's `workspace_entries` against a fleet row list that
+  also holds headers and other hosts' rows (Navigate-mode reveal can land one
+  row off, the drag indicator can draw on a fleet row), and a host's *first*
+  connection attempt reads as "reconnecting (attempt 1)".
 
 ### PR 6 — feat(fleet): host picker overlay and fleet.keys host_picker binding · deps: 5
+
+**From PR 5 (as built):** the picker emits `ClientShellAction::Fleet(
+FleetShellAction::SwitchHost { host, then_focus: None })`, which
+`dispatch_client_shell_actions` (`src/client/mod.rs`) already routes to
+`fleet::handle_shell_action`; nothing new is needed on the loop side. Remove
+the `#[allow(dead_code)]` on `host_picker_rows`, `HostPickerRow` and
+`HostRowState::state_name` in `src/fleet/sidebar.rs` — this PR consumes them.
+A row with `enabled == false` and the row for the active host are not switch
+targets (`switch_target_allowed` refuses both).
 
 **Goal:** `prefix+shift+h` (configurable as `[fleet.keys] host_picker`) opens a
 host picker overlay listing every host with state and counts; `enter` /
@@ -1289,14 +1647,165 @@ just bench-fleet-scale   # unchanged within noise (the picker is not on the fram
 bash scripts/fork/fleet-lab.sh down
 ```
 
+**As built (PR 6, merged).** Deviations from the shapes above, all deliberate:
+
+- **The default binding is `prefix+shift+f`, not `prefix+shift+h`.**
+  `prefix+shift+h` is upstream's default `keys.swap_pane_left`. Both would be
+  `BindingSource::Default`, so the shared `BindingRegistry` would keep whichever
+  is applied first and emit `"H: kept …, disabled …"` on a **stock** install —
+  either the picker never opens, or swap-pane-left stops working for every
+  herdr user, console or not. `f` is for Fleet and is free in both prefix
+  tables; a test pins both facts (`the_fleet_host_picker_has_a_default_binding_
+  that_conflicts_with_nothing`). Anything that says `prefix+shift+h` — the
+  roadmap, decision (f) as first written — is stale.
+- **Precedence is "user beats default, `[keys]` beats `[fleet.keys]` on a
+  tie".** `fleet.keys.host_picker` is applied *last* within each of the two
+  source passes, so a user's `[fleet.keys] host_picker = "prefix+h"` silently
+  displaces upstream's default `keys.focus_pane_left` (the ordinary user-beats-
+  default rule, validated live), while a user who writes the same combo in both
+  sections keeps the `[keys]` one and gets `"kept keys.goto, disabled
+  fleet.keys.host_picker"`. `FleetKeysConfig` tracks `user_fields` through a
+  custom `Deserialize` exactly as `KeysConfig` does; without that, a default
+  fleet binding could displace a user's `[keys]` binding.
+- **The picker's rows travel on the model, not on a call into `FleetState`.**
+  `FleetSidebarModel` gained `picker: Vec<HostPickerRow>`, filled by `rebuild`
+  from PR 2's `host_picker_rows(state)` (which is therefore consumed, allow
+  removed). Decision (c) puts `FleetState` in the *loop* and the model in the
+  *shell*, and the overlay lives in the shell — so a picker that derived its own
+  rows would need either a fourth `fleet_sidebar_update` argument or a second
+  path from the loop. As a consequence `FleetSidebarModel::same_rows(&other)`
+  replaces the bare `groups == groups` comparison in `fleet_sidebar_matches`:
+  a host that reconnects on a new server version moves a picker row while no
+  group row changes, and the console must still install that model.
+- **`HostRowState::state_name` was deleted, not consumed.** PR 2 added it for
+  this PR, but a picker row's label already carries the state in prose *with*
+  the version and the retry attempt (`connection_summary`), which `state_name`
+  cannot express; a second, poorer spelling of the same fact had no caller. Its
+  test now pins `from_connection`'s mapping instead. (Same treatment PR 5 gave
+  PR 2's `visible_rows`.)
+- **The overlay holds a snapshot of the rows, refreshed on
+  `fleet_sidebar_update`.** `ClientHostPickerOverlay { rows, selected, scroll }`
+  lives in `state.rs` next to `ClientNavigatorOverlay` (the renderer in
+  `overlays.rs` needs the type, and `overlays.rs` is a `#[path]` submodule of
+  `render`); the behaviour is `src/client/shell/fleet_overlay.rs`. A host that
+  drops while the picker is open is redrawn from the new model instead of
+  staying `connected` — pinned by a test.
+- **`1`-`9` selects; `enter` confirms.** Not an immediate switch: a mistyped
+  digit would otherwise move every later keystroke to another machine. Out-of-
+  range digits are ignored. `esc` closes. The binding pressed *again* does not
+  close it — an open overlay swallows keys before prefix resolution, exactly as
+  it does for the navigator, so "the binding again → close" from the sketch is
+  not reachable and was dropped rather than special-cased.
+- **A disabled host keeps the picker open; the active host closes it.**
+  Accepting routes through PR 5's `switch_action` (now `pub(super)`), so the
+  picker cannot emit a `SwitchHost` the loop would only log and drop.
+- **`OverlayRender.primary` carries the picker's popup rect.** The picker has
+  no primary button, and `primary` is the generic rect `composition.rs` already
+  copies — so "a press outside the popup closes" costs no second hit field.
+  `composition.rs` (PR 8's file) gains exactly **one** line, next to the twenty
+  identical ones: `self.hits.host_picker_rows = rendered.host_picker_rows;`.
+- **Two more one-line edits in shared files:** `src/client/shell/fleet.rs`'s
+  `switch_action` became `pub(super)`, and its `fleet_sidebar_update` calls
+  `refresh_host_picker_rows()`. `src/client/shell/tests/mod.rs` gains
+  `mod fleet_picker;`.
+- **The help overlay lists the binding for every client**, not only in fleet
+  mode: `render_help_overlay` is reached from `render_client_overlay`, which has
+  no fleet state, and threading one through would reshape `composition.rs` for a
+  cosmetic gain. The row says `host picker (fleet console)`.
+- **`herdr --default-config`'s `[fleet]` sample gained a `[fleet.keys]`
+  sub-table**, and `main.rs`'s `uncommented_default_fleet_block` test helper
+  now treats a `[fleet.…]` header as sample TOML (it only knew `[[fleet.…]]`),
+  so the round-trip test really parses the new key instead of silently folding
+  it into `[[fleet.hosts]]`.
+- **A configured `[fleet.keys]` binding has to travel with `[keys]` into the
+  client's keymap rebuild** — the bug live validation caught, and the reason
+  this PR touches `src/client/shell/config.rs` and `state.rs` beyond the plan's
+  list. `ClientShellConfig::apply_snapshot_keybindings` runs on *every* connect
+  (it merges the server's published custom commands) and, for
+  `ClientShellKeybindingSource::Local`, recompiles the whole keymap from
+  `Config { keys: self.local_keys.clone(), ..Default::default() }`. With
+  `[fleet]` left at its default there, a user's `host_picker = "prefix+h"`
+  compiled correctly at startup and was then silently replaced by this build's
+  default the moment the first host's snapshot arrived: `config check` said ok,
+  the console's own help said `prefix+shift+f`, and the configured key did
+  nothing. `ClientShellConfig` now keeps `local_fleet_keys` beside `local_keys`
+  and passes it into that rebuild (and refreshes it on a live reload).
+  `FleetKeysConfig` gained `Clone` for it. Two tests pin it —
+  `a_configured_binding_survives_the_servers_command_list` fails without the
+  fix. **Every future `[fleet.keys]` binding inherits this**: the local copy is
+  what the client recompiles from.
+- **`tests/support/mod.rs::process_runtime_dir` tolerates a process that exits
+  mid-scan.** A pid list read from `/proc` is a snapshot; `NotFound`/
+  `PermissionDenied` on the following `environ` read now means "not ours"
+  rather than an error. Three lab-booting PTY tests now run concurrently under
+  nextest, and the old code failed the whole run when any unrelated process
+  exited between the scan and the read.
+- **From the `fable` review** (all fixed, gate green): a click whose hit rect
+  came from an older frame could fall through to the *highlighted* row — the
+  select and the accept are now one call (`accept_host_picker_row`) that acts
+  only when the select succeeded; opening the picker clears
+  `hits.host_picker_rows` and `hits.overlay_primary` so a press in the same
+  input batch as the opening key cannot borrow the previous overlay's geometry;
+  `refresh_host_picker_rows` no longer clones the row vector when no picker is
+  open and now keeps the highlight on the same host *by id* rather than by
+  index; Home/End use `usize::saturating_add_signed` instead of `isize::MIN / 2`;
+  the renderer draws fixed-position segments instead of a `format!` per row per
+  frame; and `HostPickerRow.kind` — which lost its dead-code allow with the
+  rest of PR 2's picker API — is drawn as the transport (`local`/`ssh`) at the
+  right of each row.
+- `just bench-fleet-scale` is unchanged within noise (compose median 5 vs 1
+  hosts: 1.02× collapsed, 1.02× expanded, against the 1.15×/1.5× acceptance):
+  the picker is drawn only while it is open, and nothing was added to the
+  sidebar's per-frame path.
+- **`scripts/fork/tui-drive.py` matches each `--expect` only against output
+  that arrives *after* that step starts.** Two consecutive `--expect`s on text
+  from the same frame therefore always fail the second one. One expectation per
+  frame; use a string that a *later* frame carries.
+
 **Downstream**
 
 - `[fleet.keys]` is the home for future fleet-only bindings (E7's
-  "prompt on host…"); document each in `fleet-core.md`'s key table.
+  "prompt on host…"); document each in `fleet-core.md`'s key table **and** in
+  the `DEFAULT_CONFIG` `[fleet.keys]` sample, and apply it after the `[keys]`
+  fields in both source passes so `[keys]` keeps a tie. Check any new default
+  against `KeysConfig::default()` first — `prefix+shift+h` was already taken.
 - `KeybindAction::HostPicker` exists in every build; non-fleet clients ignore
   it.
+- Any new `[fleet.keys]` field must also be copied into
+  `ClientShellConfig.local_fleet_keys` (see *As built*), or it will be reset to
+  its default on the first snapshot.
+- **PR 9:** the key is `[fleet.keys] host_picker = "prefix+shift+f"` everywhere
+  it is written (`fleet.md`, the ADR's E2 review, and the ROADMAP's E2 drift
+  fix — the roadmap still says `prefix+shift+h`). `docs/fork/fleet-core.md`
+  already carries the `[fleet.keys]` section, its key table row, the precedence
+  rule and the updated `DEFAULT_CONFIG` quote — verify, do not rewrite. Add
+  `src/client/shell/fleet_overlay.rs` to the fork-owned list and
+  `src/config/model.rs`, `src/config/keybinds.rs`,
+  `src/input/{keybindings,keybind_help}.rs`, `src/client/shell/overlays.rs`,
+  `overlay_input.rs`, `actions.rs`, `mouse.rs`, `state.rs`, `composition.rs`,
+  `src/client/shell/config.rs`, `src/client/shell/worktree_overlays.rs` and
+  `tests/support/mod.rs` to the *Keeping up with upstream* table. The picker's keys for `fleet.md`:
+  `↑↓`/`j k`, `1`-`9` to select, `enter` to switch, `esc` to close, click to
+  switch, a click outside to close; a host that is down is selectable (you get
+  PR 8's notice), a host disabled in `[fleet]` is listed but inert.
 
 ### PR 7 — feat(fleet): host-aware notifications and cross-host notification targets · deps: 5
+
+**From PR 5 (as built):** opening another host's notification is a
+`FleetShellAction::SwitchHost { host, then_focus: Some(FleetFocusTarget::
+Pane(id)) }`; `FleetClientState::pending_focus` + `fleet::flush_pending_focus`
+already hold that focus until the target host has installed a projection, so
+this PR adds the *target*, not a second deferral. Remove the
+`#[allow(dead_code)]` on `FleetSidebarModel::agent_status`.
+
+**From PR 4:** `translate` currently **clears** `workspace_id`, `tab_id` and
+`pane_id` on a notification from an inactive host (they would otherwise be
+validated, suppressed or focused against the active host's snapshot — every
+server starts at `w1`/`w1:p1`). PR 7 replaces that with a real host-qualified
+target: keep the ids, carry the host beside them, and make
+`notification_still_current` / `notification_target_is_active` /
+`open_notification_target` host-aware. Do not simply delete the clearing
+without doing so.
 
 **Goal:** notifications from any host surface prefixed `[host]` with the
 existing sound rules, are validated against *their* host's state (not the
@@ -1355,13 +1864,128 @@ python3 scripts/fork/tui-drive.py … --expect 'herdr-fleet-lab:lab-1' --expect 
 bash scripts/fork/fleet-lab.sh down
 ```
 
+**As built (PR 7, merged).** Deviations from the shapes above, all deliberate:
+
+- **The host travels on a fifth `Translated` variant, not on the frozen wire
+  type.** `translate` keeps the ids and returns
+  `Translated::Notification { host, notification }`; `src/client/mod.rs`'s
+  `handle_fleet_event` gains one arm that calls fork-owned
+  `fleet::deliver_notification`, which is the loop's
+  `ServerMessage::SemanticNotification` arm with the host added (effects
+  through `handle_shell_notification_effects`, then `present` when the shell
+  asked to repaint). Reusing the upstream arm was not possible: it calls
+  `receive_notification`, which has no host. The helper returns whether it
+  recomposed so the arm never composes the same console frame twice.
+- **`receive_notification` became a one-line delegation.**
+  `receive_notification_from(host: Option<HostId>, event, now)` in
+  `notifications.rs` is the old body; `receive_notification` passes `None` and
+  is byte-for-byte the single-host behaviour, and
+  `ClientShellState::receive_fleet_notification(host, event, now)` in
+  `shell/fleet.rs` is the console's wrapper. The console passes `Some(host)`
+  for **every** host, the active one included, so nothing downstream infers a
+  host.
+- **Dedup is host-qualified.** Replacing "the notification for this pane"
+  compares the host too: `w1:p1` exists on every server, so without it one
+  machine's agent silently dropped another's toast. A test pins that two hosts
+  keep two pending notifications and that a host still replaces its own.
+- **`notification_target_is_active` is false for any host that is not on
+  screen**, and `notification_still_current` for such a host is answered by
+  `FleetSidebarModel::agent_status`. Both take the `ClientPendingNotification`
+  (not the bare event) so the host is in hand.
+- **`agent_status` reads a new `HostGroup::agent_statuses`, not the rows.**
+  Found by the `fable` review: a named agent view (`agent_view_label`) filters
+  a group's `agents`, so validating against the rows turned a still-blocked
+  agent on another host into a stale toast — a divergence from upstream, which
+  validates against `snapshot.agents`. `agent_statuses` is every agent of that
+  host's last snapshot, built once per rebuild, and is part of `HostGroup`'s
+  equality so a hidden agent's status change still fails `same_rows` and
+  installs the rebuilt model.
+- **A host-qualified notification that arrives before the console has a fleet
+  view is treated as belonging elsewhere** (also from the review): it is shown,
+  never validated against the shell's own snapshot, and `prefix+o` dismisses it
+  without a switch or a focus. Unreachable in practice — a host is `Connected`,
+  and that change installs the model, before it can notify — but it was the one
+  branch where a remote pane id could still have reached `pane.focus`.
+- **`open_fleet_notification_target` returns "the fleet path owns this"**, not
+  an action. `true` also covers a notification that names no pane and a host
+  that `switch_action` refuses (disabled, unknown), so the caller can never
+  fall through to `pane.focus` with another machine's id. The click path
+  (`mouse.rs` → `focus_visible_notification`) and `prefix+o` share it.
+- **Notifications are still cleared by `reset_for_host_switch`**, PR 5's
+  behaviour, even though a host-qualified notification would now survive a
+  switch safely. Keeping them is a UX change outside this PR's spec.
+- No new upstream file beyond the plan's list; `src/client/mod.rs` gains one
+  match arm (it already carries PR 4/5 fleet wiring). `src/protocol/**` and
+  `tests/fixtures/endpoint-*` untouched; `SemanticNotification` unchanged.
+
+**Real-server evidence (PR 7).** Two lab hosts, console on lab-1, notification
+triggered on lab-2 with the server's own semantic path — `herdr --session lab-2
+pane report-agent <pane> --source fleet-pr7 --agent codex --state blocked`
+(a transition into `Blocked` is what `forward_semantic_agent_transition` turns
+into a `NeedsAttention` with a workspace, tab and pane id). With `[ui.toast]
+delivery = "herdr"` the console drew
+
+```
+┌─────────────────────────────────┐
+│● [lab-2] codex needs attention  │
+│  lab-2 · 1                      │
+└─────────────────────────────────┘
+```
+
+while `herdr-fleet-lab:lab-1` was still the pane area; `\x02o` gave
+`switching to lab-2…`, then `▾ lab-2 · 1 blocked` with a `codex` agent row and
+lab-2's own `herdr-fleet-lab:lab-2` prompt. Sound: with `HERDR_DISABLE_SOUND`
+unset and a fake `paplay` first on `PATH`, `[ui.sound] enabled = true` played
+the request sound once (`paplay /tmp/herdr-sound-<pid>-0.mp3`) and
+`enabled = false` played nothing — the existing gate is untouched by the fleet
+path.
+
 **Downstream**
 
 - E6's push and E4's toasts take the host from `FleetEvent::Notification`,
   the same source; the `[host]` prefix is a TUI presentation choice, not a
-  server fact.
+  server fact. **As built:** the host reaches the shell on
+  `Translated::Notification`, and `ClientPendingNotification.host` /
+  `ClientVisibleNotification.host` are where it lives after that — a second
+  consumer takes the host from the event, never from the active host.
+- **Any new "is this notification still worth showing" rule must ask the
+  sender's host.** `FleetSidebarModel::agent_status` (backed by
+  `HostGroup::agent_statuses`, every agent, not the filtered panel) is that
+  question's only sanctioned answer for a host the console is not drawing.
+- **PR 9:** `docs/fork/fleet.md` documents the `[host]` prefix on *every*
+  notification including the active host's, that `prefix+o` (and a click on
+  the toast) on another host's notification switches to that host and focuses
+  the pane there, that toasts need `[ui.toast] delivery` set (they are `off`
+  by default, which is why the console shows nothing out of the box), that
+  sound follows `[ui.sound]` unchanged, and that a host switch clears the
+  notifications on screen. The trigger for a manual walkthrough is
+  `herdr --session <lab> pane report-agent <pane> --source X --agent codex
+  --state blocked`.
 
 ### PR 8 — feat(fleet): reconnect notice for the active host and resize on reconnect · deps: 5
+
+**From PR 5 (as built):** `FleetShellState::switching_to` and
+`FleetClientState::pending_switch` already track a switch in flight (the
+header draws `…`; `translate` clears it on the new host's first surface), and
+`ClientShellState::reset_for_host_switch` already drops the old host's
+surface, hit map and snapshot. So the two states this PR must draw in the pane
+area are the same one: the console has no surface to compose. Note `compose`
+returns `None` without a surface, so the notice has to be drawn *instead of*
+the normal composition path, not inside it. `fleet::present(state)` is the
+fork-owned compose-and-present helper. Input typed while the active host is
+down is already dropped by `FleetLink::send` with a `debug!` — this PR makes
+that visible, it must not start queueing it.
+
+**From PR 4:** "resize on reconnect" is already true — the
+`ClientLoopEvent::Resize` arm calls `FleetClientState::announce_geometry`,
+which adopts the geometry in the connector whether or not the active host is
+connected, and the supervisor's hello reads it (PR 1 As built). That arm also
+**skips** the link write for `ClientShellResize` in fleet mode, so do not
+re-add one. What is left for PR 8 is the *notice*: a host leaving `Connected`
+reaches the loop as `Translated::Changes` only, and the pane area still shows
+the last frame. PR 1 also deferred to PR 8 the question of whether
+`set_active`/`set_active_geometry` need a write timeout, since both write to a
+socket while holding the active-host and link locks.
 
 **Goal:** when the active host drops, the pane area shows a reconnect notice
 (host, reason, attempt) instead of the stale surface, input to it is
@@ -1434,11 +2058,132 @@ If `ssh-lab.sh up` exits 3 (`sshd not found`), run the same with two local
 hosts and `session stop`/restart, and record the degradation in the PR body.
 `just bench-fleet-scale` unchanged within noise.
 
+**As built (PR 8, merged).** Deviations from the shapes above, all deliberate:
+
+- **One notice, one gate.** `pane_area_notice() -> Option<&str>` returns the
+  precomputed line rather than a `FleetNotice` value: it is read on the compose
+  path, so it is a borrow of the `String` built at
+  `fleet_sidebar_update`/`set_fleet_switching` time. `input_allowed()` is
+  *defined* as `pane_notice.is_none()` — what the pane area is showing **is**
+  whether there is a pane to type into, so the two can never disagree.
+- **The notice is derived in the shell, not passed in by the loop**, from the
+  row model the shell already holds (`model.group(active)`'s `state`, `reason`
+  and rows). That keeps `fleet_sidebar_update`'s three-argument signature (PR 6
+  builds consoles with it) and keeps `src/fleet/sidebar.rs` — which PR 6 also
+  edits — untouched by this PR beyond one line. The cost is **no `retry in N s`
+  segment**: `Unavailable::retry_in` is not in the pure row model, and a
+  countdown that is only recomputed when a change arrives would be a stale
+  number on screen. Text is `lab-2 · reconnecting · host closed the
+  connection`, `lab-2 · reconnecting (attempt 3)`, `lab-2 · connecting`,
+  `lab-2 · unavailable · <reason>`, `lab-2 · incompatible · <reason>`, and
+  `switching to lab-2…` **only while that host is `Connected`** — a switch to a
+  host that is down says why it is down instead, which is the "switching to…
+  forever" item PR 5 deferred.
+- **"Connected before" is read from the model's rows**, not from a new flag:
+  a host with workspace or agent rows has had a projection, so a retry is a
+  *re*connect. The supervisor numbers its first attempt 1, so
+  `connection_summary` in `src/fleet/sidebar.rs` now reads `attempt <= 1` as
+  `connecting` (the one line this PR changes there, plus its picker test).
+- **`compose` takes the placeholder path whenever a notice exists**, even with
+  a snapshot/surface pair in hand — the stale frame is exactly what must not
+  stay on screen. The real snapshot is still preferred for the chrome, so the
+  sidebar keeps drawing the host's own workspaces while the pane area explains
+  itself, and `hits.panes` is empty, so the pane area is unclickable.
+- **Two input guards, not one.** `handle_raw_events` is the funnel for every
+  real input path (`handle_input_bytes`, `handle_pixel_mouse`,
+  `replay_mouse_events`, Windows `handle_client_events`, text, paste, mouse),
+  and `dispatch_queued_copy_input` is the one path that re-enters `handle_key`
+  without it. `drop_pane_bound_input` drops `ClientShellPaneInput` and
+  `ClientShellPopupInput` from `outcome.requests` **and** clears the two pieces
+  of shell state that are a queue by another name: `copy_input_queue` (keys
+  parked behind an in-flight copy read, replayed when it settles — which can be
+  after the host is back) and `pane_mouse_gesture` (whose button-up is
+  synthesized on the next focus loss, to whichever host is connected by then).
+  Input leases are deliberately left alone: they can only produce a *release*
+  for a press the host may have seen, which is harmless where a replayed
+  keystroke is not.
+- **The reconnect hook is `apply_changes`, not a new loop arm.** Every
+  `Translated` arm that carries changes already calls it, so
+  `active_host_connected(&fleet.active, &changes)` is the whole detection, and
+  it is a pure function so the "another host connected" mis-fire is pinned by a
+  test. On the active host's `Connected` it calls
+  `adopt_active_host_geometry`: `set_active_geometry(active_console_geometry
+  (state))` — the window that closes is **not** a terminal resize (the
+  connector adopts and re-checks that itself) but a pane-area change that went
+  out as a `ClientShellResize` through the link while the host was down —
+  and `invalidate_pane_surface()`, because a fresh connection's
+  `RenderStream` always sends a full `PaneSurface`, never a patch.
+  `switch_host` now shares `active_console_geometry`.
+- **PR 1's deferred write-timeout question: assessed, not changed.**
+  `set_active`/`set_active_geometry` write to a `LocalStream` under the
+  active-host and link locks, so a peer that stopped reading with a full socket
+  buffer could stall the loop. It is not cheap to bound: `interprocess`'
+  `Stream` is a named pipe on Windows, so `SO_SNDTIMEO` would be a unix-only
+  half-fix inside `src/fleet/connector.rs` (a PR 1 file), and a timed-out write
+  leaves the frame half-sent, so it must drop the connection anyway. It is also
+  **not a new hazard**: upstream's single-host client blocks on the same kind
+  of write from the same loop (`write_to_server` → `protocol::write_message`),
+  and the messages this path writes are tens of bytes. Owner: E3/E7, if a
+  wedged host is ever observed.
+- **The other two items PR 5 deferred.** `reveal_workspace` adds
+  `fleet_active_spaces_offset()` — `workspace_scroll` is an *item* index into
+  the list `render_fleet_spaces` builds (one item per header whatever its
+  drawn height, plus each expanded group's rows), so the offset mirrors that
+  exactly and is 0 for the single-host client. `workspace_drop_target_at`
+  refuses a point on **another** host's row and will not append the trailing
+  slot on one; the *active* host's own header stays a slot, because it is the
+  line above its first workspace.
+- **25-column header truncation** is a sidebar fact, not a bug to fix in the
+  label: `put_text` cuts left-to-right, so a narrow sidebar keeps `▾ lab-1 ·
+  unav…` and cuts the reason line under it. The pane-area notice is the surface
+  that carries host, state and reason in full, and a test pins both at
+  `sidebar_width = 25`. Note the header says `unavailable` where the notice
+  says `reconnecting`: the header's vocabulary is `HostConnection::state_name`,
+  shared with `herdr fleet status` and the picker.
+- **`FleetSidebarHit::host()`** is new (every variant already carried a host);
+  `tests/support/fleet_tui.rs` gained `FleetConsole::redraw()` (the Rust twin
+  of `tui-drive.py --redraw`: resize away and back, forget the text so far —
+  the only way to assert something is *no longer* shown) and
+  `tests/support/fleet_lab.rs` gained `Lab::spawn_server(session)`, for the
+  case the script cannot express: a server that went away while a client was
+  watching it and has to come back on the same socket.
+
+**Real-server evidence (PR 8).** Two lab hosts, `lab-ssh` reaching lab-1's
+session over `ssh-lab.sh`. Taking the ssh lab down under the console gives
+`lab-ssh · reconnecting · host closed the connection` in the pane area with
+`▾ lab-ssh · unavailable` and its reason in the sidebar, `▾ lab-2 · no agents`
+untouched, and `never-lands-a` typed at the notice reaching neither host (0
+occurrences in either pane, before and after recovery); no
+`/tmp/herdr-remote-*-lab-ssh-*.sock` survives the quit and the ssh transport's
+text appears only as a host *reason*, never as raw stderr on the screen.
+**Degradation recorded:** `ssh-lab.sh down` deletes and `up` recreates the ssh
+lab's `HOME`, and an already-running console's ssh then reports `Could not
+resolve hostname herdr-ssh-lab` for the rest of the run, so the ssh lab cannot
+express the *recovery* half. It was validated with the plan's local variant
+instead (`herdr --session lab-1 server stop`, then restart): the console shows
+`lab-1 · reconnecting · server is shutting down`, `herdr fleet status` reports
+`lab-1 unavailable / lab-2 connected`, the restarted server is picked up within
+5 s, and a forced repaint shows `▾ lab-1 · no agents` with the recovered host's
+prompt in the pane area and no notice. `pane layout` on lab-1 reports
+`94x39` — the console's pane area — both before the drop and after the
+reconnect, never the headless `120x40`, which is the "resize on reconnect"
+guarantee end to end. `just bench-fleet-scale`: compose median at 5 hosts is
+0.99x one host collapsed and 1.01x expanded (PR 5: 1.04x / 1.02x); rebuild is
+1.85 µs per change at 5 hosts.
+
 **Downstream**
 
-- `input_allowed()` is the gate E7 must respect for cross-host prompts to a
-  down host (fail with a notice, never queue).
+- `ClientShellState::fleet_input_allowed()` (and `FleetShellState::
+  input_allowed()`) is the gate E7 must respect for cross-host prompts to a
+  down host: fail with a notice, never queue. `drop_pane_bound_input` is where
+  a new kind of deferred pane input must also be cleared.
 - The notice is TUI presentation; E3/E4 read `HostConnection` directly.
+- **PR 9:** `docs/fork/fleet.md` should document what the console does when a
+  host drops — the notice text, that input is discarded rather than queued,
+  that the rest of the console stays usable, and that a reconnect repaints at
+  the current size. The known cosmetic split (header `unavailable` vs notice
+  `reconnecting`) is worth one line. The `retry in N s` segment the plan's
+  sketch showed is **not** implemented; do not document it.
 
 ### PR 9 — docs: fleet console guide, adr e2 review, roadmap drift · deps: 6, 7, 8
 
@@ -1485,10 +2230,108 @@ Walk `fleet.md` top to bottom against `fleet-lab.sh up 3` + `ssh-lab.sh up`;
 paste real screen dumps (trimmed); `ssh-lab.sh down`, `fleet-lab.sh down`;
 confirm the user's `herdr session list` shows no `lab-*`.
 
+**As built (PR 9, merged).** Deviations from the sketch above, all deliberate:
+
+- **The walkthrough is what the commands actually do.** Every block in
+  `fleet.md` was executed against `fleet-lab.sh up 3` + `ssh-lab.sh up`, and
+  three of them had to change to stay true:
+  - **`kill $(cat sshd.pid)` alone does not drop a connected console.** The
+    listener's *per-connection* sshd child keeps herdr's ControlMaster session
+    alive, so the active host never notices. The documented recipe reads the
+    pid first, then `pkill -P "$sshd_pid"` (the children — the console's link)
+    and only then `kill "$sshd_pid"`. Restarting with
+    `sshd -f "$HERDR_SSH_LAB_ROOT/sshd_config" -E "$HERDR_SSH_LAB_ROOT/sshd.log"`
+    then recovers the host on its own, with `HOME` and the ssh config intact —
+    the half `ssh-lab.sh down`/`up` cannot express (PR 8's recorded
+    degradation, now expressible).
+  - **A `--dump` is stripped text in draw order, not a rectangle.** The console
+    draws region by region, so pane and sidebar text interleave. The sidebar is
+    the right-hand 25 columns, and `sed 's/│/\n/g' | sed -E 's/^.*(.{25})$/\1/'`
+    pulls it back out; every sidebar excerpt in `fleet.md` came from that
+    pipeline, and the pipeline is documented next to the first dump.
+  - **PR 6's "one expectation per frame" rule needed a second half.** An
+    expectation must also be text a frame writes *contiguously*: a sidebar
+    label whose state word changed arrives as a cell diff, so
+    `--expect 'lab-1 · no agents'` never matches a recovery. Expect pane-area
+    text, or `--redraw` first. Recorded in `fleet.md` for every later PR's
+    screen evidence.
+- **A notification and a host drop are two-shell walkthroughs**, not one
+  `tui-drive.py` invocation: both have to be triggered from outside while the
+  console is up. `fleet.md` says so rather than pretending a single command
+  line does it.
+- **`HERDR_SSH_LAB_ROOT` is an output, not an input.** `ssh-lab.sh` derives its
+  root as `$HERDR_FLEET_LAB_ROOT/ssh` and refuses to run anywhere else, so an
+  isolated ssh lab is obtained by setting `HERDR_FLEET_LAB_ROOT`.
+- **`fleet-core.md` was corrected, not rewritten.** Its `[fleet.keys]` section,
+  key table, precedence rule and `DEFAULT_CONFIG` quote were verified against
+  the code and left alone (PR 6 wrote them). What changed: the two "known gaps
+  E2 owns" (fixed active geometry, inherited ssh stderr) are recorded as
+  closed and how; the foreground-geometry caveat now points at the console; and
+  "never sends input" is reworded so it stays true of a console that does.
+- **The ROADMAP's E2 section** lost `prefix+shift+h` / `[keys]` for
+  `prefix+shift+f` / `[fleet.keys]`, its launch deliverable names
+  `run_client_with_launch` (the entry PR 3/4 actually built), and its
+  Docs/Tests deliverables now name what shipped (`tui-drive.py`,
+  `tests/support/fleet_tui.rs`). The Epic status table row was **not**
+  touched — `implement-epic` owns it.
+- **One thing deferred, with an owner:** `scripts/fork/tui-drive.py` strips
+  ANSI per `os.read()` chunk, so a sequence that lands on a read boundary can
+  leak a fragment such as `[0;38;2;…m` into the dumped text (seen once, in a
+  toast frame). It cannot produce a false *positive* match on a plain-text
+  expectation, only noise in a dump. Fixing it means holding a partial-escape
+  tail across reads — code, not docs. Owner: whichever epic next edits the
+  harness (E7's console actions).
+
 **Downstream**
 
 - E7 adds its console actions to `fleet.md`; E8's install doc links here for
   "console machine".
+- The `fleet.md` walkthrough's three `tui-drive.py` rules (`--redraw` before
+  `--dump`, the 25-column sidebar extraction, one contiguous expectation per
+  frame) are the fixture contract for every later PTY validation.
+
+### PR 10 — fix(fleet): log fleet console active-host changes · deps: 5
+
+**Goal:** close the gap the epic's end-to-end validation found. Step 1 of
+*End-to-end epic validation* asserts the herdr log records the active host
+change, but nothing logged a *positive* one: only the refusal paths
+(`refusing to switch to a host disabled in [fleet]`) and host-local resize
+failures were logged, and the switch itself was a `debug!` phrased
+`the fleet console switched host`. A console run at `HERDR_LOG=debug`
+therefore had no line answering "which machine was this console driving?".
+
+**Files**
+
+- `src/client/fleet.rs` only. Two `tracing::info!` lines, one event name:
+  - `console_link`, right after `state.set_active_host(Some(active))` — the
+    launch decision: `info!(host = %active, "fleet console active host")`.
+  - `retarget_host`, after the switch has been applied to the connector, the
+    link, the fleet state and the endpoint lane (replacing the old `debug!`):
+    `info!(host = %host, from = %previous, "fleet console active host")`.
+    A refused switch never reaches `retarget_host` (`switch_target_allowed`
+    warns and returns), so the line only ever describes a change that
+    happened.
+
+No upstream file is touched, no wire or endpoint change, no new dependency.
+`info!` (not `debug!`) because this is the one fact an operator reading a
+console log needs by default.
+
+**Tests:** `a_switch_moves_the_connector_the_link_and_the_fleet_state_together`
+in `src/client/fleet.rs` gains a thread-local `tracing` capture
+(`CapturedLog`, a `MakeWriter` over `Arc<Mutex<Vec<u8>>>` installed with
+`tracing::subscriber::set_default`) and asserts both lines: the launch line
+naming `alpha` and the switch line carrying `host=beta from=alpha`. The
+capture is thread-local, so the fake hosts' supervisor threads never write
+into it.
+
+**Real-server validation**
+
+`fleet-lab.sh up 2`, an `[fleet]` block with `include_local = false` and
+`lab-1`/`lab-2` as `kind = "local"`, then drive the console through
+`scripts/fork/tui-drive.py` at `HERDR_LOG=debug`: expect `lab-1`, open the
+picker, pick 2, expect `lab-2`, quit. `grep -i 'active host'
+$XDG_CONFIG_HOME/herdr-dev/herdr-client.log` must show the launch line for
+`lab-1` and the switch line `host=lab-2 from=lab-1`.
 
 ## Critical files referenced (reuse, don't reinvent)
 
