@@ -69,11 +69,6 @@ pub(crate) enum KeybindAction {
     OpenNotificationTarget,
     Detach,
     OpenNavigator,
-    /// Open the Fleet console's host picker (fork, `[fleet.keys]`).
-    ///
-    /// Exists in every build. A client that is not a console has no fleet to
-    /// pick from and ignores it.
-    HostPicker,
 }
 
 pub(crate) fn resolve_direct_binding(
@@ -157,7 +152,6 @@ pub(crate) fn resolve_non_indexed_action(
         ),
         (&keybinds.detach, KeybindAction::Detach),
         (&keybinds.goto, KeybindAction::OpenNavigator),
-        (&keybinds.host_picker, KeybindAction::HostPicker),
     ] {
         if action_matches(bindings, key, dispatch) {
             return Some(action);

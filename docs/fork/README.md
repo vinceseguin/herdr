@@ -16,14 +16,14 @@ architecture decisions in [`decisions/`](./decisions/).
 
 | | Upstream herdr | This fork |
 | --- | --- | --- |
-| Console | one TUI ↔ one server (local or one `--remote`) | `herdr fleet`: every LAN host's workspaces and agents in one sidebar, work in any of them |
+| Console | upstream's multi-machine client (`herdr machine add`, `list`, …; machine sidebar, background connects, reconnects — upstream #3670) | **the same** — the fork's own console (E2) was retired in favour of it, see [ADR 0002](./decisions/0002-adopt-upstream-multi-machine-client.md) |
 | Phone | — (third-party bridges) | `herdr gateway` + installable web app: agents grouped blocked-first, live terminals, answer prompts |
 | Away from home | SSH | same thing over Tailscale; gateway gets HTTPS from `tailscale serve` |
 | Servers | stock | **stock** — LAN hosts run upstream or the fork interchangeably |
 
-Design in one line: servers are untouched, SSH is the only transport, the
-gateway is loopback-first and token-gated, and every new line of code lives in
-an additive module so upstream merges stay cheap.
+Design in one line: servers are untouched, the console is upstream's, SSH is
+the only transport, the gateway is loopback-first and token-gated, and every
+new line of code lives in an additive module so upstream merges stay cheap.
 
 ## Working in the fork with Claude Code
 
@@ -376,46 +376,16 @@ lab-2    local  connected    0.8.2-fork  0        0        0     0     0
 no agents
 ```
 
+The multi-machine **console** is upstream's: `herdr machine add <target>`
+saves an SSH machine, and the client's machine sidebar shows every saved
+machine's workspaces and agents (upstream #3670). `herdr fleet status` is the
+fork's headless view of the same hosts, and the shape the gateway (E3) serves.
+
 `--json` prints the `herdr.fleet.status.v1` report the gateway will serve, and
 `--watch` streams one `FleetChange` per line. Full reference — every `[fleet]`
 key, the `host/w1:p1` id form, connection states and reasons, ssh host setup and
-reconnect behaviour, and the `src/fleet/` module map for E2/E3 — is in
+reconnect behaviour, and the `src/fleet/` module map for E3 — is in
 [`fleet-core.md`](./fleet-core.md).
-
-## Fleet console
-
-`herdr fleet` (or `herdr --fleet`) opens the full-screen console over every
-configured host at once: one host group per host in the sidebar with live
-status, and one *active host* filling the pane area and receiving everything
-you type.
-
-The sidebar's spaces section then reads like this (sketch; real dumps are in
-[`fleet.md`](./fleet.md)):
-
-```
- spaces
-
-▾ local · 1 blocked · 2 working
-  ▸ main
-    api
-    web
-▾ workbox · no agents
-  · agents
-▾ oldbox · unavailable
-  connection refused
-```
-
-Click a host header to switch, or open the picker with `prefix+shift+f`
-(`[fleet.keys] host_picker`). Notifications from any host arrive prefixed
-`[host]`, and `prefix+o` switches to that host and focuses the pane there. A
-host that drops is dimmed with its reason and the rest of the console keeps
-working; when the *active* host drops the pane area shows a reconnect notice
-and input is discarded rather than queued.
-
-Launch, the sidebar, switching, routing, notifications, failure UX, the limits
-(no mixed-host layouts, no kitty graphics, local keybindings only) and a
-lab-driven walkthrough with `scripts/fork/tui-drive.py` are in
-[`fleet.md`](./fleet.md).
 
 ## Continuous integration
 
@@ -452,26 +422,31 @@ git fetch upstream
 git switch -c chore/sync-upstream-$(date +%Y%m%d) origin/master
 git merge upstream/master          # merge, never rebase master
 bash scripts/fork/gate.sh          # EXIT=0
-git push -u origin HEAD && gh pr create -R vinceseguin/herdr --base master --fill && gh pr merge -R vinceseguin/herdr --squash --delete-branch
+git push -u origin HEAD && gh pr create -R vinceseguin/herdr --base master --fill && gh pr merge -R vinceseguin/herdr --merge --delete-branch
 ```
+
+A sync PR is merged with a **merge commit** (`--merge`, never `--squash`) so
+upstream's history stays in the fork's `master`. Resolve conflicts by
+ownership (ADR 0002): upstream's side for `src/client/**`,
+`src/remote/attach.rs` and new `src/remote/*` files, `src/server/**`,
+`src/api/**`, `src/platform/**`, `docs/next/**`; the fork's side for
+`src/fleet/**`, `src/gateway/**`, `scripts/fork/**`, `docs/fork/**`,
+`.claude/**`, `.github/workflows/fork-*.yml`, `assets/fork/**`; both sides in
+the wiring files of the table below. Then re-apply E1's three
+`src/remote/attach.rs` hooks onto upstream's version (or adapt
+`src/fleet/transport/ssh.rs` to an equivalent upstream bridge, and say so in
+the merge commit).
 
 After every sync, re-run `gh workflow list --all -R vinceseguin/herdr` and
 `gh workflow disable <file>` any **new** upstream workflow the merge added.
 
 Fork-owned paths never conflict — whole directories (`docs/fork/`, `.claude/`,
-`scripts/fork/`, including `fleet-lab.sh`, `ssh-lab.sh`, `gate.sh`,
-`dev-setup.sh` and `tui-drive.py`; `src/fleet/`, and `src/gateway/` and `web/`
-once later epics create them) plus fork-only files that live inside upstream
-directories:
-
-- `src/cli/fleet.rs`, `.github/workflows/fork-*.yml`;
-- the console's own modules: `src/client/link.rs`, `src/client/fleet.rs`,
-  `src/client/shell/fleet.rs`, `fleet_sidebar.rs`, `fleet_overlay.rs`, and
-  `src/client/shell/tests/fleet_{sidebar,picker,notifications,reconnect,scale}.rs`;
-- every `tests/fork_*.rs` (today `tests/fork_channel.rs`,
-  `tests/fork_fleet_lab.rs`, `tests/fork_ssh_lab.rs`,
-  `tests/fork_fleet_tui.rs`), `tests/support/fleet_lab.rs`,
-  `tests/support/fleet_tui.rs` and `tests/cli/fleet.rs`.
+`scripts/fork/`, including `fleet-lab.sh`, `ssh-lab.sh`, `gate.sh` and
+`dev-setup.sh`; `src/fleet/`, and `src/gateway/` and `web/` once later epics
+create them) plus fork-only files that live inside upstream directories:
+`src/cli/fleet.rs`, `.github/workflows/fork-*.yml`, every `tests/fork_*.rs`
+(today `tests/fork_channel.rs`, `tests/fork_fleet_lab.rs`,
+`tests/fork_ssh_lab.rs`), `tests/support/fleet_lab.rs` and `tests/cli/fleet.rs`.
 
 The upstream files that currently carry fork wiring, and may conflict:
 
@@ -479,34 +454,14 @@ The upstream files that currently carry fork wiring, and may conflict:
 | --- | --- |
 | `.cargo/config.toml` | the `[env]` build channel |
 | `src/build_info.rs`, `src/update.rs`, `src/release_notes.rs` | fork build identity, self-update disabled |
-| `src/main.rs` | `mod fleet;`, the `[fleet]`/`[fleet.keys]` block of `DEFAULT_CONFIG`, the `--fleet` flag with its `--help` usage and option lines, `"fleet"` in the bare-command list, the console launch branch |
-| `src/cli.rs`, `src/cli/spec.rs` | one `mod fleet;` + match arm (the `Option<i32>` "not a CLI command" pattern), and `fleet_command()` |
-| `src/config/model.rs`, `src/config/io.rs`, `src/config.rs` | the `[fleet]` section including `[fleet.keys]`, its `KNOWN_TOP_LEVEL_CONFIG_KEYS`/live-reload entry, and its diagnostics |
-| `src/config/keybinds.rs`, `src/input/keybindings.rs`, `src/input/keybind_help.rs` | `Keybinds.host_picker`, `KeybindAction::HostPicker` and its help row (E2 PR 6) |
-| `src/client/mod.rs` | the `ServerLink`/`ClientLink` seam, `ClientLoopEvent::Fleet`, `ClientLaunch`/`run_client_with_launch`, `ClientState.fleet`, `mod link; mod fleet;` (E2 PRs 3-7) |
-| `src/client/endpoint_commands.rs` | `send_next`/`complete` over `ServerLink`, the per-link request correlation (E2 PR 3) |
-| `src/client/attach.rs`, `src/client/clipboard_images.rs`, `src/client/terminal_sessions.rs` | the same seam: `&mut LocalStream` → `&mut ServerLink`, or `write_stream_message` for a stream of their own (E2 PR 3) |
-| `src/client/shell.rs`, `shell/state.rs`, `shell/render.rs`, `shell/composition.rs` | `mod fleet;` + the re-export, the fleet fields on `ClientShellState`/`ShellHitMap`/`ClientShellOverlay`/`ClientPendingNotification`, and the render-state and notice hooks (E2 PRs 5-8) |
-| `src/client/shell/sidebar.rs`, `agent_sidebar.rs`, `mouse.rs`, `overlays.rs`, `overlay_input.rs`, `actions.rs`, `input.rs`, `copy_mode.rs`, `notifications.rs`, `config.rs`, `worktree_overlays.rs` | one delegation, arm or guard each for host groups, the picker, host-aware notifications and the input drop; `sidebar.rs`/`agent_sidebar.rs` also split their row bodies out so both paths draw identical rows, and `config.rs` carries `local_fleet_keys` (E2 PRs 5-8) |
-| `src/client/shell/tests/{mod,mobile,startup_overlays}.rs` | the five fleet test modules, and one `host: None` field in two fixtures |
+| `src/main.rs` | `mod fleet;`, the `[fleet]` block of `DEFAULT_CONFIG`, one `--help` usage line, `"fleet"` in the bare-command list |
+| `src/remote/attach.rs` | `pub(crate)` visibility on the ssh stdio bridge and remote discovery, plus `start_with`/`local_forward_socket_path_scoped`/`BridgeErrorSink` (E1 PR 3) — upstream's side first, then re-apply |
+| `src/cli.rs`, `src/cli/spec.rs` | one `mod fleet;` + match arm, and `fleet_command()` |
+| `src/config/model.rs`, `src/config/io.rs`, `src/config.rs` | the `[fleet]` section, its `KNOWN_TOP_LEVEL_CONFIG_KEYS`/live-reload entry, and its diagnostics |
 | `src/remote/attach.rs` | `pub(crate)` visibility on the ssh stdio bridge and remote discovery, plus `start_with`/`local_forward_socket_path_scoped`/`BridgeErrorSink` (E1 PR 3) |
-| `justfile` | the `bench-fleet-scale` recipe |
 | `scripts/config_reference_check.py` | one `SKIPPED_SUBTREES` entry for `fleet` |
-| `src/app/mod.rs` (tests only), `tests/support/mod.rs`, `tests/api_ping.rs`, `tests/cli/sessions.rs`, `tests/cli/mod.rs` | fork test wiring; `tests/support/mod.rs` also exposes `fleet_tui` and tolerates a process that exits mid-scan |
+| `src/app/mod.rs` (tests only), `tests/support/mod.rs`, `tests/api_ping.rs`, `tests/cli/sessions.rs`, `tests/cli/mod.rs` | fork test wiring |
 | `.gitignore`, the fork section at the tail of `AGENTS.md` | fork layout and rules |
-
-Two merge notes for the client seam:
-
-- **A new upstream helper that takes `&mut LocalStream` must be given
-  `&mut ServerLink` at merge time.** `write_to_server` kept its name and every
-  call site that writes to the client's own server, so upstream edits *to those
-  sites* merge cleanly — but a helper upstream adds after the fork will arrive
-  typed on the raw stream. If it owns a stream of its own (as
-  `terminal_sessions.rs` does), give it `link::write_stream_message` instead.
-- Any new `[fleet.keys]` binding must also be copied into
-  `ClientShellConfig.local_fleet_keys`, or the first snapshot resets it to its
-  default: `apply_snapshot_keybindings` recompiles the whole local keymap on
-  every connect.
 
 `src/protocol/wire.rs`, `src/protocol/endpoint.rs` and
 `tests/fixtures/endpoint-*.json` are never touched by the fork; take upstream's

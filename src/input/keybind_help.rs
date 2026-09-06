@@ -194,17 +194,6 @@ pub(crate) fn keybind_help_groups(
         ),
     ];
 
-    // Fork: `[fleet.keys]`. Listed for every client, like every other
-    // configured binding — the help overlay describes the keymap, and the
-    // renderer it is drawn by has no fleet state to condition on.
-    groups.push((
-        "fleet",
-        vec![entry(
-            binding_label(&keybinds.host_picker),
-            "host picker (fleet console)",
-        )],
-    ));
-
     if !keybinds.custom_commands.is_empty() {
         groups.push((
             "custom",

@@ -7,10 +7,6 @@
 //! Exit codes follow the plan's decision (h): 0 whenever a report was produced
 //! (an unreachable host is data, not a failure), 1 for an invalid `[fleet]`
 //! section, 2 for a usage error.
-//!
-//! A bare `herdr fleet` is not a CLI command at all: it opens the Fleet
-//! console, so it answers `None` and `main` launches the client, exactly as
-//! `herdr server` does.
 
 use std::io::Write as _;
 use std::time::Duration;
@@ -21,25 +17,22 @@ use crate::fleet::oneshot;
 use crate::fleet::report::FleetStatusReport;
 use crate::fleet::state::FleetChange;
 
-const FLEET_USAGE: &str =
-    "usage: herdr fleet\n       herdr fleet status [--json] [--timeout-ms MS] [--watch]";
+const FLEET_USAGE: &str = "usage: herdr fleet status [--json] [--timeout-ms MS] [--watch]";
 /// How long a one-shot waits for hosts that have not answered yet.
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 /// Upper bound on `--timeout-ms`, so a typo cannot hang a script for a day.
 const MAX_TIMEOUT_MS: u64 = 600_000;
 
-pub(super) fn run_fleet_command(args: &[String]) -> std::io::Result<Option<i32>> {
+pub(super) fn run_fleet_command(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(|arg| arg.as_str()) {
-        // Not a CLI command: `main` launches the Fleet console.
-        None => Ok(None),
-        Some("status") => run_status_command(&args[1..]).map(Some),
+        Some("status") => run_status_command(&args[1..]),
         Some("help" | "--help" | "-h") if args.len() == 1 => {
             print_fleet_help();
-            Ok(Some(0))
+            Ok(0)
         }
         _ => {
             print_fleet_help_to_stderr();
-            Ok(Some(2))
+            Ok(2)
         }
     }
 }
@@ -239,11 +232,8 @@ fn status_name(status: AgentStatus) -> &'static str {
 
 fn fleet_help() -> String {
     let mut help = String::new();
-    help.push_str("Open the Fleet console, or inspect the configured fleet\n\n");
+    help.push_str("Inspect the configured fleet of herdr hosts\n\n");
     help.push_str(&format!("{FLEET_USAGE}\n\n"));
-    help.push_str("Commands:\n");
-    help.push_str("  (none)              Open the Fleet console over every configured host\n");
-    help.push_str("  status              Print the fleet's hosts and agents once\n\n");
     help.push_str("Options:\n");
     help.push_str("  --json              Print the fleet status report as JSON\n");
     help.push_str(&format!(
@@ -349,38 +339,5 @@ mod tests {
         for flag in ["--json", "--timeout-ms", "--watch"] {
             assert!(help.contains(flag), "help is missing {flag}: {help}");
         }
-    }
-
-    #[test]
-    fn the_help_leads_with_the_console() {
-        let help = fleet_help();
-        assert!(help.starts_with("Open the Fleet console"), "{help}");
-        assert!(help.contains("usage: herdr fleet\n"), "{help}");
-    }
-
-    fn args(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| value.to_string()).collect()
-    }
-
-    #[test]
-    fn a_bare_fleet_is_not_a_cli_command() {
-        assert_eq!(
-            run_fleet_command(&[]).expect("no io"),
-            None,
-            "`herdr fleet` opens the console; main launches it"
-        );
-    }
-
-    #[test]
-    fn an_unknown_fleet_subcommand_is_a_usage_error() {
-        assert_eq!(
-            run_fleet_command(&args(&["bogus"])).expect("no io"),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn fleet_help_is_handled_by_the_command_itself() {
-        assert_eq!(run_fleet_command(&args(&["help"])).expect("no io"), Some(0));
     }
 }

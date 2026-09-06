@@ -11,9 +11,6 @@ pub(crate) struct OverlayRender {
     pub(crate) navigator_popup: Rect,
     pub(crate) navigator_search: Rect,
     pub(crate) navigator_rows: Vec<(Rect, usize)>,
-    /// Fork (E2 PR 6): the host picker's drawn rows, by index into the
-    /// overlay's own row list.
-    pub(crate) host_picker_rows: Vec<(Rect, usize)>,
     pub(crate) worktree_search: Rect,
     pub(crate) worktree_rows: Vec<(Rect, usize)>,
     pub(crate) help_popup: Rect,
@@ -44,7 +41,6 @@ pub(crate) fn render_client_overlay(
         ClientShellOverlay::Navigator(_)
             | ClientShellOverlay::ContextMenu(_)
             | ClientShellOverlay::GlobalMenu(_)
-            | ClientShellOverlay::HostPicker(_)
     ) {
         for y in b.area.y..b.area.bottom() {
             for x in b.area.x..b.area.right() {
@@ -75,168 +71,8 @@ pub(crate) fn render_client_overlay(
         ClientShellOverlay::WorktreeRemove(v) => {
             worktree_overlays::render_worktree_remove_overlay(b, v, p)
         }
-        ClientShellOverlay::HostPicker(v) => render_host_picker_overlay(b, v, p),
         ClientShellOverlay::ContextMenu(_) | ClientShellOverlay::GlobalMenu(_) => None,
     }
-}
-
-/// The `1`-`9` jump keys, as the gutter draws them: a static table so a
-/// frame allocates nothing per row.
-const HOST_PICKER_DIGITS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
-
-/// Columns before a host picker row's label: `" 1 ● "`.
-const HOST_PICKER_GUTTER: u16 = 5;
-
-/// The Fleet console's host picker (fork, E2 PR 6).
-///
-/// A list of every configured host, in the sidebar's order so the `1`-`9`
-/// jump names the same host as the *n*-th group. Every string it draws was
-/// computed once, when the console last rebuilt its row model; a row is drawn
-/// as fixed-position segments, not formatted, so an open picker costs no
-/// per-row allocation per frame.
-fn render_host_picker_overlay(
-    b: &mut Buffer,
-    picker: &ClientHostPickerOverlay,
-    p: &Palette,
-) -> Option<OverlayRender> {
-    let widest = picker
-        .rows
-        .iter()
-        .map(|row| display_width(&row.label))
-        .max()
-        .unwrap_or(0);
-    let kind_widest = picker
-        .rows
-        .iter()
-        .map(|row| display_width(row.kind))
-        .max()
-        .unwrap_or(0);
-    // Gutter, the label, a gap and the transport, the panel border, and a
-    // column of breathing room. `popup` clamps this to the screen; a label
-    // wider than that is truncated by `put_text`, never wrapped.
-    let width = widest
-        .saturating_add(HOST_PICKER_GUTTER)
-        .saturating_add(kind_widest.saturating_add(1))
-        .saturating_add(3)
-        .max(32);
-    // Title, divider, one line per host, footer, and the panel's two borders.
-    let height = u16::try_from(picker.rows.len())
-        .unwrap_or(u16::MAX)
-        .saturating_add(5);
-    let outer = popup(b.area, width, height)?;
-    let inner = panel(b, outer, p.accent, p.panel_bg)?;
-
-    put_text(
-        b,
-        inner.x,
-        inner.y,
-        inner.width,
-        " Fleet",
-        Style::default().fg(p.text).bg(p.panel_bg),
-    );
-    put_right_text(
-        b,
-        inner,
-        inner.y,
-        &format!("{} hosts", picker.rows.len()),
-        Style::default().fg(p.overlay0).bg(p.panel_bg),
-    );
-    put_text(
-        b,
-        inner.x,
-        inner.y + 1,
-        inner.width,
-        &"─".repeat(inner.width as usize),
-        Style::default().fg(p.surface1).bg(p.panel_bg),
-    );
-
-    let body = Rect::new(
-        inner.x,
-        inner.y + 2,
-        inner.width,
-        inner.height.saturating_sub(3),
-    );
-    let max_scroll = picker.rows.len().saturating_sub(body.height as usize);
-    let scroll = picker
-        .scroll
-        .max(
-            picker
-                .selected
-                .saturating_sub(body.height.saturating_sub(1) as usize),
-        )
-        .min(picker.selected)
-        .min(max_scroll);
-    let mut row_hits = Vec::new();
-    for (visible, (index, row)) in picker
-        .rows
-        .iter()
-        .enumerate()
-        .skip(scroll)
-        .take(body.height as usize)
-        .enumerate()
-    {
-        let rect = Rect::new(body.x, body.y + visible as u16, body.width, 1);
-        row_hits.push((rect, index));
-        // Dim is the one style that carries meaning here: a host that cannot
-        // be reached, or one `[fleet]` disables, is not somewhere the console
-        // can go right now.
-        let reachable = row.enabled && row.state.is_connected();
-        let style = if index == picker.selected {
-            Style::default()
-                .fg(contrast(p))
-                .bg(p.accent)
-                .add_modifier(Modifier::BOLD)
-        } else if !reachable {
-            Style::default()
-                .fg(p.overlay0)
-                .bg(p.panel_bg)
-                .add_modifier(Modifier::DIM)
-        } else if row.active {
-            Style::default().fg(p.text).bg(p.panel_bg)
-        } else {
-            Style::default().fg(p.subtext0).bg(p.panel_bg)
-        };
-        b.set_style(rect, style);
-        if let Some(digit) = HOST_PICKER_DIGITS.get(index) {
-            put_text(b, rect.x.saturating_add(1), rect.y, 1, digit, style);
-        }
-        if row.active {
-            put_text(b, rect.x.saturating_add(3), rect.y, 1, "●", style);
-        }
-        let label_x = rect.x.saturating_add(HOST_PICKER_GUTTER);
-        let label_area = rect.width.saturating_sub(HOST_PICKER_GUTTER);
-        put_text(b, label_x, rect.y, label_area, &row.label, style);
-        // The transport (`local` / `ssh`) sits at the right edge when the
-        // label leaves room for it, the way the navigator places its meta.
-        let label_width = display_width(&row.label).min(label_area);
-        let kind_area = Rect::new(
-            label_x.saturating_add(label_width).saturating_add(1),
-            rect.y,
-            label_area.saturating_sub(label_width.saturating_add(1)),
-            1,
-        );
-        if kind_area.width >= display_width(row.kind) {
-            put_right_text(b, kind_area, rect.y, row.kind, style);
-        }
-    }
-
-    put_text(
-        b,
-        inner.x,
-        inner.bottom() - 1,
-        inner.width,
-        " move j/k · jump 1-9 · switch enter · close esc",
-        Style::default().fg(p.overlay0).bg(p.panel_bg),
-    );
-
-    Some(OverlayRender {
-        // The picker has no primary button; `primary` carries its popup so a
-        // press outside it closes the overlay, the way the navigator uses
-        // `navigator_popup`.
-        primary: outer,
-        host_picker_rows: row_hits,
-        ..OverlayRender::default()
-    })
 }
 
 pub(crate) fn render_global_menu(
@@ -821,7 +657,6 @@ fn render_rename_overlay(
         navigator_popup: Rect::default(),
         navigator_search: Rect::default(),
         navigator_rows: Vec::new(),
-        host_picker_rows: Vec::new(),
         worktree_search: Rect::default(),
         worktree_rows: Vec::new(),
         cursor: Some(crate::protocol::CursorState {
@@ -1062,7 +897,6 @@ fn render_navigator_overlay(
         navigator_popup: q,
         navigator_search: Rect::new(i.x, i.y, i.width, 1),
         navigator_rows: row_hits,
-        host_picker_rows: Vec::new(),
         worktree_search: Rect::default(),
         worktree_rows: Vec::new(),
         cursor: n.search_focused.then(|| crate::protocol::CursorState {
@@ -1327,7 +1161,6 @@ fn render_confirm_close_overlay(
         navigator_popup: Rect::default(),
         navigator_search: Rect::default(),
         navigator_rows: Vec::new(),
-        host_picker_rows: Vec::new(),
         worktree_search: Rect::default(),
         worktree_rows: Vec::new(),
         cursor: None,

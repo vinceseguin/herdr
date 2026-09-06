@@ -276,6 +276,7 @@ fn fleet_usage_errors_exit_two() {
     write_config(&config_home, "");
 
     for args in [
+        vec!["fleet"],
         vec!["fleet", "stats"],
         vec!["fleet", "status", "--jsn"],
         vec!["fleet", "status", "--timeout-ms"],
@@ -288,21 +289,6 @@ fn fleet_usage_errors_exit_two() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-
-    // A bare `herdr fleet` is the Fleet console, not a usage error. There is no
-    // terminal in this harness, so it fails the way every other herdr client
-    // does when it is not on a tty — never with the usage text.
-    let output = run_named_cli(&config_home, &runtime_dir, &["fleet"]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_ne!(
-        output.status.code(),
-        Some(2),
-        "`herdr fleet` opens the console: {stderr}"
-    );
-    assert!(
-        !stderr.contains("usage: herdr fleet"),
-        "`herdr fleet` must not print the usage line: {stderr}"
-    );
 
     // `--help` is answered by the shared clap spec, `help` by the command.
     let output = run_named_cli(&config_home, &runtime_dir, &["fleet", "--help"]);

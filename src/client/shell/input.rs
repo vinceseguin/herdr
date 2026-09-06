@@ -281,16 +281,6 @@ impl ClientShellState {
             self.reconcile_input_source();
         }
         outcome.repaint |= self.resume_mobile_switcher_if_ready();
-        // Fork (E2 PR 8): a Fleet console whose active host is switching,
-        // reconnecting or unreachable shows a notice where the pane area
-        // would be. Input aimed at that pane is dropped here, once, and never
-        // queued: replaying it after the host comes back would type into a
-        // shell that has moved on, and holding it across a switch would type
-        // it into another machine. Chrome, overlays and the host picker keep
-        // working — leaving the console is the one thing that must not break.
-        if !self.fleet_input_allowed() && self.drop_pane_bound_input(&mut outcome) {
-            outcome.repaint = true;
-        }
         outcome
     }
 

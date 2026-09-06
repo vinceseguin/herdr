@@ -469,14 +469,6 @@ impl ClientShellState {
         {
             return None;
         }
-        // Fork (E2 PR 8): a Fleet console's spaces body also holds other
-        // hosts' headers and rows. A drag can only ever reorder the active
-        // host's workspaces, so a pointer over another host has no target —
-        // without this the nearest-slot search below snaps the indicator onto
-        // that host's rows, several lines away from the pointer.
-        if self.is_other_host_row(point.1) {
-            return None;
-        }
         let mut slots = self
             .hits
             .workspaces
@@ -502,9 +494,7 @@ impl ClientShellState {
                     .map(|workspace| workspace.workspace_id.clone())
             });
             let row = last_hit.rect.bottom();
-            // …and the row after the active host's last workspace belongs to
-            // the next host's header in a console, which is not a slot.
-            if row < self.hits.new_workspace.y && !self.is_other_host_row(row) {
+            if row < self.hits.new_workspace.y {
                 slots.push((before, row));
             }
         }
@@ -1556,37 +1546,6 @@ impl ClientShellState {
             }
             return;
         }
-        // Fork (E2 PR 6): the Fleet console's host picker, driven like the
-        // navigator below it — hover selects, a press on a row switches, a
-        // press outside the popup closes.
-        if matches!(self.overlay, Some(ClientShellOverlay::HostPicker(_))) {
-            let row_hit = self.host_picker_row_at(point);
-            match mouse.kind {
-                MouseEventKind::Moved => {
-                    if let Some(index) = row_hit {
-                        outcome.repaint |= self.select_host_picker_row(index);
-                    }
-                }
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(index) = row_hit {
-                        self.accept_host_picker_row(index, outcome);
-                    } else if !super::contains(self.hits.overlay_primary, point) {
-                        self.overlay = None;
-                        outcome.repaint = true;
-                    }
-                }
-                MouseEventKind::ScrollUp => {
-                    self.move_host_picker_selection(-3);
-                    outcome.repaint = true;
-                }
-                MouseEventKind::ScrollDown => {
-                    self.move_host_picker_selection(3);
-                    outcome.repaint = true;
-                }
-                _ => {}
-            }
-            return;
-        }
         if matches!(self.overlay, Some(ClientShellOverlay::Navigator(_))) {
             let row_hit = self
                 .hits
@@ -1987,9 +1946,6 @@ impl ClientShellState {
                     self.agent_panel_sort_manual = true;
                     self.agent_scroll = 0;
                     self.persist_chrome_preferences(outcome);
-                    // Every fleet group's agent order is built with this
-                    // preference, so the console's row model is now stale.
-                    self.note_fleet_sort_changed(outcome);
                     outcome.repaint = true;
                     return;
                 }
@@ -2047,12 +2003,6 @@ impl ClientShellState {
                     outcome.repaint = true;
                     outcome.resize = true;
                     self.persist_chrome_preferences(outcome);
-                    return;
-                }
-                // Host-qualified rows first: they belong to a machine the
-                // shell is not showing, and the id-only hit tests below would
-                // resolve them against the active host.
-                if self.handle_fleet_sidebar_click(point, outcome) {
                     return;
                 }
                 for hit in &self.hits.workspaces {

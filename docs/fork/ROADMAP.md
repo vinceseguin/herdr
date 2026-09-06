@@ -6,9 +6,10 @@ agents' terminals plus a TUI client attached to **one** server on **one**
 machine. This fork adds three things upstream does not have:
 
 1. **One console for every machine on the LAN.** Several computers each run a
-   herdr server; a single `herdr fleet` TUI on any of them shows every host's
-   workspaces and agents at once, with live status, and lets you work in any of
-   them.
+   herdr server; one client shows every host's workspaces and agents at once,
+   with live status, and lets you work in any of them. Since upstream #3670
+   this is upstream's own multi-machine client (`herdr machine …`); the fork's
+   E2 console was retired (ADR 0002).
 2. **A phone app.** An installable web app (PWA) served by a small gateway on
    one LAN machine shows every agent on every machine, streams any terminal
    live, and lets you answer a blocked agent from the phone.
@@ -89,7 +90,7 @@ adds **TypeScript** (Vite) with **xterm.js**.
 | TUI client, client-owned shell (snapshot, sidebar, input) | `src/client/`, `src/client/shell/` |
 | SSH stdio bridge used by `herdr --remote` | `src/remote/attach.rs` (`SshStdioBridge`, `prepare_remote_herdr`, `ensure_remote_server_ready`), `src/remote/host_unix.rs` |
 | **Fleet core** — hosts config, connector, merged pure state | `src/fleet/` (new) |
-| **Fleet TUI** — host groups in sidebar, host switching | `src/client/shell/` additions + `src/fleet/` |
+| **Multi-machine console** — saved machines, machine sidebar, switching | upstream's `src/client/`, `src/remote/saved.rs` (`herdr machine …`) — **untouched**; the fork's E2 console is ♻️ superseded (ADR 0002) |
 | **Gateway** — HTTP/WebSocket for phones and browsers | `src/gateway/` (new), behind a cargo feature |
 | **Phone app** — installable PWA | `web/` (new), built assets embedded in the gateway |
 | Fork docs, plans, ADRs | `docs/fork/` (`docs/*` is gitignored upstream; `.gitignore` carves this out) |
@@ -125,28 +126,29 @@ Key upstream facts every plan builds on (verified on `master` @ 0.8.2):
 
 ## Sequencing
 
-**Dependency order: E0 → E1 → E2, then E3 → E4 → E5, then E6 / E7 / E8.**
+**Dependency order: E0 → E1 → E3 → E4 → E5, then E6 / E7 / E8** (E2 is
+superseded; see below).
 
 - **E0** first, because `just ci` has to run on this machine before a single
   task can be gated, and because fork CI and the fleet lab are what every later
   epic validates with.
-- **E1** is the shared core. Both the TUI (E2) and the gateway (E3) are thin
-  consumers of it; getting the pure `FleetState` right is where correctness
+- **E1** is the shared core. The gateway (E3) — and, before it was
+  superseded, the TUI (E2) — is a thin consumer of it; getting the pure `FleetState` right is where correctness
   lives.
-- **E2** and **E3** are independent once E1 exists and may run in parallel if
-  the machine can afford two Rust builds at once (see
-  `implement-roadmap`'s concurrency rule).
+- **E2** was superseded by upstream's multi-machine client (#3670) after it
+  shipped; see ADR 0002. **E3** is the first consumer of E1 that remains.
 - **E5** is mostly documentation plus a small gateway convenience; it is listed
   as its own epic because it answers the user's actual question ("do I just
   need a VPN?" — yes, Tailscale) and because HTTPS from `tailscale serve` is
   what makes E4's installability and E6's push notifications work on iOS.
-- **E8** last: only the console machine and the gateway host need fork
-  binaries; LAN servers can stay stock.
+- **E8** last: only the gateway host needs a fork binary; the console is
+  upstream's client and LAN servers can stay stock.
 
 ## Milestones
 
-- **MVP 1 — LAN console:** E0 → E1 → E2. Sit at one computer, see and drive
-  every agent on every LAN machine from one `herdr fleet`.
+- **MVP 1 — LAN console:** E0 → E1, then upstream's machine client. Sit at
+  one computer, see and drive every agent on every LAN machine from one
+  herdr.
 - **MVP 2 — Phone, anywhere:** E3 → E4 → E5. Install the PWA, see every agent
   grouped blocked-first, watch a terminal, answer a prompt, from the couch or
   from a café over Tailscale.
@@ -156,19 +158,19 @@ Key upstream facts every plan builds on (verified on `master` @ 0.8.2):
 
 ## Epic status
 
-Owned by `implement-roadmap`. Legend: ✅ done · 🔨 in progress · ⬜ not started · ⛔ blocked.
+Owned by `implement-roadmap`. Legend: ✅ done · 🔨 in progress · ⬜ not started · ⛔ blocked · ♻️ superseded.
 
 | Epic | Title | Depends on | Status | Plan |
 | --- | --- | --- | --- | --- |
 | E0 | Fork foundations, CI, fleet lab | — | ✅ | `docs/fork/plans/e0-fork-foundations.md` |
 | E1 | Fleet core (multi-host runtime model) | E0 | ✅ | `docs/fork/plans/e1-fleet-core.md` |
-| E2 | Fleet TUI (one console, every machine) | E1 | ✅ | `docs/fork/plans/e2-fleet-tui.md` |
+| E2 | Fleet TUI (one console, every machine) | E1 | ♻️ | `docs/fork/plans/e2-fleet-tui.md` — superseded by upstream #3670 (ADR 0002) |
 | E3 | Fleet gateway (HTTP + WebSocket) | E1 | 🔨 | `docs/fork/plans/e3-fleet-gateway.md` |
 | E4 | Phone app (installable PWA) | E3 | ⬜ | — |
 | E5 | Off-LAN access via Tailscale | E3 | ⬜ | — |
 | E6 | Push notifications to the phone | E4, E5 | ⬜ | — |
-| E7 | Control from phone and console (approvals, prompts, start) | E2, E4 | ⬜ | — |
-| E8 | Fork release and install pipeline | E2, E4 | ⬜ | — |
+| E7 | Control from phone and console (approvals, prompts, start) | E3, E4 | ⬜ | — |
+| E8 | Fork release and install pipeline | E3, E4 | ⬜ | — |
 
 ---
 
@@ -299,7 +301,9 @@ connector calls directly** vs spawning `herdr --remote`-style subprocesses per
 host; (b) id form — **`host/w1:p1`** vs `w1:p1@host`; (c) where `[fleet]`
 lives — **main `config.toml`** vs a separate `fleet.toml`.
 **Constraint downstream epics must honor:** no server or wire-protocol change;
-`FleetState` stays free of ratatui, sockets, and async. Learned in E1: the
+`FleetState` stays free of ratatui, sockets, and async. The gateway may source
+hosts from upstream's saved machine profiles (`src/remote/saved.rs`, added by
+upstream #3670) in addition to `[[fleet.hosts]]` — E3 decides. Learned in E1: the
 snapshot's `agents[]` lists only detected or reported agents (a plain shell
 pane is not an agent); `fleet_change_seq` is per `FleetState` instance, so
 recency only exists inside a long-lived state (a one-shot report assigns it in
@@ -312,50 +316,19 @@ open blocks until that ssh child exits — release the stream first.
 
 ### E2 — Fleet TUI (one console, every machine)
 
-**Goal:** `herdr fleet` on the console machine shows every host's workspaces and
-agents in the sidebar with live status, and lets you pick any host and work in
-it at full fidelity.
-**Why:** this is MVP 1 — "see all the sessions at once" from one computer.
-**Deliverables:**
-
-- Launch: `herdr fleet [--session <name>]` (and `herdr --fleet` alias). Reuses
-  `run_client_with_launch` / the client-owned shell; the difference is N
-  streams behind a `FleetConnector` instead of one socket.
-- Sidebar: a host group per configured host (`▸ workbox · 2 blocked · 3
-  working`), then that host's workspaces and agents using the existing agent
-  status glyphs and ordering; unreachable hosts shown dimmed with the reason;
-  the local host first. Click a host header or use the host picker
-  (`prefix+shift+f` default, configurable under `[fleet.keys]`) to switch the
-  **active host**.
-- Pane area renders the active host only — its focused tab and panes exactly as
-  today. Switching hosts swaps which stream's pane surfaces are installed.
-  Mixed-host layouts (panes from two hosts in one tab) are **out of scope**.
-- Routing: pane input, resize, focus, scroll, endpoint commands go to the
-  active host; selecting an agent on another host switches the active host,
-  then focuses it there.
-- Notifications from any host surface with the host name prefixed
-  (`[workbox] reviewer needs input`), including sound per existing config.
-- Local keybindings apply to every host (same default as `--remote`);
-  `--remote-keybindings server` semantics are not offered in fleet mode v1.
-- Failure UX: a host dropping shows "reconnecting…" in its group and keeps the
-  rest usable; if the *active* host drops, the pane area shows a reconnect
-  notice, not an exit.
-- Docs: `docs/fork/fleet.md` (launch, sidebar, switching, routing,
-  notifications, failure UX, limits, lab walkthrough).
-- Tests: shell-state unit tests for host grouping/switching/routing without
-  PTYs; a `tests/` integration run against the fleet lab asserting the
-  snapshot-driven sidebar lists both hosts' agents and that input reaches the
-  right server, driven through a real PTY (`tests/support/fleet_tui.rs`, and
-  `scripts/fork/tui-drive.py` for manual runs).
+**Superseded** (2026-09-06, [ADR 0002](./decisions/0002-adopt-upstream-multi-machine-client.md)).
+The console is upstream's: [herdrdev/herdr#3670](https://github.com/herdrdev/herdr/pull/3670)
+added saved SSH machines (`herdr machine add|list|…`, `src/remote/saved.rs`), a
+machine sidebar listing every machine's workspaces and agents, background
+connects, health probes and reconnects — the E2 feature set. The fork's own
+console (`herdr fleet` over the E1 connector, host groups, the picker,
+`[fleet.keys]`, `docs/fork/fleet.md`) shipped in fork PRs #22–#31 and was
+reverted so upstream syncs stay cheap; its plan,
+`docs/fork/plans/e2-fleet-tui.md`, keeps the history under a superseded
+banner. See upstream's `herdr machine` docs for the console. E1's headless
+core (`src/fleet/`, `herdr fleet status`) is unaffected and feeds E3.
 
 **Depends on:** E1.
-**Open decisions (default in bold):** (a) host switch UX — **sidebar host
-groups + a picker overlay reusing the existing overlay pattern** vs tabs-per-host;
-(b) whether inactive hosts' focused-tab surfaces are prefetched — **no**
-(subscribe only on switch; accept a brief redraw).
-**Performance constraint:** sidebar work is × hosts × agents; keep it
-O(visible rows), no per-frame allocation for inactive hosts, and profile 1 vs 5
-hosts × 15 agents before merging (`AGENTS.md` → multiplicative paths).
 
 ---
 
@@ -514,10 +487,11 @@ workspaces on any host.
   `agent.rename`, `pane.close`, `workspace.create`.
 - PWA: quick actions on a blocked agent (`y`, `n`, Enter, Esc, "approve" for
   known approval prompts, free-text prompt), confirm dialogs for close/stop.
-- Fleet TUI: prompt/send-keys to an agent on another host from the picker
-  without switching, plus "new workspace on host…".
+- Console: whatever upstream's multi-machine client offers for acting on an
+  agent on another machine — the fork adds no console half of its own
+  (ADR 0002).
 
-**Depends on:** E2, E4.
+**Depends on:** E3, E4.
 **Open decisions (default in bold):** which destructive actions the phone may
 do — **close pane / stop agent with confirm; never `server.stop`**.
 
@@ -539,7 +513,7 @@ gateway host; keep LAN servers on stock or fork interchangeably.
   and for a headless `herdr server`, and `docs/fork/install.md` covering
   "console machine", "gateway host", and "LAN server (stock or fork)".
 
-**Depends on:** E2, E4.
+**Depends on:** E3, E4.
 **Open decisions (default in bold):** **fork update channel** vs manual install
 only.
 

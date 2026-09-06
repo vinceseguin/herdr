@@ -1,5 +1,16 @@
 # Epic E2 — Fleet TUI (one console, every machine)
 
+> **Superseded by upstream #3670 on 2026-09-06 — code reverted in fork PR #33
+> (`chore: retire the fork fleet tui superseded by upstream multi-machine
+> client`); see [ADR 0002](../decisions/0002-adopt-upstream-multi-machine-client.md).**
+> The rest of this file is the plan and PR log as they stood when the epic was
+> marked done (fork PRs #22–#32). Only PR 2's connector work (#23) remains in
+> the tree; everything under `src/client/**`, `src/fleet/sidebar.rs`,
+> `[fleet.keys]`, `tests/fork_fleet_tui.rs`, `tests/support/fleet_tui.rs`,
+> `scripts/fork/tui-drive.py`, `just bench-fleet-scale` and
+> `docs/fork/fleet.md` is gone. Nothing below is a current specification.
+
+
 ## Context
 
 **Goal (roadmap):** `herdr fleet` on the console machine shows every host's

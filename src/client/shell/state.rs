@@ -93,11 +93,6 @@ pub(crate) struct ClientShellConfig {
     pub(super) palette: Palette,
     pub(super) keybinds: LiveKeybindConfig,
     pub(super) local_keys: crate::config::KeysConfig,
-    /// The local `[fleet.keys]` (fork), kept for the same reason as
-    /// `local_keys`: the client recompiles its keymap from these when a
-    /// server publishes its custom commands, and a fleet binding must
-    /// survive that.
-    pub(super) local_fleet_keys: crate::config::FleetKeysConfig,
     pub(super) keybinding_source: ClientShellKeybindingSource,
     pub(super) prompt_new_tab_name: bool,
     pub(super) prompt_new_workspace_name: bool,
@@ -149,10 +144,6 @@ pub(super) struct ShellHitMap {
     pub(super) agent_scroll_metrics: Option<crate::pane::ScrollMetrics>,
     pub(super) agent_max_scroll: usize,
     pub(super) agent_sort_toggle: Rect,
-    /// Host-qualified fleet rows (fork, E2 PR 5): every header, and every
-    /// workspace/agent row of a host that is *not* active. The two lists above
-    /// carry bare server-side ids and so only ever hold the active host's rows.
-    pub(super) fleet_rows: Vec<(Rect, FleetSidebarHit)>,
     pub(super) sidebar_divider: Rect,
     pub(super) sidebar_section_divider: Rect,
     pub(super) sidebar_toggle: Rect,
@@ -174,10 +165,6 @@ pub(super) struct ShellHitMap {
     pub(super) navigator_popup: Rect,
     pub(super) navigator_search: Rect,
     pub(super) navigator_rows: Vec<(Rect, usize)>,
-    /// Host picker rows (fork, E2 PR 6), by index into the overlay's own
-    /// `rows`. Never a host id: the row a click lands on is resolved against
-    /// the overlay that drew it, and that overlay is closed by the switch.
-    pub(super) host_picker_rows: Vec<(Rect, usize)>,
     pub(super) worktree_search: Rect,
     pub(super) worktree_rows: Vec<(Rect, usize)>,
     pub(super) help_popup: Rect,
@@ -300,9 +287,6 @@ pub(crate) enum ClientShellAction {
     OpenSafeWebUrl(String),
     ReplayMouse(Vec<crossterm::event::MouseEvent>),
     Keybind(crate::input::KeybindAction),
-    /// Something only the client loop can do about the fleet (fork, E2 PR 5):
-    /// the connector, the link and the fleet state must change together.
-    Fleet(super::fleet::FleetShellAction),
 }
 
 #[derive(Default)]
@@ -340,7 +324,6 @@ pub(super) enum ClientShellOverlayKind {
     ContextMenu,
     GlobalMenu,
     Settings,
-    HostPicker,
 }
 
 #[derive(Debug)]
@@ -408,19 +391,6 @@ pub(super) struct ClientNavigatorOverlay {
     pub(super) scroll: usize,
     pub(super) filter: Option<ClientNavigatorFilter>,
     pub(super) expanded_workspaces: HashSet<String>,
-}
-
-/// The Fleet console's host picker (fork, E2 PR 6).
-///
-/// Rows are a snapshot of `FleetSidebarModel::picker` taken when the overlay
-/// opens and refreshed whenever the console installs a new model, so a picker
-/// that is open while a host drops redraws with that host's new state. The
-/// behaviour lives in `fleet_overlay.rs`.
-#[derive(Debug)]
-pub(super) struct ClientHostPickerOverlay {
-    pub(super) rows: Vec<crate::fleet::sidebar::HostPickerRow>,
-    pub(super) selected: usize,
-    pub(super) scroll: usize,
 }
 
 #[derive(Debug)]
@@ -639,7 +609,6 @@ pub(super) enum ClientShellOverlay {
     ContextMenu(ClientContextMenuOverlay),
     GlobalMenu(ClientGlobalMenuOverlay),
     Settings(ClientSettingsOverlay),
-    HostPicker(ClientHostPickerOverlay),
 }
 
 impl ClientShellOverlay {
@@ -658,7 +627,6 @@ impl ClientShellOverlay {
             Self::ContextMenu(_) => ClientShellOverlayKind::ContextMenu,
             Self::GlobalMenu(_) => ClientShellOverlayKind::GlobalMenu,
             Self::Settings(_) => ClientShellOverlayKind::Settings,
-            Self::HostPicker(_) => ClientShellOverlayKind::HostPicker,
         }
     }
 }
@@ -776,21 +744,11 @@ pub(super) struct ClientPendingNotification {
     pub(super) event: SemanticNotification,
     pub(super) deadline: std::time::Instant,
     pub(super) validate_state: bool,
-    /// The Fleet host that sent this (fork, E2 PR 7); `None` for the
-    /// single-host client, which has exactly one server.
-    ///
-    /// `SemanticNotification` is a frozen wire type, so the host travels
-    /// beside it: the ids inside it are that host's, and validating or
-    /// focusing them against another machine's projection is the mis-route
-    /// this field exists to prevent.
-    pub(super) host: Option<crate::fleet::hosts::HostId>,
 }
 
 pub(super) struct ClientVisibleNotification {
     pub(super) event: SemanticNotification,
     pub(super) deadline: std::time::Instant,
-    /// The Fleet host that sent this; see [`ClientPendingNotification::host`].
-    pub(super) host: Option<crate::fleet::hosts::HostId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -978,9 +936,6 @@ pub(crate) struct ClientShellState {
     pub(super) config_diagnostic: Option<String>,
     pub(super) endpoint_error: Option<String>,
     pub(super) dismissed_product_announcement: Option<(String, String)>,
-    /// Every other host of a Fleet console (fork, E2 PR 5); `None` for the
-    /// single-host client. The active host stays in `snapshot`/`pane_surface`.
-    pub(super) fleet: Option<super::fleet::FleetShellState>,
 }
 
 pub(super) fn product_announcement_state(
@@ -1120,7 +1075,6 @@ impl ClientShellState {
             local_config_diagnostic,
             endpoint_error: None,
             dismissed_product_announcement: None,
-            fleet: None,
         }
     }
 
@@ -1197,11 +1151,6 @@ impl ClientShellState {
                 .position(|entry| snapshot.workspaces[entry.index].workspace_id == workspace_id)
         });
         if let Some(target) = target {
-            // Fork (E2 PR 8): in a Fleet console the spaces list is host
-            // headers plus every expanded group's rows, and `target` counts
-            // only the active host's. Scrolling by the raw index reveals the
-            // wrong row — one per header and per row of the hosts above it.
-            let target = target.saturating_add(self.fleet_active_spaces_offset());
             self.workspace_scroll = target.min(self.hits.workspace_max_scroll);
         }
     }
@@ -1761,8 +1710,6 @@ impl ClientShellState {
                     | ClientShellOverlay::WorktreeRemove(_)
                     | ClientShellOverlay::ContextMenu(_)
                     | ClientShellOverlay::GlobalMenu(_)
-                    // The picker's keys are j/k and 1-9, like the navigator's.
-                    | ClientShellOverlay::HostPicker(_)
             );
         }
         matches!(
