@@ -1695,11 +1695,28 @@ mod console_tests {
         let state = FleetState::new(specs);
         let (mut link, console) =
             console_link(state, connector, ConsoleStderr::passthrough()).expect("console opens");
+        // The hello reaching the *fake* is not the connector being able to
+        // write: the supervisor registers the stream only after the welcome
+        // comes back, and a write before that is dropped by design
+        // (`FleetLink::send`). Probe with a command that reports it — a focus
+        // is harmless and is not a pane input — so a loaded machine cannot
+        // turn this into a flake.
+        let connector = std::rc::Rc::clone(
+            &link
+                .fleet
+                .as_ref()
+                .expect("a console carries fleet state")
+                .connector,
+        );
+        let alpha_id = HostId::new("alpha").expect("host id");
         assert!(
             crate::fleet::connector::test_support::wait_for(Duration::from_secs(10), || {
                 !hello_geometry(&alpha.received()).is_empty()
+                    && connector
+                        .send(&alpha_id, crate::fleet::connector::HostCommand::Focus(true))
+                        .is_ok()
             }),
-            "alpha handshook"
+            "alpha handshook and the connector can write to it"
         );
 
         link.link.write(&pane_input("w1:p1")).expect("write");
