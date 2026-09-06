@@ -667,7 +667,7 @@ exactly these E1 contracts (verified in the code):
 | --- | --- | --- | --- | --- |
 | 1 | chore: add gateway cargo feature with axum, qrcode and token dependencies | A · Foundations | — | ✅ |
 | 2 | feat(gateway): gateway config section, token store, bind and origin policy | A · Foundations | 1 | ✅ |
-| 3 | feat(gateway): passive async fleet runtime folding connector events into shared state | A · Foundations | 1 | ⬜ |
+| 3 | feat(gateway): passive async fleet runtime folding connector events into shared state | A · Foundations | 1 | ✅ |
 | 4 | feat(gateway): herdr gateway serves health, fleet report and embedded assets over http | B · HTTP | 2, 3 | ⬜ |
 | 5 | feat(gateway): websocket fleet event stream | C · Streams | 4 | ⬜ |
 | 6 | feat(gateway): websocket terminal observe stream over per-host transports | C · Streams | 4 | ⬜ |
@@ -1452,7 +1452,83 @@ pane shows `40 120` (the E1 caveat reproduced, then fixed).
   for a pre-#3670 server is documented in `fleet-core.md`, not worked
   around.
 
+**Landed** (merged; gate `EXIT=0` for both `ci` and `ci-no-default`)
+
+- **The shapes are as planned, with three additions PRs 4/5/6/9 must know:**
+  - `ChangeStream` is **not** a newtype over the broadcast receiver. It carries
+    the runtime's stop latch too (`{ changes: broadcast::Receiver<Arc<str>>,
+    stop: watch::Receiver<bool>, stopped: bool }`), because "the stream ends
+    when the last sender drops" is false in the gateway: the router holds a
+    `FleetHandle` — and with it a broadcast sender — for the life of the
+    process, so a `/api/events` task would wait forever on a stopped fleet.
+    `FleetRuntime::shutdown` latches the watch with `send_replace` (plain
+    `send` leaves the value untouched when it sees no receivers) *before*
+    dropping its own handle. `next()` drains what is already queued, then
+    returns `None` for good.
+  - `FleetHandle::subscribe()` (no report) is **private**. PR 5 must call
+    `subscribe_with_report`: a subscriber with no starting report cannot tell
+    a delta it missed from one that never happened.
+  - `FleetRuntime::start` **must be called from inside a tokio runtime**
+    (it spawns the fold task). PR 4 builds it inside `rt.block_on`, not before.
+- **Gap-freeness is enforced by the lock, not by ordering luck.** The fold task
+  applies *and publishes* under the same `state` lock that
+  `subscribe_with_report` holds while it subscribes and snapshots, so a change
+  is in the report **xor** on the stream — never both, never neither. A
+  200-iteration concurrent test pins it. `broadcast::Sender::send` never
+  blocks, so this holds no lock across an `.await`.
+- **`for_daemon` needs a feature-scoped allow.** Its only production caller is
+  the gateway, which `--no-default-features` compiles out, so it carries
+  `#[cfg_attr(not(feature = "gateway"), allow(dead_code))]` — scoped to that
+  build rather than unconditional, so a default build that stops calling it
+  still fails the lint. `src/gateway/mod.rs`'s `mod fleet;` carries the
+  planned `#[allow(dead_code)]` naming PR 4; **PR 4 removes it.**
+- **The ssh switch reaches the bridged children, not the discovery probes.**
+  `SshTransport::ssh_session()` builds `RemoteSsh::new(...)`, which is
+  hard-coded interactive, so `discover_remote_herdr`'s `uname -s` / binary
+  probe still runs without `BatchMode` and without a timeout even under
+  `for_daemon`. Nothing is painted on a daemon's terminal (those probes pipe
+  both stdout and stderr), and a hung probe blocks only that host's supervisor
+  thread — which this plan's cross-cutting constraints already accept. Closing
+  it needs a noninteractive `RemoteSsh` constructor in `src/remote/attach.rs`,
+  and *Sequencing hazards* requires `src/remote/**` to have an empty diff for
+  the whole epic, so it is **documented** in `for_daemon` and in
+  `docs/fork/fleet-core.md`, not worked around.
+- **`transport_for` grew a `#[cfg(test)]` trait method**,
+  `HostTransport::ssh_noninteractive_for_test() -> Option<bool>`, so the wiring
+  test can assert the daemon flag reached the transport without an `Any`
+  downcast in production code. PR 6's `new_scoped`/`transport_for_scoped` must
+  thread `ssh_noninteractive` the same way.
+- **A console's hello is `surface_active: true` for *every* host**, not only
+  the active one: `HandshakeParams::for_client` builds one hello the connector
+  reuses. A console's inactive hosts are therefore protected by
+  `INACTIVE_SURFACE`, not by the flag. Unchanged from pre-PR behaviour (every
+  hello sent `true`), and `for_client` has no production caller since the E2
+  TUI was retired — but it is the trap a future console author would hit.
+- **Residual accepted:** if the fold task panics, deltas stop silently while
+  `report()` keeps working. Guarding it would mean `catch_unwind` around the
+  fold; PR 4's own supervision is the better place to notice a dead runtime.
+- **Validation note for later PRs:** `scripts/fork/fleet-lab.sh` defaults to
+  the shared root `/tmp/herdr-fleet-lab`. Two agents validating at once collide
+  there — one agent's `down` deletes the root out from under the other's
+  still-running servers. Set `HERDR_FLEET_LAB_ROOT` per task when a wave runs
+  two PRs with live validation.
+- **The lab pane is not a shell.** `fleet-lab.sh`'s pane `execs` a sleep loop,
+  so the plan's `pane run … 'stty size'` on `$HERDR_FLEET_LAB_PANE_N` is echoed
+  and never executed, and `[server] headless_cols/rows` + `server
+  reload-config` does **not** resize an existing pane (only panes created
+  afterwards). Split a fresh pane (`pane split <pane> --direction down`) and
+  measure that one; the A/B that matters is whether the number *changes* when a
+  fleet consumer attaches.
+
 ### PR 4 — feat(gateway): herdr gateway serves health, fleet report and embedded assets over http · deps: 2, 3
+
+> **From PR 3 (landed):** `FleetRuntime::start` spawns a tokio task, so build
+> it **inside** `rt.block_on`, never before. Delete `src/gateway/mod.rs`'s
+> `#[allow(dead_code)]` on `mod fleet;` in this PR (PR 3 named it for you), and
+> `GATEWAY_STAGING_NOTE` with its test, as PR 1 recorded. `FleetRuntime::start`
+> returns `Err(Vec<String>)` for `[fleet]` diagnostics — print them and exit 1.
+> Keep the `FleetHandle` in the router state; it is `Clone` and every method on
+> it is sync and bounded. Call `FleetRuntime::shutdown().await` on SIGTERM.
 
 **Goal:** `herdr gateway [--bind ADDR] [--config PATH]` runs: loads config,
 enforces the bind policy, creates the tokens, starts the fleet runtime and
@@ -1637,6 +1713,16 @@ modes, the `stty size` line, the exit lines. Paste no token.
 
 ### PR 5 — feat(gateway): websocket fleet event stream · deps: 4
 
+> **From PR 3 (landed):** use `FleetHandle::subscribe_with_report()` — the
+> report-less `subscribe()` is private, because a subscriber with no starting
+> report cannot tell a delta it missed from one that never happened. Drive the
+> socket with `ChangeStream::next() -> Option<ChangeItem>`: `Change(Arc<str>)`
+> is the `FleetChange` JSON verbatim (newline-free, wrap nothing around it),
+> `Lagged` means the subscriber overflowed the 256-deep channel and should be
+> sent a `Resync` rather than a delta, and `None` means the runtime stopped —
+> close the socket, do not treat it as an error. `next()` is cancel-safe, so it
+> may sit in a `select!` arm.
+
 **Goal:** `GET /api/events` upgrades to a WebSocket that sends `hello`, the
 full fleet report, then every `FleetChange` as it happens — the live feed
 E4's Fleet screen and E6's push trigger consume — plus the python WebSocket
@@ -1735,6 +1821,17 @@ Evidence: the message lines (with `reason` text), the two exit codes.
   and epic; add flags, never change the output line format.
 
 ### PR 6 — feat(gateway): websocket terminal observe stream over per-host transports · deps: 4
+
+> **From PR 3 (landed):** `FleetHandle::host_connection(&HostId)` and
+> `host_spec(&HostId)` are the fail-fast pair — `None` means the host is not
+> configured at all (a `terminal.error`, never a 5xx). Reuse
+> `FleetConnectorOptions::for_daemon(config)` so terminal bridges are
+> noninteractive too. When threading the new `new_scoped` /
+> `transport_for_scoped`, carry `options.ssh_noninteractive` exactly as
+> `transport_for` does, and extend the `#[cfg(test)]`
+> `HostTransport::ssh_noninteractive_for_test()` wiring assertion to the scoped
+> constructor — a dropped argument there hands a gateway an interactive ssh
+> child with no other symptom.
 
 **Goal:** `GET /api/terminal/{host}/{pane}` streams a pane's rendered ANSI
 frames to the browser, read-only: the browser sends `terminal.open` with
@@ -2115,6 +2212,14 @@ rotate lines, the `ls -l` modes. Never paste the URL or the cookie.
   `listen`, `devices`, `pairings_pending`).
 
 ### PR 9 — feat(fleet): opt-in hosts from saved machine profiles · deps: 3
+
+> **From PR 3 (landed):** the call to swap is in `FleetRuntime::start`
+> (`src/gateway/fleet.rs`), which today reads
+> `resolve_hosts(&config.fleet)` and passes the same `Vec<HostSpec>` to both
+> `FleetState::new` and `FleetConnector::start` through the private
+> `FleetRuntime::over(specs, connector)`. Keep those two lists identical — a
+> spec in one and not the other makes an event address a host the state does
+> not have. `src/fleet/oneshot.rs`'s `FleetSession::start` needs the same swap.
 
 **Goal:** decision (r): with `[fleet] include_machines = true`, every
 enabled machine saved by `herdr machine add` (upstream #3670's
