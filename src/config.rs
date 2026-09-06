@@ -53,7 +53,7 @@ pub(crate) use self::{
 
 pub(crate) use self::{
     keybinds::CommandKeybindType,
-    model::{validate_fleet_host_name, KeysConfig},
+    model::{validate_fleet_host_name, validate_fleet_host_target, KeysConfig},
 };
 
 /// `[gateway]` itself is unconditional (an upstream-shaped build still parses

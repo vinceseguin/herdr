@@ -34,7 +34,8 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::fleet::connector::{FleetConnector, FleetConnectorOptions, FleetEvent};
-use crate::fleet::hosts::{resolve_hosts, HostId, HostSpec};
+use crate::fleet::hosts::{HostId, HostSpec};
+use crate::fleet::hosts_source::hosts_for_config;
 use crate::fleet::report::FleetStatusReport;
 use crate::fleet::state::{FleetChange, FleetState, HostConnection, HostEvent};
 
@@ -108,7 +109,8 @@ pub enum ChangeItem {
 }
 
 impl FleetRuntime {
-    /// Resolve `[fleet]`, open every enabled host, and start folding.
+    /// Resolve `[fleet]` (and the saved machines, when opted in), open every
+    /// enabled host, and start folding.
     ///
     /// `Err` carries the `[fleet]` diagnostics: an invalid section is an
     /// operator error the caller reports and exits on, never a host failure.
@@ -116,7 +118,7 @@ impl FleetRuntime {
     ///
     /// Must be called from inside a tokio runtime: it spawns the fold task.
     pub fn start(config: &Config) -> Result<Self, Vec<String>> {
-        let specs = resolve_hosts(&config.fleet)?;
+        let specs = hosts_for_config(config)?;
         Ok(Self::over(
             specs.clone(),
             FleetConnector::start(specs, FleetConnectorOptions::for_daemon(config)),
@@ -755,7 +757,7 @@ mod tests {
     /// An invalid `[fleet]` section is an operator error, not a host failure —
     /// and it is refused before a single supervisor thread is spawned.
     ///
-    /// Pure: `start` returns on the `resolve_hosts` error before it reaches the
+    /// Pure: `start` returns on the `hosts_for_config` error before it reaches the
     /// connector, so this covers every platform, not only the socket ones.
     #[tokio::test]
     async fn an_invalid_fleet_section_is_a_config_error() {

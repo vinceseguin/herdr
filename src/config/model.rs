@@ -985,6 +985,9 @@ impl Default for RemoteConfig {
 pub struct FleetConfig {
     /// Include this machine's default session as host "local". Default: true.
     pub include_local: bool,
+    /// Also aggregate every machine saved by `herdr machine add` as an ssh
+    /// host, next to `[[fleet.hosts]]`. Default: false.
+    pub include_machines: bool,
     /// Additional hosts; see `[[fleet.hosts]]` in `herdr --default-config`.
     pub hosts: Vec<FleetHostConfig>,
 }
@@ -993,6 +996,7 @@ impl Default for FleetConfig {
     fn default() -> Self {
         Self {
             include_local: true,
+            include_machines: false,
             hosts: Vec::new(),
         }
     }
