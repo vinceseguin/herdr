@@ -379,7 +379,7 @@ the binary, commands and paths stay `herdr`.
 | 5 | feat(fleet): sidebar host groups with live status and click-to-switch | C · Fleet UX | 4 | ✅ |
 | 6 | feat(fleet): host picker overlay and fleet.keys host_picker binding | C · Fleet UX | 5 | ✅ |
 | 7 | feat(fleet): host-aware notifications and cross-host notification targets | C · Fleet UX | 5 | ⬜ |
-| 8 | feat(fleet): reconnect notice for the active host and resize on reconnect | C · Fleet UX | 5 | ✅ |
+| 8 | feat(fleet): reconnect notice for the active host and resize on reconnect | C · Fleet UX | 5 | ⬜ |
 | 9 | docs: fleet console guide, adr e2 review, roadmap drift | D · Docs | 6, 7, 8 | ⬜ |
 
 **Wave preview (2-agent cap):** W1 `[1, 2]` → W2 `[3]` → W3 `[4]` → W4 `[5]`
@@ -1965,132 +1965,11 @@ If `ssh-lab.sh up` exits 3 (`sshd not found`), run the same with two local
 hosts and `session stop`/restart, and record the degradation in the PR body.
 `just bench-fleet-scale` unchanged within noise.
 
-**As built (PR 8, merged).** Deviations from the shapes above, all deliberate:
-
-- **One notice, one gate.** `pane_area_notice() -> Option<&str>` returns the
-  precomputed line rather than a `FleetNotice` value: it is read on the compose
-  path, so it is a borrow of the `String` built at
-  `fleet_sidebar_update`/`set_fleet_switching` time. `input_allowed()` is
-  *defined* as `pane_notice.is_none()` — what the pane area is showing **is**
-  whether there is a pane to type into, so the two can never disagree.
-- **The notice is derived in the shell, not passed in by the loop**, from the
-  row model the shell already holds (`model.group(active)`'s `state`, `reason`
-  and rows). That keeps `fleet_sidebar_update`'s three-argument signature (PR 6
-  builds consoles with it) and keeps `src/fleet/sidebar.rs` — which PR 6 also
-  edits — untouched by this PR beyond one line. The cost is **no `retry in N s`
-  segment**: `Unavailable::retry_in` is not in the pure row model, and a
-  countdown that is only recomputed when a change arrives would be a stale
-  number on screen. Text is `lab-2 · reconnecting · host closed the
-  connection`, `lab-2 · reconnecting (attempt 3)`, `lab-2 · connecting`,
-  `lab-2 · unavailable · <reason>`, `lab-2 · incompatible · <reason>`, and
-  `switching to lab-2…` **only while that host is `Connected`** — a switch to a
-  host that is down says why it is down instead, which is the "switching to…
-  forever" item PR 5 deferred.
-- **"Connected before" is read from the model's rows**, not from a new flag:
-  a host with workspace or agent rows has had a projection, so a retry is a
-  *re*connect. The supervisor numbers its first attempt 1, so
-  `connection_summary` in `src/fleet/sidebar.rs` now reads `attempt <= 1` as
-  `connecting` (the one line this PR changes there, plus its picker test).
-- **`compose` takes the placeholder path whenever a notice exists**, even with
-  a snapshot/surface pair in hand — the stale frame is exactly what must not
-  stay on screen. The real snapshot is still preferred for the chrome, so the
-  sidebar keeps drawing the host's own workspaces while the pane area explains
-  itself, and `hits.panes` is empty, so the pane area is unclickable.
-- **Two input guards, not one.** `handle_raw_events` is the funnel for every
-  real input path (`handle_input_bytes`, `handle_pixel_mouse`,
-  `replay_mouse_events`, Windows `handle_client_events`, text, paste, mouse),
-  and `dispatch_queued_copy_input` is the one path that re-enters `handle_key`
-  without it. `drop_pane_bound_input` drops `ClientShellPaneInput` and
-  `ClientShellPopupInput` from `outcome.requests` **and** clears the two pieces
-  of shell state that are a queue by another name: `copy_input_queue` (keys
-  parked behind an in-flight copy read, replayed when it settles — which can be
-  after the host is back) and `pane_mouse_gesture` (whose button-up is
-  synthesized on the next focus loss, to whichever host is connected by then).
-  Input leases are deliberately left alone: they can only produce a *release*
-  for a press the host may have seen, which is harmless where a replayed
-  keystroke is not.
-- **The reconnect hook is `apply_changes`, not a new loop arm.** Every
-  `Translated` arm that carries changes already calls it, so
-  `active_host_connected(&fleet.active, &changes)` is the whole detection, and
-  it is a pure function so the "another host connected" mis-fire is pinned by a
-  test. On the active host's `Connected` it calls
-  `adopt_active_host_geometry`: `set_active_geometry(active_console_geometry
-  (state))` — the window that closes is **not** a terminal resize (the
-  connector adopts and re-checks that itself) but a pane-area change that went
-  out as a `ClientShellResize` through the link while the host was down —
-  and `invalidate_pane_surface()`, because a fresh connection's
-  `RenderStream` always sends a full `PaneSurface`, never a patch.
-  `switch_host` now shares `active_console_geometry`.
-- **PR 1's deferred write-timeout question: assessed, not changed.**
-  `set_active`/`set_active_geometry` write to a `LocalStream` under the
-  active-host and link locks, so a peer that stopped reading with a full socket
-  buffer could stall the loop. It is not cheap to bound: `interprocess`'
-  `Stream` is a named pipe on Windows, so `SO_SNDTIMEO` would be a unix-only
-  half-fix inside `src/fleet/connector.rs` (a PR 1 file), and a timed-out write
-  leaves the frame half-sent, so it must drop the connection anyway. It is also
-  **not a new hazard**: upstream's single-host client blocks on the same kind
-  of write from the same loop (`write_to_server` → `protocol::write_message`),
-  and the messages this path writes are tens of bytes. Owner: E3/E7, if a
-  wedged host is ever observed.
-- **The other two items PR 5 deferred.** `reveal_workspace` adds
-  `fleet_active_spaces_offset()` — `workspace_scroll` is an *item* index into
-  the list `render_fleet_spaces` builds (one item per header whatever its
-  drawn height, plus each expanded group's rows), so the offset mirrors that
-  exactly and is 0 for the single-host client. `workspace_drop_target_at`
-  refuses a point on **another** host's row and will not append the trailing
-  slot on one; the *active* host's own header stays a slot, because it is the
-  line above its first workspace.
-- **25-column header truncation** is a sidebar fact, not a bug to fix in the
-  label: `put_text` cuts left-to-right, so a narrow sidebar keeps `▾ lab-1 ·
-  unav…` and cuts the reason line under it. The pane-area notice is the surface
-  that carries host, state and reason in full, and a test pins both at
-  `sidebar_width = 25`. Note the header says `unavailable` where the notice
-  says `reconnecting`: the header's vocabulary is `HostConnection::state_name`,
-  shared with `herdr fleet status` and the picker.
-- **`FleetSidebarHit::host()`** is new (every variant already carried a host);
-  `tests/support/fleet_tui.rs` gained `FleetConsole::redraw()` (the Rust twin
-  of `tui-drive.py --redraw`: resize away and back, forget the text so far —
-  the only way to assert something is *no longer* shown) and
-  `tests/support/fleet_lab.rs` gained `Lab::spawn_server(session)`, for the
-  case the script cannot express: a server that went away while a client was
-  watching it and has to come back on the same socket.
-
-**Real-server evidence (PR 8).** Two lab hosts, `lab-ssh` reaching lab-1's
-session over `ssh-lab.sh`. Taking the ssh lab down under the console gives
-`lab-ssh · reconnecting · host closed the connection` in the pane area with
-`▾ lab-ssh · unavailable` and its reason in the sidebar, `▾ lab-2 · no agents`
-untouched, and `never-lands-a` typed at the notice reaching neither host (0
-occurrences in either pane, before and after recovery); no
-`/tmp/herdr-remote-*-lab-ssh-*.sock` survives the quit and the ssh transport's
-text appears only as a host *reason*, never as raw stderr on the screen.
-**Degradation recorded:** `ssh-lab.sh down` deletes and `up` recreates the ssh
-lab's `HOME`, and an already-running console's ssh then reports `Could not
-resolve hostname herdr-ssh-lab` for the rest of the run, so the ssh lab cannot
-express the *recovery* half. It was validated with the plan's local variant
-instead (`herdr --session lab-1 server stop`, then restart): the console shows
-`lab-1 · reconnecting · server is shutting down`, `herdr fleet status` reports
-`lab-1 unavailable / lab-2 connected`, the restarted server is picked up within
-5 s, and a forced repaint shows `▾ lab-1 · no agents` with the recovered host's
-prompt in the pane area and no notice. `pane layout` on lab-1 reports
-`94x39` — the console's pane area — both before the drop and after the
-reconnect, never the headless `120x40`, which is the "resize on reconnect"
-guarantee end to end. `just bench-fleet-scale`: compose median at 5 hosts is
-0.99x one host collapsed and 1.01x expanded (PR 5: 1.04x / 1.02x); rebuild is
-1.85 µs per change at 5 hosts.
-
 **Downstream**
 
-- `ClientShellState::fleet_input_allowed()` (and `FleetShellState::
-  input_allowed()`) is the gate E7 must respect for cross-host prompts to a
-  down host: fail with a notice, never queue. `drop_pane_bound_input` is where
-  a new kind of deferred pane input must also be cleared.
+- `input_allowed()` is the gate E7 must respect for cross-host prompts to a
+  down host (fail with a notice, never queue).
 - The notice is TUI presentation; E3/E4 read `HostConnection` directly.
-- **PR 9:** `docs/fork/fleet.md` should document what the console does when a
-  host drops — the notice text, that input is discarded rather than queued,
-  that the rest of the console stays usable, and that a reconnect repaints at
-  the current size. The known cosmetic split (header `unavailable` vs notice
-  `reconnecting`) is worth one line. The `retry in N s` segment the plan's
-  sketch showed is **not** implemented; do not document it.
 
 ### PR 9 — docs: fleet console guide, adr e2 review, roadmap drift · deps: 6, 7, 8
 

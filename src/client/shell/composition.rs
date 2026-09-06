@@ -24,19 +24,11 @@ impl ClientShellState {
         self.last_composed_size = Some((cols, rows));
         // A Fleet console keeps drawing its chrome while the active host has
         // no projection or no surface, composing the pane area from an empty
-        // placeholder instead (fork, E2 PR 5). It takes the same path while
-        // that host is switching, reconnecting or unreachable (E2 PR 8): the
-        // last frame it sent describes a machine that is not answering, and
-        // leaving it on screen — clickable, typeable — is the mis-read this
-        // notice exists to prevent. A single-host client has no fleet state
-        // and draws nothing until its server does, as before.
-        let notice = self
-            .fleet
-            .as_ref()
-            .and_then(super::fleet::FleetShellState::pane_area_notice);
+        // placeholder instead (fork, E2 PR 5). A single-host client has no
+        // fleet state and draws nothing until its server does, as before.
         let (snapshot, surface, placeholder) =
             match (self.snapshot.as_deref(), self.pane_surface.as_ref()) {
-                (Some(snapshot), Some(surface)) if notice.is_none() => {
+                (Some(snapshot), Some(surface)) => {
                     if snapshot.revision != surface.projection_revision {
                         return None;
                     }

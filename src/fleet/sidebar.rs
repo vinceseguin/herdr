@@ -368,10 +368,7 @@ fn connection_summary(connection: &HostConnection) -> String {
             "connected".to_string()
         }
         HostConnection::Connected { server_version, .. } => format!("connected {server_version}"),
-        // The supervisor numbers its *first* attempt 1, and `FleetState` starts
-        // a host at 0, so anything past 1 is a retry (fork, E2 PR 8: a first
-        // connection used to read as "reconnecting (attempt 1)").
-        HostConnection::Connecting { attempt } if *attempt <= 1 => "connecting".to_string(),
+        HostConnection::Connecting { attempt: 0 } => "connecting".to_string(),
         // A retry is the interesting case for an operator: it says the host was
         // reachable once and the connector has not given up.
         HostConnection::Connecting { attempt } => format!("reconnecting (attempt {attempt})"),
@@ -1086,7 +1083,7 @@ mod tests {
             rows.iter().map(|row| row.label.clone()).collect::<Vec<_>>(),
             vec![
                 "local  connected 0.8.2-fork  1 blocked · 1 working",
-                "workbox  connecting",
+                "workbox  reconnecting (attempt 1)",
                 "stale  unavailable  connection refused",
                 "old  incompatible  endpoint generation 2",
                 "off  unavailable  host disabled in [fleet]",

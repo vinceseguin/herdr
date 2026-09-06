@@ -139,83 +139,7 @@ pub(super) fn apply_changes(state: &mut ClientState, changes: Vec<FleetChange>) 
     if changes.is_empty() {
         return false;
     }
-    let reconnected = state
-        .fleet
-        .as_ref()
-        .is_some_and(|fleet| active_host_connected(&fleet.active, &changes));
-    if reconnected {
-        adopt_active_host_geometry(state);
-    }
-    // `|`, not `||`: the sidebar must be rebuilt even when the pane area
-    // already knows it has to repaint.
-    rebuild_sidebar(state) | reconnected
-}
-
-/// Whether these changes are *the active host* coming up.
-///
-/// Pure, and deliberately narrow: the caller drops the shell's pane surface on
-/// a `true`, and doing that because some other host connected would blank the
-/// console for a machine it is not even showing.
-fn active_host_connected(active: &HostId, changes: &[FleetChange]) -> bool {
-    changes.iter().any(|change| {
-        matches!(
-            change,
-            FleetChange::HostConnection {
-                host,
-                connection: HostConnection::Connected { .. },
-            } if host == active
-        )
-    })
-}
-
-/// Meet the active host's fresh connection at the size the console has *now*.
-///
-/// Two things have to be true the moment a host comes back, and neither is
-/// true on its own:
-///
-/// * The host must render at the console's current geometry. A *terminal*
-///   resize is already covered: the connector adopts it whether or not the
-///   host is up, hellos with it, and re-checks it under the link lock after
-///   the hello. A pane-area change that is not a terminal resize is not — the
-///   sidebar dragged wider, collapsed, or a snapshot that changed the tab bar
-///   goes out as a `ClientShellResize` through the link, and the link drops
-///   a write to a host that is down. Announcing here is what tells the host
-///   about it: the connector writes a resize only when the size actually
-///   differs from what it announced, so the common case costs nothing.
-/// * The shell must stop showing the frame the host sent *before* it went
-///   away. That frame is the old size and the old boot; blitting it again
-///   would be a console lying about a machine it just lost. Dropping it puts
-///   the pane area on the placeholder until the host draws itself again.
-fn adopt_active_host_geometry(state: &mut ClientState) {
-    let geometry = active_console_geometry(state);
-    if let Some(fleet) = state.fleet.as_ref() {
-        if let Err(error) = fleet.connector.set_active_geometry(geometry) {
-            debug!(host = %fleet.active, %error, "could not resize a fleet host that just connected");
-        }
-    }
-    if let Some(shell) = state.shell.as_mut() {
-        shell.invalidate_pane_surface();
-    }
-}
-
-/// The geometry the console's pane area actually has.
-///
-/// One place, so a switch and a reconnect cannot describe the same terminal
-/// differently.
-fn active_console_geometry(state: &ClientState) -> ActiveGeometry {
-    ActiveGeometry {
-        surface: state
-            .shell
-            .as_ref()
-            .map(|shell| shell.surface_size(state.reported_size.0, state.reported_size.1))
-            .unwrap_or(ClientSurfaceSize {
-                cols: state.reported_size.0.max(1),
-                rows: state.reported_size.1.max(1),
-            }),
-        cell_width_px: state.reported_cell_size.0,
-        cell_height_px: state.reported_cell_size.1,
-        pixel_mouse: state.pixel_geometry_exact,
-    }
+    rebuild_sidebar(state)
 }
 
 /// Rebuild the model from the current fleet state and install it if it differs.
@@ -362,7 +286,19 @@ pub(super) fn switch_host(
     // The connector decides what a host's surface is; tell it the console's
     // current geometry before it activates the new host, so the activation
     // resize is the size the pane area actually has.
-    let geometry = active_console_geometry(state);
+    let geometry = ActiveGeometry {
+        surface: state
+            .shell
+            .as_ref()
+            .map(|shell| shell.surface_size(state.reported_size.0, state.reported_size.1))
+            .unwrap_or(ClientSurfaceSize {
+                cols: state.reported_size.0.max(1),
+                rows: state.reported_size.1.max(1),
+            }),
+        cell_width_px: state.reported_cell_size.0,
+        cell_height_px: state.reported_cell_size.1,
+        pixel_mouse: state.pixel_geometry_exact,
+    };
     let Some(fleet) = state.fleet.as_mut() else {
         return Ok(FleetActionOutcome::default());
     };
@@ -1324,44 +1260,6 @@ mod tests {
     }
 
     #[test]
-    fn only_the_active_hosts_own_connection_drops_the_shells_surface() {
-        let active = host_id("alpha");
-        let connected = |id: &str| FleetChange::HostConnection {
-            host: host_id(id),
-            connection: HostConnection::Connected {
-                server_version: "0.8.2-fork".to_string(),
-                methods: Vec::new(),
-            },
-        };
-
-        assert!(
-            active_host_connected(&active, &[connected("alpha")]),
-            "the machine the console is showing came back: its last frame is stale"
-        );
-        assert!(
-            !active_host_connected(&active, &[connected("beta")]),
-            "another host connecting must not blank the pane area"
-        );
-        assert!(
-            !active_host_connected(
-                &active,
-                &[FleetChange::HostConnection {
-                    host: active.clone(),
-                    connection: HostConnection::Unavailable {
-                        reason: "host closed the connection".to_string(),
-                        retry_in: None,
-                    },
-                }]
-            ),
-            "losing the host is the notice's business, not the surface's"
-        );
-        assert!(
-            !active_host_connected(&active, &[]),
-            "no change, nothing to do"
-        );
-    }
-
-    #[test]
     fn a_host_the_fleet_does_not_know_changes_nothing() {
         let mut state = fleet();
         let active = host_id("alpha");
@@ -1695,28 +1593,11 @@ mod console_tests {
         let state = FleetState::new(specs);
         let (mut link, console) =
             console_link(state, connector, ConsoleStderr::passthrough()).expect("console opens");
-        // The hello reaching the *fake* is not the connector being able to
-        // write: the supervisor registers the stream only after the welcome
-        // comes back, and a write before that is dropped by design
-        // (`FleetLink::send`). Probe with a command that reports it — a focus
-        // is harmless and is not a pane input — so a loaded machine cannot
-        // turn this into a flake.
-        let connector = std::rc::Rc::clone(
-            &link
-                .fleet
-                .as_ref()
-                .expect("a console carries fleet state")
-                .connector,
-        );
-        let alpha_id = HostId::new("alpha").expect("host id");
         assert!(
             crate::fleet::connector::test_support::wait_for(Duration::from_secs(10), || {
                 !hello_geometry(&alpha.received()).is_empty()
-                    && connector
-                        .send(&alpha_id, crate::fleet::connector::HostCommand::Focus(true))
-                        .is_ok()
             }),
-            "alpha handshook and the connector can write to it"
+            "alpha handshook"
         );
 
         link.link.write(&pane_input("w1:p1")).expect("write");

@@ -212,7 +212,6 @@ mod agents_worktrees_notifications;
 mod chrome_context;
 mod copy;
 mod fleet_picker;
-mod fleet_reconnect;
 mod fleet_scale;
 mod fleet_sidebar;
 #[path = "input.rs"]

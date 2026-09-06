@@ -98,36 +98,6 @@ impl Lab {
         output
     }
 
-    /// Start one session's server again, the way `fleet-lab.sh` starts it.
-    ///
-    /// For the case the script cannot express: a server that went away *while
-    /// a client was watching it* and has to come back on the same socket.
-    /// The child is registered with the shared watchdog, so a panicking test
-    /// still leaves no herdr behind.
-    pub fn spawn_server(&self, session: &str) -> std::process::Child {
-        let child = Command::new(env!("CARGO_BIN_EXE_herdr"))
-            .arg("--session")
-            .arg(session)
-            .arg("server")
-            .env("XDG_CONFIG_HOME", self.root.join("xdg"))
-            .env("XDG_RUNTIME_DIR", self.runtime_dir())
-            .env("XDG_STATE_HOME", self.root.join("state"))
-            .env("XDG_DATA_HOME", self.root.join("data"))
-            .env("XDG_CACHE_HOME", self.root.join("cache"))
-            .env_remove("HERDR_SOCKET_PATH")
-            .env_remove("HERDR_CLIENT_SOCKET_PATH")
-            .env_remove("HERDR_ENV")
-            .env_remove("HERDR_SESSION")
-            .env_remove("HERDR_CONFIG_PATH")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("restart a lab server");
-        super::register_spawned_herdr_pid(Some(child.id()));
-        child
-    }
-
     pub fn herdr(&self, session: &str, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_herdr"))
             .arg("--session")

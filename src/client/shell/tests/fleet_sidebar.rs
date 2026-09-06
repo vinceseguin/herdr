@@ -616,9 +616,7 @@ fn a_switch_to_a_host_without_a_surface_still_draws_the_console_and_says_so() {
     // leave every other host one click away.
     let _ = fleet_hit(&state, &FleetSidebarHit::HostHeader(host("alpha")));
 
-    // A host with no projection at all draws from the placeholder. Since
-    // E2 PR 8 the notice names why it will not arrive rather than saying the
-    // switch is still in flight — gamma is not coming.
+    // A host with no projection at all draws from the placeholder.
     state.reset_for_host_switch();
     state.fleet_sidebar_update(
         model_switched_to("gamma"),
@@ -627,15 +625,12 @@ fn a_switch_to_a_host_without_a_surface_still_draws_the_console_and_says_so() {
     );
     let text = screen(&mut state);
     assert!(
-        text.contains("gamma · unavailable · connection refused") && text.contains("▾ alpha"),
+        text.contains("switching to gamma…") && text.contains("▾ alpha"),
         "the chrome draws with no projection at all:\n{text}"
     );
     let _ = fleet_hit(&state, &FleetSidebarHit::HostHeader(host("alpha")));
 
-    // And a switch that lands on a host that *is* up leaves no notice.
-    state.reset_for_host_switch();
-    state.set_snapshot(Box::new(host_snapshot("beta", "boot-beta")));
-    state.fleet_sidebar_update(model_switched_to("beta"), host("beta"), Some(host("beta")));
+    // And once the switch lands, the notice is gone.
     assert!(state.set_fleet_switching(None));
     let text = screen(&mut state);
     assert!(!text.contains("switching to"), "{text}");

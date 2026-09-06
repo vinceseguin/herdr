@@ -490,16 +490,9 @@ impl ClientShellState {
     fn dispatch_queued_copy_input(&mut self, outcome: &mut ClientShellInput) {
         while !self.copy_operation_in_flight {
             let Some(key) = self.copy_input_queue.pop_front() else {
-                break;
+                return;
             };
             self.handle_key(key, outcome);
-        }
-        // Fork (E2 PR 8): the one input path that does not come through
-        // `handle_raw_events`, so it needs the console's drop rule too — keys
-        // held behind a copy operation must not become the way pane input
-        // survives a host going down.
-        if !self.fleet_input_allowed() && self.drop_pane_bound_input(outcome) {
-            outcome.repaint = true;
         }
     }
 

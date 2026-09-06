@@ -102,8 +102,6 @@ pub struct FleetConsole {
     child: Box<dyn Child + Send + Sync>,
     output: Arc<Mutex<Vec<u8>>>,
     pid: Option<u32>,
-    cols: u16,
-    rows: u16,
     detached: bool,
 }
 
@@ -172,38 +170,8 @@ impl FleetConsole {
             child,
             output,
             pid,
-            cols,
-            rows,
             detached: false,
         }
-    }
-
-    /// Force a full repaint and forget everything drawn before it.
-    ///
-    /// A client draws frame *diffs*: a screen that changed one character only
-    /// ever wrote that character, so accumulated output is a history, not a
-    /// screen. Resizing the window and back makes the client redraw
-    /// everything; clearing the buffer in between makes what follows readable
-    /// as a screen — the Rust twin of `tui-drive.py --redraw`, and the only
-    /// way to assert that something is *no longer* shown.
-    pub fn redraw(&mut self) {
-        let Some(master) = self.master.as_ref() else {
-            return;
-        };
-        let size = |rows: u16| PtySize {
-            rows,
-            cols: self.cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-        let _ = master.resize(size(self.rows.saturating_sub(1).max(1)));
-        thread::sleep(Duration::from_millis(250));
-        self.output
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-        let _ = master.resize(size(self.rows));
-        thread::sleep(Duration::from_millis(250));
     }
 
     /// Everything the console has drawn, with the escapes removed.

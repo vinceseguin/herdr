@@ -1187,11 +1187,6 @@ impl ClientShellState {
                 .position(|entry| snapshot.workspaces[entry.index].workspace_id == workspace_id)
         });
         if let Some(target) = target {
-            // Fork (E2 PR 8): in a Fleet console the spaces list is host
-            // headers plus every expanded group's rows, and `target` counts
-            // only the active host's. Scrolling by the raw index reveals the
-            // wrong row — one per header and per row of the hosts above it.
-            let target = target.saturating_add(self.fleet_active_spaces_offset());
             self.workspace_scroll = target.min(self.hits.workspace_max_scroll);
         }
     }
