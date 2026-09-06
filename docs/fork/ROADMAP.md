@@ -175,7 +175,7 @@ Owned by `implement-roadmap`. Legend: ✅ done · 🔨 in progress · ⬜ not st
 | E6 | Push notifications to the phone | E4, E5 | ⬜ | — |
 | E7 | Control from phone and console (approvals, prompts, start) | E3, E4 | ⬜ | — |
 | E8 | Fork release and install pipeline | E3, E4 | ⬜ | — |
-| E9 | Claude account profiles per agent, switchable mid-session | E0 | ⬜ | — |
+| E9 | Claude account profiles per agent, switchable mid-session | E0 | 🔨 | `docs/fork/plans/e9-claude-accounts.md` |
 
 ---
 
