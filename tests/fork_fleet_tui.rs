@@ -204,6 +204,85 @@ fn sidebar_lists_every_host_and_click_switches() {
     );
 }
 
+/// `prefix + shift + f`: the console's default `[fleet.keys] host_picker`.
+const HOST_PICKER_KEYS: &[u8] = b"\x02F";
+
+#[test]
+fn host_picker_switches_hosts_from_the_keyboard() {
+    let mut lab = Lab::new("tui-picker");
+    let up = lab.up("2");
+    assert!(
+        up.status.success(),
+        "fleet-lab up 2 failed: {}{}",
+        stdout_of(&up),
+        stderr_of(&up)
+    );
+    for session in ["lab-1", "lab-2"] {
+        support::wait_for_socket(&lab_client_socket(&lab, session), SOCKET_TIMEOUT);
+    }
+    let pane_1 = lab_pane_id(&lab, 1);
+    let pane_2 = lab_pane_id(&lab, 2);
+    append_lab_config(&lab, &lab_fleet_config(2));
+
+    let mut console = FleetConsole::spawn(&lab, COLS, ROWS);
+    assert_screen(
+        &console,
+        "herdr-fleet-lab:lab-1",
+        RENDER_TIMEOUT,
+        "the active host's pane never rendered",
+    );
+    // lab-2 has to be connected before the picker can offer it as `connected`.
+    assert_screen(
+        &console,
+        "· lab-2",
+        RENDER_TIMEOUT,
+        "lab-2 never reported a projection",
+    );
+
+    console.send(HOST_PICKER_KEYS);
+    assert_screen(
+        &console,
+        "connected",
+        RENDER_TIMEOUT,
+        "the host picker did not open on prefix+shift+f",
+    );
+
+    // Down, then enter: the second row is lab-2, in the sidebar's own order.
+    console.send(b"\x1b[B\r");
+    assert_screen(
+        &console,
+        "herdr-fleet-lab:lab-2",
+        RENDER_TIMEOUT,
+        "the picker did not switch the console to lab-2",
+    );
+
+    console.send(b"picker-marker");
+    assert_screen(
+        &console,
+        "picker-marker",
+        RENDER_TIMEOUT,
+        "the console never showed the host it switched to",
+    );
+    assert!(
+        support::wait_until(Duration::from_secs(20), Duration::from_millis(200), || {
+            pane_text(&lab, "lab-2", &pane_2).contains("picker-marker")
+        }),
+        "input after the switch never reached lab-2:\n{}",
+        pane_text(&lab, "lab-2", &pane_2)
+    );
+    assert!(
+        !pane_text(&lab, "lab-1", &pane_1).contains("picker-marker"),
+        "input after the switch reached the previous host:\n{}",
+        pane_text(&lab, "lab-1", &pane_1)
+    );
+
+    assert!(
+        console.detach(EXIT_TIMEOUT),
+        "prefix+q did not end the console:\n{}",
+        console.screen_text()
+    );
+}
+
 #[test]
 fn a_fleet_with_no_enabled_host_refuses_before_it_touches_the_terminal() {
     let mut lab = Lab::new("tui-empty");

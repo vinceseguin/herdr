@@ -126,6 +126,7 @@ impl ClientShellConfig {
                     keybinds: config.keybinds(),
                 }),
             local_keys: config.keys.clone(),
+            local_fleet_keys: config.fleet.keys.clone(),
             keybinding_source: ClientShellKeybindingSource::Local,
             prompt_new_tab_name: config.ui.prompt_new_tab_name,
             prompt_new_workspace_name: config.ui.prompt_new_workspace_name,
@@ -196,6 +197,15 @@ impl ClientShellConfig {
             ClientShellKeybindingSource::Local => {
                 let mut config = crate::config::Config {
                     keys: self.local_keys.clone(),
+                    // Fork: `[fleet.keys]` is compiled through the same
+                    // registry as `[keys]`, so it has to travel with it.
+                    // Rebuilding from `Config::default()` alone would quietly
+                    // restore the *default* host-picker binding every time a
+                    // server publishes its commands.
+                    fleet: crate::config::FleetConfig {
+                        keys: self.local_fleet_keys.clone(),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 };
                 config.keys.command = commands
@@ -279,6 +289,7 @@ impl ClientShellConfig {
             match config.live_keybinds_with_diagnostics() {
                 Ok((mut keybinds, keybind_diagnostics)) => {
                     self.local_keys = config.keys.clone();
+                    self.local_fleet_keys = config.fleet.keys.clone();
                     if self.keybinding_source == ClientShellKeybindingSource::RemoteLocal {
                         keybinds.keybinds.custom_commands.clear();
                     }

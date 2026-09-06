@@ -100,6 +100,7 @@ pub(super) fn render_worktree_create_overlay(
         navigator_popup: Rect::default(),
         navigator_search: Rect::default(),
         navigator_rows: Vec::new(),
+        host_picker_rows: Vec::new(),
         worktree_search: Rect::default(),
         worktree_rows: Vec::new(),
         cursor: (!create.creating).then(|| crate::protocol::CursorState {
@@ -286,6 +287,7 @@ pub(super) fn render_worktree_open_overlay(
         navigator_popup: Rect::default(),
         navigator_search: Rect::default(),
         navigator_rows: Vec::new(),
+        host_picker_rows: Vec::new(),
         worktree_search: search,
         worktree_rows: row_hits,
         cursor: (open.search_focused && !open.opening).then(|| crate::protocol::CursorState {
@@ -402,6 +404,7 @@ pub(super) fn render_worktree_remove_overlay(
         navigator_popup: Rect::default(),
         navigator_search: Rect::default(),
         navigator_rows: Vec::new(),
+        host_picker_rows: Vec::new(),
         worktree_search: Rect::default(),
         worktree_rows: Vec::new(),
         cursor: None,

@@ -740,7 +740,23 @@ fn read_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
 }
 
 fn process_runtime_dir(pid: u32) -> std::io::Result<Option<PathBuf>> {
-    let environ = fs::read(format!("/proc/{pid}/environ"))?;
+    // A pid list read from /proc is a snapshot: any of those processes may
+    // exit before this read. That is not an error, it is the process no longer
+    // being one of ours — and a test that boots several servers concurrently
+    // hits it often enough to matter. Every other unreadable-environ case
+    // (permissions, a foreign process) is equally "not ours".
+    let environ = match fs::read(format!("/proc/{pid}/environ")) {
+        Ok(environ) => environ,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(err) => return Err(err),
+    };
 
     let mut socket_path: Option<PathBuf> = None;
 

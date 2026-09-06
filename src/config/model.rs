@@ -984,6 +984,8 @@ impl Default for RemoteConfig {
 pub struct FleetConfig {
     /// Include this machine's default session as host "local". Default: true.
     pub include_local: bool,
+    /// `[fleet.keys]` — bindings that only act in the Fleet console.
+    pub keys: FleetKeysConfig,
     /// Additional hosts; see `[[fleet.hosts]]` in `herdr --default-config`.
     pub hosts: Vec<FleetHostConfig>,
 }
@@ -992,8 +994,66 @@ impl Default for FleetConfig {
     fn default() -> Self {
         Self {
             include_local: true,
+            keys: FleetKeysConfig::default(),
             hosts: Vec::new(),
         }
+    }
+}
+
+/// `[fleet.keys]` — keybindings for surfaces only the Fleet console has.
+///
+/// A fork-owned section rather than a `[keys]` leaf: `[keys]` is enumerated
+/// against upstream's published config reference, which the fork does not
+/// edit. The bindings themselves are ordinary [`BindingConfig`] values,
+/// compiled through the same registry as `[keys]`, so a collision with a
+/// `[keys]` binding is reported exactly like any other duplicate.
+#[derive(Debug, Clone)]
+pub struct FleetKeysConfig {
+    /// Open the Fleet host picker. Default: "prefix+shift+f"
+    pub host_picker: BindingConfig,
+    /// Which fields the user actually wrote, so a user binding can displace a
+    /// default one silently and a default one never displaces a user's.
+    pub(crate) user_fields: BTreeSet<&'static str>,
+}
+
+impl Default for FleetKeysConfig {
+    fn default() -> Self {
+        Self {
+            // Not "prefix+shift+h" as E2's plan sketched: that combo is
+            // upstream's default `keys.swap_pane_left`, so a fleet default on
+            // it would either disable an upstream default or be disabled
+            // itself, with a config diagnostic on a stock install either way.
+            // "f" is for Fleet, and is free in both prefix tables.
+            host_picker: BindingConfig::one("prefix+shift+f"),
+            user_fields: BTreeSet::new(),
+        }
+    }
+}
+
+impl FleetKeysConfig {
+    pub(crate) fn key_field_is_user_configured(&self, field: &str) -> bool {
+        self.user_fields.contains(field)
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct FleetKeysConfigOverlay {
+    host_picker: Option<BindingConfig>,
+}
+
+impl<'de> Deserialize<'de> for FleetKeysConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let input = FleetKeysConfigOverlay::deserialize(deserializer)?;
+        let mut keys = FleetKeysConfig::default();
+        if let Some(value) = input.host_picker {
+            keys.host_picker = value;
+            keys.user_fields.insert("host_picker");
+        }
+        Ok(keys)
     }
 }
 

@@ -260,8 +260,13 @@ the binary, commands and paths stay `herdr`.
   is unchanged. `--session <name>` keeps its global meaning: the implicit
   `local` host is *this process's* configured session
   (`client_socket_path_for(None)` already honours it).
-- **(f) Host picker key is `[fleet.keys] host_picker = "prefix+shift+h"`**
-  *(auto default — deviation from the roadmap's `[keys]` wording, with reason)*.
+- **(f) Host picker key is `[fleet.keys] host_picker`** — **`"prefix+shift+f"`
+  as built**, not the `"prefix+shift+h"` this decision first named: that combo
+  is upstream's default `keys.swap_pane_left` (`src/config/model.rs`), so a
+  fleet default on it would either disable an upstream default or be disabled
+  itself, with a config diagnostic on a stock install either way. See PR 6's
+  *As built*. *(auto default — deviation from the roadmap's `[keys]` wording,
+  with reason)*.
   A `[keys]` leaf is enumerated by upstream's `config_reference_check.py`
   and needs a row in `docs/next/website/src/data/config-reference.json`,
   which fork rules forbid editing; `SKIPPED_SUBTREES` skips only struct-typed
@@ -372,7 +377,7 @@ the binary, commands and paths stay `herdr`.
 | 3 | refactor: route client writes and fleet events through a server link seam | B · Console loop | 1 | ✅ |
 | 4 | feat: herdr fleet opens the client shell over the fleet connector | B · Console loop | 2, 3 | ✅ |
 | 5 | feat(fleet): sidebar host groups with live status and click-to-switch | C · Fleet UX | 4 | ✅ |
-| 6 | feat(fleet): host picker overlay and fleet.keys host_picker binding | C · Fleet UX | 5 | ⬜ |
+| 6 | feat(fleet): host picker overlay and fleet.keys host_picker binding | C · Fleet UX | 5 | ✅ |
 | 7 | feat(fleet): host-aware notifications and cross-host notification targets | C · Fleet UX | 5 | ⬜ |
 | 8 | feat(fleet): reconnect notice for the active host and resize on reconnect | C · Fleet UX | 5 | ⬜ |
 | 9 | docs: fleet console guide, adr e2 review, roadmap drift | D · Docs | 6, 7, 8 | ⬜ |
@@ -1641,12 +1646,147 @@ just bench-fleet-scale   # unchanged within noise (the picker is not on the fram
 bash scripts/fork/fleet-lab.sh down
 ```
 
+**As built (PR 6, merged).** Deviations from the shapes above, all deliberate:
+
+- **The default binding is `prefix+shift+f`, not `prefix+shift+h`.**
+  `prefix+shift+h` is upstream's default `keys.swap_pane_left`. Both would be
+  `BindingSource::Default`, so the shared `BindingRegistry` would keep whichever
+  is applied first and emit `"H: kept …, disabled …"` on a **stock** install —
+  either the picker never opens, or swap-pane-left stops working for every
+  herdr user, console or not. `f` is for Fleet and is free in both prefix
+  tables; a test pins both facts (`the_fleet_host_picker_has_a_default_binding_
+  that_conflicts_with_nothing`). Anything that says `prefix+shift+h` — the
+  roadmap, decision (f) as first written — is stale.
+- **Precedence is "user beats default, `[keys]` beats `[fleet.keys]` on a
+  tie".** `fleet.keys.host_picker` is applied *last* within each of the two
+  source passes, so a user's `[fleet.keys] host_picker = "prefix+h"` silently
+  displaces upstream's default `keys.focus_pane_left` (the ordinary user-beats-
+  default rule, validated live), while a user who writes the same combo in both
+  sections keeps the `[keys]` one and gets `"kept keys.goto, disabled
+  fleet.keys.host_picker"`. `FleetKeysConfig` tracks `user_fields` through a
+  custom `Deserialize` exactly as `KeysConfig` does; without that, a default
+  fleet binding could displace a user's `[keys]` binding.
+- **The picker's rows travel on the model, not on a call into `FleetState`.**
+  `FleetSidebarModel` gained `picker: Vec<HostPickerRow>`, filled by `rebuild`
+  from PR 2's `host_picker_rows(state)` (which is therefore consumed, allow
+  removed). Decision (c) puts `FleetState` in the *loop* and the model in the
+  *shell*, and the overlay lives in the shell — so a picker that derived its own
+  rows would need either a fourth `fleet_sidebar_update` argument or a second
+  path from the loop. As a consequence `FleetSidebarModel::same_rows(&other)`
+  replaces the bare `groups == groups` comparison in `fleet_sidebar_matches`:
+  a host that reconnects on a new server version moves a picker row while no
+  group row changes, and the console must still install that model.
+- **`HostRowState::state_name` was deleted, not consumed.** PR 2 added it for
+  this PR, but a picker row's label already carries the state in prose *with*
+  the version and the retry attempt (`connection_summary`), which `state_name`
+  cannot express; a second, poorer spelling of the same fact had no caller. Its
+  test now pins `from_connection`'s mapping instead. (Same treatment PR 5 gave
+  PR 2's `visible_rows`.)
+- **The overlay holds a snapshot of the rows, refreshed on
+  `fleet_sidebar_update`.** `ClientHostPickerOverlay { rows, selected, scroll }`
+  lives in `state.rs` next to `ClientNavigatorOverlay` (the renderer in
+  `overlays.rs` needs the type, and `overlays.rs` is a `#[path]` submodule of
+  `render`); the behaviour is `src/client/shell/fleet_overlay.rs`. A host that
+  drops while the picker is open is redrawn from the new model instead of
+  staying `connected` — pinned by a test.
+- **`1`-`9` selects; `enter` confirms.** Not an immediate switch: a mistyped
+  digit would otherwise move every later keystroke to another machine. Out-of-
+  range digits are ignored. `esc` closes. The binding pressed *again* does not
+  close it — an open overlay swallows keys before prefix resolution, exactly as
+  it does for the navigator, so "the binding again → close" from the sketch is
+  not reachable and was dropped rather than special-cased.
+- **A disabled host keeps the picker open; the active host closes it.**
+  Accepting routes through PR 5's `switch_action` (now `pub(super)`), so the
+  picker cannot emit a `SwitchHost` the loop would only log and drop.
+- **`OverlayRender.primary` carries the picker's popup rect.** The picker has
+  no primary button, and `primary` is the generic rect `composition.rs` already
+  copies — so "a press outside the popup closes" costs no second hit field.
+  `composition.rs` (PR 8's file) gains exactly **one** line, next to the twenty
+  identical ones: `self.hits.host_picker_rows = rendered.host_picker_rows;`.
+- **Two more one-line edits in shared files:** `src/client/shell/fleet.rs`'s
+  `switch_action` became `pub(super)`, and its `fleet_sidebar_update` calls
+  `refresh_host_picker_rows()`. `src/client/shell/tests/mod.rs` gains
+  `mod fleet_picker;`.
+- **The help overlay lists the binding for every client**, not only in fleet
+  mode: `render_help_overlay` is reached from `render_client_overlay`, which has
+  no fleet state, and threading one through would reshape `composition.rs` for a
+  cosmetic gain. The row says `host picker (fleet console)`.
+- **`herdr --default-config`'s `[fleet]` sample gained a `[fleet.keys]`
+  sub-table**, and `main.rs`'s `uncommented_default_fleet_block` test helper
+  now treats a `[fleet.…]` header as sample TOML (it only knew `[[fleet.…]]`),
+  so the round-trip test really parses the new key instead of silently folding
+  it into `[[fleet.hosts]]`.
+- **A configured `[fleet.keys]` binding has to travel with `[keys]` into the
+  client's keymap rebuild** — the bug live validation caught, and the reason
+  this PR touches `src/client/shell/config.rs` and `state.rs` beyond the plan's
+  list. `ClientShellConfig::apply_snapshot_keybindings` runs on *every* connect
+  (it merges the server's published custom commands) and, for
+  `ClientShellKeybindingSource::Local`, recompiles the whole keymap from
+  `Config { keys: self.local_keys.clone(), ..Default::default() }`. With
+  `[fleet]` left at its default there, a user's `host_picker = "prefix+h"`
+  compiled correctly at startup and was then silently replaced by this build's
+  default the moment the first host's snapshot arrived: `config check` said ok,
+  the console's own help said `prefix+shift+f`, and the configured key did
+  nothing. `ClientShellConfig` now keeps `local_fleet_keys` beside `local_keys`
+  and passes it into that rebuild (and refreshes it on a live reload).
+  `FleetKeysConfig` gained `Clone` for it. Two tests pin it —
+  `a_configured_binding_survives_the_servers_command_list` fails without the
+  fix. **Every future `[fleet.keys]` binding inherits this**: the local copy is
+  what the client recompiles from.
+- **`tests/support/mod.rs::process_runtime_dir` tolerates a process that exits
+  mid-scan.** A pid list read from `/proc` is a snapshot; `NotFound`/
+  `PermissionDenied` on the following `environ` read now means "not ours"
+  rather than an error. Three lab-booting PTY tests now run concurrently under
+  nextest, and the old code failed the whole run when any unrelated process
+  exited between the scan and the read.
+- **From the `fable` review** (all fixed, gate green): a click whose hit rect
+  came from an older frame could fall through to the *highlighted* row — the
+  select and the accept are now one call (`accept_host_picker_row`) that acts
+  only when the select succeeded; opening the picker clears
+  `hits.host_picker_rows` and `hits.overlay_primary` so a press in the same
+  input batch as the opening key cannot borrow the previous overlay's geometry;
+  `refresh_host_picker_rows` no longer clones the row vector when no picker is
+  open and now keeps the highlight on the same host *by id* rather than by
+  index; Home/End use `usize::saturating_add_signed` instead of `isize::MIN / 2`;
+  the renderer draws fixed-position segments instead of a `format!` per row per
+  frame; and `HostPickerRow.kind` — which lost its dead-code allow with the
+  rest of PR 2's picker API — is drawn as the transport (`local`/`ssh`) at the
+  right of each row.
+- `just bench-fleet-scale` is unchanged within noise (compose median 5 vs 1
+  hosts: 1.02× collapsed, 1.02× expanded, against the 1.15×/1.5× acceptance):
+  the picker is drawn only while it is open, and nothing was added to the
+  sidebar's per-frame path.
+- **`scripts/fork/tui-drive.py` matches each `--expect` only against output
+  that arrives *after* that step starts.** Two consecutive `--expect`s on text
+  from the same frame therefore always fail the second one. One expectation per
+  frame; use a string that a *later* frame carries.
+
 **Downstream**
 
 - `[fleet.keys]` is the home for future fleet-only bindings (E7's
-  "prompt on host…"); document each in `fleet-core.md`'s key table.
+  "prompt on host…"); document each in `fleet-core.md`'s key table **and** in
+  the `DEFAULT_CONFIG` `[fleet.keys]` sample, and apply it after the `[keys]`
+  fields in both source passes so `[keys]` keeps a tie. Check any new default
+  against `KeysConfig::default()` first — `prefix+shift+h` was already taken.
 - `KeybindAction::HostPicker` exists in every build; non-fleet clients ignore
   it.
+- Any new `[fleet.keys]` field must also be copied into
+  `ClientShellConfig.local_fleet_keys` (see *As built*), or it will be reset to
+  its default on the first snapshot.
+- **PR 9:** the key is `[fleet.keys] host_picker = "prefix+shift+f"` everywhere
+  it is written (`fleet.md`, the ADR's E2 review, and the ROADMAP's E2 drift
+  fix — the roadmap still says `prefix+shift+h`). `docs/fork/fleet-core.md`
+  already carries the `[fleet.keys]` section, its key table row, the precedence
+  rule and the updated `DEFAULT_CONFIG` quote — verify, do not rewrite. Add
+  `src/client/shell/fleet_overlay.rs` to the fork-owned list and
+  `src/config/model.rs`, `src/config/keybinds.rs`,
+  `src/input/{keybindings,keybind_help}.rs`, `src/client/shell/overlays.rs`,
+  `overlay_input.rs`, `actions.rs`, `mouse.rs`, `state.rs`, `composition.rs`,
+  `src/client/shell/config.rs`, `src/client/shell/worktree_overlays.rs` and
+  `tests/support/mod.rs` to the *Keeping up with upstream* table. The picker's keys for `fleet.md`:
+  `↑↓`/`j k`, `1`-`9` to select, `enter` to switch, `esc` to close, click to
+  switch, a click outside to close; a host that is down is selectable (you get
+  PR 8's notice), a host disabled in `[fleet]` is listed but inert.
 
 ### PR 7 — feat(fleet): host-aware notifications and cross-host notification targets · deps: 5
 

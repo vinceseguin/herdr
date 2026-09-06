@@ -406,6 +406,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # This machine's default session is always host "local" unless disabled.
 # include_local = true
 #
+# [fleet.keys]
+# Bindings that only act in the Fleet console (`herdr fleet`).
+# host_picker = "prefix+shift+f"
+#
 # [[fleet.hosts]]
 # name = "workbox"        # display name and id prefix (workbox/w1:p1)
 # kind = "ssh"            # "ssh" | "local"
@@ -905,6 +909,7 @@ mod tests {
                 let body = line.strip_prefix("# ").unwrap_or(line);
                 let key = body.split(" = ").next().unwrap_or_default();
                 let is_toml = body.starts_with("[[fleet.")
+                    || body.starts_with("[fleet.")
                     || (!key.is_empty()
                         && key.len() < body.len()
                         && key
@@ -930,6 +935,11 @@ mod tests {
 
         let config: config::Config = toml::from_str(&block).expect("fleet sample is valid TOML");
         assert!(config.fleet.include_local);
+        assert_eq!(
+            config.fleet.keys.host_picker,
+            config::BindingConfig::one("prefix+shift+f"),
+            "the sample must print this build's default binding"
+        );
         assert_eq!(config.fleet.hosts.len(), 1);
         let host = &config.fleet.hosts[0];
         assert_eq!(host.name, "workbox");
