@@ -33,217 +33,363 @@ binary, commands, config directories and protocol stay `herdr`. E3 ships only
 a tiny committed placeholder `web/dist/index.html` so the embedding path is
 exercised; the Vite/Preact app is E4's.
 
-**Dependency chain:** E1 is ✅ (`origin/master` @ `09919e4a`, herdr
-`0.8.2-fork`). **E2 is 🔨 and being implemented concurrently** — none of its
-code is on `master` yet, and E3 must never depend on it: both are consumers
-of the E1 fleet core. E3 assumes exactly these E1 contracts (verified in the
-code):
+**This is a re-plan.** The first E3 plan was verified on `master @ 09919e4a`.
+Since then three things landed on `master` (now `3d649ce3`, herdr
+`0.8.2-fork`): upstream #3670 "manage multiple ssh machines from one client"
+(`herdr machine …`, saved SSH profiles in `src/client/endpoint/catalog.rs`,
+a rewritten `src/remote/attach.rs`, new `src/remote/{saved,args,process,
+restart_policy}.rs`); the retirement of the fork's E2 fleet TUI (fork PR #33
+reverted #22 and #24–#31; #23 — connector client options, active-surface
+tracking and `take_events()` — was kept in `src/fleet/connector.rs` /
+`handshake.rs`); and the upstream sync PR #34 whose merge notes live in
+[ADR 0002](../decisions/0002-adopt-upstream-multi-machine-client.md). What
+changed in this plan versus the first one, and why:
 
-- `src/fleet/connector.rs`: `FleetConnector::start(specs, options) -> Self`,
-  `events(&mut self) -> &mut tokio::sync::mpsc::Receiver<FleetEvent>`,
-  `shutdown(self)` (bounded 2 s join; unlinks ssh forward sockets),
-  `FleetConnectorOptions::for_config(&Config)` (reads
-  `[remote].manage_ssh_config`; `handshake = HandshakeParams::read_only(
-  INACTIVE_SURFACE)`, `max_frame_size = MAX_FRAME_SIZE`), `FleetEvent::Host
-  { host, event: HostEvent }` (the only variant a non-active consumer
-  receives besides `Notification`/`EndpointResponse`; surfaces are dropped in
-  the reader thread for inactive hosts). The gateway never calls
-  `set_active`, so no host is ever asked for a bigger surface.
+- **E2 no longer exists.** Every "E2 is landing concurrently" hazard, the
+  ban on `take_events()`/`for_client`, and the references to
+  `tests/support/fleet_tui.rs`, `just bench-fleet-scale` and `[fleet.keys]`
+  are gone. Nothing under `src/client/` is fork-owned any more; E3 still
+  never edits it except one visibility word in `terminal_sessions.rs` (PR 6).
+- **PR 3 is built on the connector API as it exists after #23**:
+  `take_events()` (an owned receiver for the gateway's `select!` task, which
+  is dropped before `shutdown`), `FleetConnectorOptions { handshake, active,
+  manage_ssh_config, max_frame_size, endpoint_timeout }`, `ActiveGeometry`,
+  `set_active_geometry` (never called by the gateway).
+- **The gateway is a passive reader** (decision (p)): the generation-1 hello
+  gained `surface_active` in #3670, and the server no longer makes a client
+  that sends `false` its foreground client or lets it claim pane geometry.
+  This removes the E1 caveat that drove the old "hold connections only while
+  someone reads" rule — the gateway can hold every host permanently.
+- **The ssh child's stderr is handled through upstream's own switch**
+  (decision (q)): `SshStdioBridge::start_with` now takes `noninteractive`,
+  which nulls the child's stderr and applies `BatchMode=yes`; the fleet
+  threads it through as a connector option the gateway turns on. No fd
+  juggling in the gateway.
+- **Saved machine profiles become an opt-in host source** (decision (r),
+  the "E3 decides" item of ADR 0002) in a small separable PR 9; PR 10 is the
+  docs PR. Ten PRs instead of nine.
+- Every path, symbol and line reference below was re-verified on
+  `3d649ce3`; stale ones (`client_transport.rs:669-786`, `headless.rs:1160`,
+  `terminal_sessions.rs` at 267 lines, `do_handshake` at `:131`, the
+  "shutdown unlinks forward sockets" claim, `src/remote/saved.rs` as the
+  profile store) were rewritten.
+
+**Dependency chain:** E1 is ✅; E2 is ♻️ superseded (ADR 0002). E3 assumes
+exactly these E1 contracts (verified in the code):
+
+- `src/fleet/connector.rs`: `FleetConnector::start(specs, options) -> Self`
+  (`:364`), `events(&mut self) -> Option<&mut mpsc::Receiver<FleetEvent>>`
+  (`:459`), `take_events(&mut self) -> Option<mpsc::Receiver<FleetEvent>>`
+  (`:474`, second call `None`; **drop the receiver before `shutdown`**),
+  `shutdown(self)` (`:558`: sets the stop flag, closes the receiver if still
+  owned, half-closes every stream through the connector-local
+  `shutdown_stream_write` (`:1383-1392`, the replacement for upstream's
+  removed `ipc::shutdown_local_stream_write`), waits `SHUTDOWN_JOIN_TIMEOUT
+  = 2 s` on the supervisor exit channel, then detaches), `send` (`:687`),
+  `set_active`/`set_active_geometry` (`:485`/`:532`, never called by the
+  gateway), `FleetConnectorOptions` (`:126-143`: `handshake:
+  HandshakeParams`, `active: ActiveGeometry`, `manage_ssh_config`,
+  `max_frame_size = MAX_FRAME_SIZE`, `endpoint_timeout = 60 s`) with
+  `for_config(&Config)` (`:151`, reads `[remote].manage_ssh_config`) and the
+  unused `for_client` (`:167`); `INACTIVE_SURFACE` (`:72`, 120×40 = the
+  default headless size); `FleetEvent::{Host, Surface, SurfacePatch,
+  Notification, EndpointResponse, ServerMessage}` (`:199-227`); an inactive
+  host's surface frames are dropped in the reader thread (`:1155-1173`).
+  **Forward sockets are unlinked by `SshTransport::drop`** when a supervisor
+  thread exits and drops its transport, not by `shutdown` itself; a
+  supervisor still running after the 2 s wait is detached and its socket
+  stays until process exit — so the gateway must close every stream and wait
+  for the connector before returning from `main`.
+- `src/fleet/handshake.rs`: `HandshakeParams { cell_width_px,
+  cell_height_px, surface_size, pixel_mouse, mouse_capture, read_timeout }`
+  (`:45-52`), `read_only(surface_size)` (`:56`), `for_client(…)` (`:83`),
+  `endpoint_handshake(&mut LocalStream, &HandshakeParams) ->
+  io::Result<HandshakeOutcome>` (`:123`) which hardcodes `surface_active:
+  true` at `:140-144` with the comment "E3 may flip it for hosts with no
+  active surface". `HandshakeOutcome::{Connected, Incompatible, Rejected}`.
 - `src/fleet/state.rs`: `FleetState::{new, hosts, host, active_host,
-  set_active_host, apply, merged_agents, totals}`; `HostConnection::{
-  Connecting, Connected{server_version, methods}, Unavailable{reason,
-  retry_in}, Incompatible}` + `is_connected/state_name/reason`;
-  `FleetChange::{HostConnection, Snapshot, AgentAdded, AgentRemoved,
-  AgentStatus, ActiveHost}` tagged `kind` (`host_connection`, `snapshot`,
-  `agent_added`, `agent_removed`, `agent_status`, `active_host`), `Serialize
-  + Deserialize`, **no catch-all** — a reader skips unknown kinds; the
-  `HostConnection` delta serializes as `ConnectionReport` without `methods`.
-  `test_new()`, `test_with_adversarial_identity_state()`,
-  `assert_invariants_for_test()` are `#[cfg(test)]` and reachable only from
-  in-crate tests.
-- `src/fleet/report.rs`: `FLEET_STATUS_SCHEMA = "herdr.fleet.status.v1"`,
-  `FleetStatusReport::from_state(&mut FleetState, client_version)` (`&mut`
-  for the merged cache), `HostReport`, `ConnectionReport` (`#[serde(other)]
-  Unknown`), `WorkspaceReport`, `AgentReport`; every key always present.
-- `src/fleet/hosts.rs`: `HostId` (`new`, `LOCAL`, `as_str`, serde as a
-  string, never contains `/`), `HostKind::{Local{session}, Ssh{target,
-  session}}`, `HostSpec { id, kind, enabled }`, `resolve_hosts(&FleetConfig)
-  -> Result<Vec<HostSpec>, Vec<String>>` (all-or-nothing).
-  `src/fleet/refs.rs`: `FleetPaneRef::new(host, pane_id)`, `Display`/`FromStr`
-  as `host/w1:p1`, `is_valid_resource_id`.
+  set_active_host, apply, merged_agents, totals}` (`:358-469`);
+  `HostConnection::{Connecting{attempt}, Connected{server_version, methods},
+  Unavailable{reason, retry_in}, Incompatible{generation, reason}}` +
+  `is_connected/state_name/reason`; `FleetChange` tagged `kind`
+  (`host_connection`, `snapshot`, `agent_added`, `agent_removed`,
+  `agent_status`, `active_host`; `:281-319`), `Serialize + Deserialize`,
+  **no catch-all** — a reader skips unknown kinds; the `HostConnection` delta
+  serializes as `ConnectionReport` without `methods`. `test_new()`,
+  `test_with_adversarial_identity_state()`, `assert_invariants_for_test()`
+  are `#[cfg(test)]` on a separate impl block (`:822-970`) and reachable only
+  from in-crate tests.
+- `src/fleet/report.rs`: `FLEET_STATUS_SCHEMA = "herdr.fleet.status.v1"`
+  (`:19`), `FleetStatusReport::from_state(&mut FleetState, client_version)`
+  (`:220`, `&mut` for the merged cache), `HostReport`, `ConnectionReport`
+  (`#[serde(other)] Unknown`), `WorkspaceReport`, `AgentReport`; every key
+  always present.
+- `src/fleet/hosts.rs`: `HostId` (`new` validates `[A-Za-z0-9._-]` via
+  `validate_fleet_host_name`, never contains `/`; `local()`, `as_str`),
+  `HostKind::{Local{session}, Ssh{target, session}}`, `HostSpec { id, kind,
+  enabled }`, `resolve_hosts(&FleetConfig) -> Result<Vec<HostSpec>,
+  Vec<String>>` (`:149`, all-or-nothing). `src/fleet/refs.rs`:
+  `FleetPaneRef::new(host, pane_id)`, `Display`/`FromStr` as `host/w1:p1`,
+  `is_valid_resource_id` (`:24`).
 - `src/fleet/transport/`: `trait HostTransport { connect(&mut self) ->
-  io::Result<LocalStream>; read_timeout(); describe() }`,
+  io::Result<LocalStream>; read_timeout(); describe() }` (`mod.rs:25`),
   `transport_for(&HostSpec, &FleetConnectorOptions) -> Result<Box<dyn
-  HostTransport>, String>`, `LocalTransport::new(session)`,
-  `SshTransport::new(host, target, session, manage_ssh_config)` — which binds
-  its forward socket at `local_forward_socket_path_scoped(host.as_str(),
-  target, session)`. **A second `SshTransport` with the same scope in the
-  same process fails with `AddrInUse`**, so the gateway's terminal streams
-  need their own scope (PR 6).
-- `src/fleet/oneshot.rs`: `FleetSession::start(&Config)`, `settle`,
-  `next_changes` (`blocking_recv` — must not run inside a runtime),
-  `report`, `shutdown`; the model for "resolve config → specs → connector →
-  state", which the gateway re-does asynchronously.
+  HostTransport>, String>` (`mod.rs:41`), `LocalTransport::new(session)`,
+  `SshTransport::new(host, target, session, manage_ssh_config)` (`ssh.rs:60`)
+  which derives its forward socket once at
+  `local_forward_socket_path_scoped(host.as_str(), target, session)`
+  (`ssh.rs:70`) and starts the bridge with `SshStdioBridge::start_with(…,
+  noninteractive: false, BridgeErrorSink::Report(_))` (`ssh.rs:169-179`).
+  **A second `SshTransport` with the same scope in the same process fails
+  with `AddrInUse`**, so the gateway's terminal streams need their own scope
+  (PR 6). `Drop` (`ssh.rs:230-238`) clears the bridge before the ssh session.
+- `src/fleet/oneshot.rs`: `FleetSession::start(&Config)` (`:36`; resolves
+  hosts, `FleetState::new`, `set_active_host(None)`, `FleetConnector::start`
+  with `for_config`), `settle`, `next_changes` (`blocking_recv` — must not
+  run inside a runtime), `report`, `shutdown`; the model for "resolve config
+  → specs → connector → state", which the gateway re-does asynchronously.
+- `src/fleet/mod.rs:33-227` is an architecture guard: `hosts`, `refs`,
+  `report`, `state` may not name `tokio`, `ratatui`, `interprocess`,
+  `crate::ipc`, `crate::remote` or `crate::client`. New fleet modules are not
+  covered unless added to `PURE_MODULES`; PR 9 adds its pure mapper there.
 - E1 constraints recorded in the roadmap and `docs/fork/fleet-core.md`:
   `agents[]` excludes plain panes (the fleet lab's marker panes are **not**
   agents — `/api/fleet` from the lab shows `workspaces[]` but empty
-  `agents[]`); `fleet_change_seq` is per `FleetState` instance; an ssh host's
-  forward socket is unlinked only by `shutdown`, so the gateway **must** call
-  it on every exit path; on unix dropping an `SshTransport` while a bridged
-  stream is still open blocks until the ssh child exits — release streams
-  first; a connecting client shell becomes each host's *foreground* client
-  and its surface (120×40 inactive) is the host's effective pane geometry —
-  headless servers are unaffected, a host with a configured `headless_size`
-  or an attached console is resized while the gateway holds it (documented
-  limitation; a truly passive reader needs an advertised optional endpoint
-  observer method, out of scope). The ssh child inherits stderr; the gateway
-  is not full-screen, so it may stay.
+  `agents[]`); `fleet_change_seq` is per `FleetState` instance; on unix
+  dropping an `SshTransport` while a bridged stream is still open blocks
+  until the ssh child exits — release streams first.
 
-### Real current state (verified on `master` @ `09919e4a`)
+### Real current state (verified on `master` @ `3d649ce3`)
 
 - **No gateway anywhere.** `src/gateway/`, `web/`, `[gateway]`,
-  `tests/fork_gateway.rs`, `docs/fork/gateway.md` do not exist.
-  `grep -rn 'cfg(feature' src/` is empty: **`Cargo.toml` has no `[features]`
-  section at all**, so `gateway` is the crate's first feature and the
-  `--no-default-features` build path is untested today. There is no
-  `src/lib.rs` and no `[lib]` — the crate is a single bin (`herdr`), so
+  `tests/fork_gateway.rs`, `docs/fork/gateway.md`, `scripts/fork/ws-client.py`
+  do not exist. `grep -rn 'cfg(feature' src/` is empty and **`Cargo.toml`
+  has no `[features]`, `[lib]`, `[dev-dependencies]` or `[profile]`
+  section** (sections: `[package]`, `[dependencies]` `:23-48`,
+  `[patch.crates-io]` `:50`, `[target.'cfg(windows)'.dependencies]` `:53`),
+  so `gateway` is the crate's first feature and the `--no-default-features`
+  build path is untested today. The crate is a single bin (`herdr`), so
   `tests/*.rs` cannot `use herdr::…` and drive the binary through
   `env!("CARGO_BIN_EXE_herdr")`; handler-level tests must be in-crate
   `#[cfg(test)]` modules under `src/gateway/`.
-- **Dependencies.** `Cargo.toml` `[dependencies]` (no `[dev-dependencies]`,
-  no `[profile]`): `tokio = { version = "1", features = ["rt-multi-thread",
+- **Dependencies.** `tokio = { version = "1", features = ["rt-multi-thread",
   "macros", "sync", "time", "process", "io-util"] }` — **no `net`, no
   `signal`**; `serde`/`serde_json`, `base64 = "0.22.1"`, `sha2 = "0.10"`,
   `bytes = "1"`, `time = "0.3.47"`, `tracing`/`tracing-subscriber`,
   `interprocess = "2.4.2"`, `bincode = "2"`, `clap 4.5` (`std,help,usage`),
-  `ratatui`, `crossterm`, `portable-pty` (patched), `libc`, `regex`, `toml`,
-  `schemars`, `png`, `ctrlc`. `Cargo.lock` has **no** `axum`, `hyper`,
-  `http`, `tower`, `tungstenite`, `qrcode`, `subtle`, `constant_time_eq`,
-  `hmac`, `url`, `mime_guess`, `include_dir`; it *does* carry `rand 0.8.5`,
-  `getrandom 0.3.4` + `0.4.2`, `futures-util 0.3.33`, `uuid 1.22.0`
-  transitively. `just ci` runs `--locked`, so `Cargo.lock` ships in the same
-  PR as `Cargo.toml`. `rust-toolchain.toml` pins `1.96.1`; edition 2021.
-  `.cargo/config.toml` sets `[env] HERDR_BUILD_CHANNEL = "fork"`.
-  `build.rs` builds libghostty-vt with Zig and emits `rerun-if-env-changed`
-  for the build-channel vars; it does not know about `web/`.
+  `clap_complete`, `ratatui 0.30`, `crossterm 0.29`, `portable-pty` (patched),
+  `libc`, `regex`, `toml 0.8`, `schemars`, `png`, `ctrlc`, `jsonc-parser`,
+  `serde_ignored`, `unicode-width`. `Cargo.lock` (267 packages) has **no**
+  `axum`, `hyper`, `http`, `tower`, `tower-http`, `tungstenite`,
+  `tokio-tungstenite`, `qrcode`, `subtle`, `constant_time_eq`, `hmac`,
+  `url`, `mime_guess`, `include_dir`, `rustls`, `ring`; it *does* carry
+  `rand 0.8.5`, `getrandom 0.3.4` + `0.4.2`, `futures-util 0.3.33`, `uuid
+  1.22.0`, `tokio 1.50.0` transitively. `just ci` runs `--locked`, so
+  `Cargo.lock` ships in the same PR as `Cargo.toml`. `rust-toolchain.toml`
+  pins `1.96.1`; edition 2021. `.cargo/config.toml` sets `[env]
+  HERDR_BUILD_CHANNEL = "fork"`. `build.rs` builds libghostty-vt with Zig
+  0.15.2 and emits `rerun-if-changed` for the vendored tree only; it does
+  not know about `web/`. `.gitignore` has no `web/` entry (only
+  `node_modules/`), so a committed `web/dist` is tracked by default.
+- **Upstream #3670 in the tree.** Saved SSH machines live in
+  `src/client/endpoint/catalog.rs`: `pub(crate) struct SavedSshEndpoint { id:
+  ProfileId, label, target, session, enabled }` (`:20-25`,
+  `deny_unknown_fields`, validated by `:45` — target via
+  `remote::validate_remote_target`, session via `session::validate_name`,
+  label ≤ 128 bytes, no passwords), `EndpointCatalog::load_profiles() ->
+  Result<Vec<SavedSshEndpoint>, String>` (`:106`, reads only the catalog),
+  stored as pretty JSON at `catalog_path() = config::state_dir()/client/
+  endpoints.json` (`:369`, private-mode write, ≤ 64 profiles). Both are
+  re-exported at `crate::client::endpoint::*` (`src/client/endpoint.rs:16`;
+  `ProfileId` at `:27`, 32 lowercase hex chars). `herdr machine list|add|
+  rename|remove|enable|disable` is `src/cli/machine.rs:30`
+  `run_machine_command`, wired at `src/cli.rs:30`/`:119`,
+  `src/cli/spec.rs:37` (`machine::command()` in `src/cli/spec/machine.rs`)
+  and `src/main.rs:761`. **`src/remote/saved.rs` is not the profile store**:
+  it is the saved-machine ssh bridge (`connect_saved_ssh`,
+  `saved_ssh_failure_needs_attention` `:49` — a reusable "needs human
+  attention" classifier). `src/remote/args.rs` (`validate_remote_target`
+  `:118`), `process.rs` (`wait_with_output_timeout`, `pub(super)`) and
+  `restart_policy.rs` (pure, `pub(super)`) are internal to `remote`.
+- **The generation-1 hello has a passive-reader hook.**
+  `src/protocol/endpoint.rs:46` `EndpointClientHello.surface_active: bool`
+  with `#[serde(default = "default_true")]` and **no `deny_unknown_fields`**,
+  so a server that predates the field ignores it. Server semantics for
+  `false` (`src/server/headless.rs`): the connect arm sets
+  `foreground_client_id` only `if surface_active` (`:2024`);
+  `promote_client_to_foreground` returns early for an inactive client
+  (`:908-915`); a `ClientResize` from it is ignored (`:2248`);
+  `claim_unowned_shell_tab_geometry`/`resize_shell_tab_if_controller`
+  (`src/server/headless/client_views.rs:708-737`) refuse it; and
+  `render_targets` (`src/server/clients.rs`) still includes every shell
+  client with a writer, so **snapshot updates keep flowing to a passive
+  client** (`src/server/headless/render.rs:409-450`). The fleet currently
+  sends `true` (`src/fleet/handshake.rs:140-144`). The console's own
+  `do_handshake` (`src/client/handshake.rs:154`, `pub(super)`) takes
+  `surface_active` as its last parameter.
+- **The ssh bridge has a daemon mode.** `SshStdioBridge::start_with(target,
+  remote_herdr, local_socket, session_name, ssh_options, noninteractive,
+  errors)` (`src/remote/attach.rs:1843-1851`); `bridge_connection`
+  (`:2048-2072`) spawns the per-connection `ssh` with `.stderr(if
+  noninteractive { Stdio::null() } else { Stdio::inherit() })` and, when
+  noninteractive, `apply_noninteractive_ssh_options` (`:575-591`:
+  `BatchMode=yes`, `NumberOfPasswordPrompts=0`, `StrictHostKeyChecking=yes`,
+  `ConnectTimeout=10`, `ConnectionAttempts=1`, keepalives). Discovery probes
+  (`RemoteSsh::sh_output`/`user_shell_output`, `:414-460`) always pipe
+  stderr into the returned error, so the bridge child is the only site that
+  inherits fd 2. `RemoteSsh::new_noninteractive` (`:383`) is `pub(super)`
+  and drops the session name and managed config; E3 does not need it.
+  `BridgeErrorSink::{Stderr, Log, Report(Arc<dyn Fn(String)>)}` (`:1935`).
 - **Runtime shape to copy.** No `#[tokio::main]`; the long-running daemon
-  path is `src/server/headless/bootstrap.rs:40`
+  path is `src/server/headless/bootstrap.rs:40-43`
   `tokio::runtime::Builder::new_multi_thread().enable_all().build()` +
   `rt.block_on`. Every socket read/write on the herdr side is **blocking
   std I/O**: `protocol::write_message(&mut W, &M)` / `read_message(&mut R,
-  max_frame_size)` (`src/protocol/wire.rs:1601,1624`, `[u32 LE len][bincode]`),
-  `crate::ipc::connect_local_stream(&Path) -> io::Result<LocalStream>`
-  (`LocalStream = interprocess::local_socket::Stream`, `try_clone` for a
-  write half as `src/client/terminal_sessions.rs` does).
+  max_frame_size)` (`src/protocol/wire.rs:1601`/`:1624`, `[u32 LE len]
+  [bincode]`), `crate::ipc::connect_local_stream(&Path) ->
+  io::Result<LocalStream>` (`src/ipc.rs:35`; `LocalStream =
+  interprocess::local_socket::Stream`, `:11`).
 - **Observe/control wire path (frozen, reused as-is).** A client-socket
-  connection has one mode for its lifetime, chosen by its first message
-  (`src/server/client_transport.rs:669-786`): `ClientMessage::TerminalHello
-  { version: PROTOCOL_VERSION (22), cols, rows, cell_width_px,
-  cell_height_px, pixel_mouse }` → `ServerMessage::Welcome { version,
-  encoding: RenderEncoding::TerminalAnsi, error: None }` and the connection
-  is `TerminalPending`; then `ClientMessage::ObserveTerminal { target }`
-  (tag 7) or `ControlTerminal { target, takeover }` (tag 8), where `target`
-  resolves server-side to a raw terminal id, a public pane id `w1:p1`, or an
-  agent target (`resolve_terminal_target_id_string`, `src/server/
-  headless.rs:1160`; unknown → `ServerShutdown { reason: "terminal session
-  observe failed: terminal target … not found" }` and disconnect). Output is
-  **one message type**, `ServerMessage::Terminal(TerminalFrame { seq: u64,
-  width: u16, height: u16, full: bool, bytes: Vec<u8> })` — already-diffed
-  ANSI, `full: false` is the patch; `Graphics` and everything else is
-  dropped by the CLI. Inputs on a control connection reuse the direct
-  terminal vocabulary: `Input { data }` (tag 1), `Resize { cols, rows,
-  cell_width_px, cell_height_px, pixel_mouse }` (tag 3), `AttachScroll {
-  source: Wheel | PageKey{input}, direction: Up|Down, lines, column, row,
-  modifiers }` (tag 6), `Detach` (tag 4 — "release"). Server facts that
-  matter: observers are unlimited and never own the terminal
-  (`terminal_observe_allows_multiple_clients_without_attach_ownership`,
-  `src/server/headless/tests/mod.rs:3088`); **an observer's `Resize` changes
-  only its own virtual viewport** (`ServerEvent::ClientResize`,
-  `src/server/headless.rs:2185`, `render_terminal_virtual`), while a
-  controller's `Resize` resizes the real PTY (`:2181`); control is
-  single-owner (second `ControlTerminal` without `takeover` gets a
-  `ServerShutdown` "already has an attached client; retry with --takeover");
-  mode is one-way (observe → control on the same connection is refused); an
-  observed hidden pane keeps rendering; the server's per-client render lane
-  has capacity one, so a slow reader coalesces frames rather than desyncing
-  (`src/server/headless/render.rs:620-639`). Caps: hello and non-graphics
-  frames use `MAX_FRAME_SIZE = 2 MiB`; `MAX_GRAPHICS_FRAME_SIZE = 32 MiB`
-  only for graphics, which the gateway never enables.
-- **The CLI twin of that path**, `src/client/terminal_sessions.rs` (267
-  lines): `run_terminal_session_observe(target, cols, rows)` /
-  `run_terminal_session_control(target, takeover, cols, rows)`;
-  `connect_terminal_session_stream` (hardcodes `client_socket_path()`, calls
-  `std::process::exit` on failure — not reusable), `write_terminal_session_
-  output` (the read loop, emits NDJSON `{"type":"terminal.frame","seq",
-  "encoding":"ansi","width","height","full","bytes":<base64>}` /
-  `{"type":"terminal.closed","reason"}`), and
-  `pub(super) fn terminal_control_command_from_json(raw: &str) ->
-  Result<ClientMessage, String>` mapping `terminal.input {text | bytes}`,
+  connection has one mode for its lifetime, chosen by its first message in
+  `handle_client_handshake` (`src/server/client_transport.rs:646-830`):
+  `ClientMessage::TerminalHello { version: PROTOCOL_VERSION (22), cols, rows,
+  cell_width_px, cell_height_px, pixel_mouse }` (tag 0, arm at `:692`) →
+  `ServerMessage::Welcome { version, encoding, error: None }` where
+  `encoding` is `RenderEncoding::TerminalAnsi` whenever there are no shell
+  options (`:801-805`) and the connection is `ClientConnectionMode::
+  TerminalPending` (`src/server/clients.rs:12-17`: `ClientShell`,
+  `TerminalPending`, `TerminalAttach{terminal_id}`,
+  `TerminalObserve{terminal_id}` — **control is attach**); then
+  `ClientMessage::ObserveTerminal { target }` (tag 7) or `ControlTerminal {
+  target, takeover }` (tag 8) (`:1029-1037` → `ServerEvent::
+  ClientObserveTerminal`/`ClientControlTerminal`, dispatched at
+  `src/server/headless.rs:2051-2058`), where `target` resolves server-side
+  through `resolve_terminal_target_id_string` (`headless.rs:1172`: raw
+  terminal id, then `app.resolve_terminal_target` for a public pane id
+  `w1:p1` or an agent target; unknown → `ServerShutdown { reason: "terminal
+  session observe failed: terminal target … not found" }` and disconnect).
+  Output is **one message type**, `ServerMessage::Terminal(TerminalFrame {
+  seq: u64, width: u16, height: u16, full: bool, bytes: Vec<u8> })`
+  (`wire.rs:1271`/`:1346`) — already-diffed ANSI, `full: false` is the patch;
+  `Graphics` (`:1349`) and everything else is dropped by the CLI. Inputs on
+  a control connection reuse the direct terminal vocabulary: `Input { data }`
+  (tag 1), `Resize { cols, rows, cell_width_px, cell_height_px, pixel_mouse }`
+  (tag 3), `AttachScroll { source: Wheel | PageKey{input}, direction:
+  Up|Down, lines, column, row, modifiers }` (tag 6), `Detach` (tag 4 —
+  "release"). Server facts that matter: observers are unlimited and never
+  own the terminal (`terminal_observe_allows_multiple_clients_without_attach_
+  ownership`, `src/server/headless/tests/mod.rs:3152`); **an observer's
+  `Resize` changes only its own client-local viewport** (`ServerEvent::
+  ClientResize`, `headless.rs:2205-2222`), while a controller's `Resize`
+  resizes the real PTY (`:2182-2204`, the only path that calls
+  `runtime.resize`); control is single-owner — a second `ControlTerminal`
+  without `takeover` gets `ServerShutdown { "… already has an attached
+  client; retry with --takeover" }` **and is disconnected**
+  (`headless.rs:1826-1838`), and a takeover evicts the previous owner the
+  same way; mode is one-way (observe → control on the same connection is
+  refused); an observed hidden pane keeps rendering; the server's per-client
+  render lane has capacity one (`ClientWriterQueueState.render:
+  Option<Vec<u8>>`, `client_transport.rs:251-310`; `render.rs:633-651`
+  defers a full render on `TrySendError::Full`), so a slow reader coalesces
+  frames rather than desyncing. Caps: hello and non-graphics frames use
+  `MAX_FRAME_SIZE = 2 MiB` (`wire.rs:24`); `MAX_GRAPHICS_FRAME_SIZE = 32 MiB`
+  (`:29`) only for graphics, which the gateway never enables.
+- **The CLI twin of that path**, `src/client/terminal_sessions.rs` (277
+  lines): `pub fn run_terminal_session_observe(target, cols, rows)` (`:18`) /
+  `run_terminal_session_control(target, takeover, cols, rows)` (`:26`);
+  private `connect_terminal_session_stream` (`:72`; hardcodes
+  `client_socket_path()`, calls `std::process::exit(1)` on failure — not
+  reusable), private `write_terminal_session_output` (`:122`; the read loop,
+  reads with `MAX_GRAPHICS_FRAME_SIZE`, emits NDJSON `{"type":"terminal.
+  frame","seq","encoding":"ansi","width","height","full","bytes":<base64>}`
+  / `{"type":"terminal.closed","reason"}`), and `pub(super) fn
+  terminal_control_command_from_json(raw: &str) -> Result<ClientMessage,
+  String>` (`:208`) mapping `terminal.input {text | bytes}`,
   `terminal.resize {cols, rows, cell_width_px, cell_height_px}`,
   `terminal.scroll {direction, lines, source, column, row, modifiers}`,
-  `terminal.release` (tests at `src/client/tests/mod.rs:783-840`). Defaults
-  120×40; there is no SIGWINCH handling and no `--encoding` flag.
-  `do_handshake` (`src/client/handshake.rs:131`) is `pub(super)`; the
-  terminal hello is two frames and is re-implemented in the gateway rather
-  than widening `src/client/`.
+  `terminal.release` (tests at `src/client/tests/mod.rs:806-849`). Defaults
+  120×40 (`src/cli.rs:632-633`); no SIGWINCH handling, no `--encoding`
+  flag. The terminal hello is two frames and is re-implemented in the
+  gateway rather than widening `src/client/handshake.rs`.
 - **CLI wiring pattern** (E1's `fleet`): `src/cli.rs:28` `mod fleet;` and
-  `:116` `"fleet" => fleet::run_fleet_command(&args[2..])?` in `maybe_run`
+  `:117` `"fleet" => fleet::run_fleet_command(&args[2..])?` in `maybe_run`
   (`pub(super) fn run_fleet_command(args: &[String]) -> io::Result<i32>`,
-  hand-parsed args, `help` → 0, usage error → 2); `src/cli/spec.rs:31`
-  `.subcommand(fleet_command())` + `fn fleet_command()` at `:147` (help and
-  completions only; invariants `spec_describes_all_completion_commands`,
+  `src/cli/fleet.rs:26`, hand-parsed args, `help` → 0, usage error → 2);
+  `src/cli/spec.rs:34` `.subcommand(fleet_command())` + `fn fleet_command()`
+  at `:138-148` (help and completions only; invariants
+  `spec_describes_all_completion_commands`,
   `every_spec_subcommand_renders_short_and_long_help`,
-  `spec_passes_clap_invariants`); `src/main.rs:746-768` the bare-command
-  allowlist (`"fleet"` at `:758` — a missing entry makes `herdr gateway`
-  exit 2 "unknown command") and `:611` the `--help` usage lines.
-  `build_info::is_fork()` already gates fork-only help text.
-- **Config pattern** (E1's `[fleet]`): `src/config/model.rs:979` `FleetConfig`
-  (`#[derive(Debug, Deserialize)] #[serde(default)]`, hand-written `Default`,
-  pure `diagnostics()`), `Config.fleet` at `:323` (last field); `src/config/
-  io.rs:7` `KNOWN_TOP_LEVEL_CONFIG_KEYS` allowlist (alphabetical; `"gateway"`
-  goes between `"fleet"` and `"keys"`), `load_live_section(table, "fleet",
-  …)` + `diagnostics.extend(config.fleet.diagnostics())` on the live-reload
-  path, `Config::collect_diagnostics()` (`src/config.rs:114`);
-  `src/main.rs:64` `DEFAULT_CONFIG` with the fully commented `[fleet]` block
-  at `:404` and two contract tests (`default_config_fleet_block_parses_
-  without_diagnostics`, `default_config_fleet_block_is_commented_out`);
-  `scripts/config_reference_check.py` `SKIPPED_SUBTREES = ("keys.command",
+  `spec_passes_clap_invariants`); `src/main.rs:751-773` the bare-command
+  allowlist (`"fleet"` at `:760`, `"machine"` at `:761` — a missing entry
+  makes `herdr gateway` exit 2 "unknown command") and `:612` the `--help`
+  usage line for fleet (`:607` for machine). `build_info::is_fork()` gates
+  only the `herdr update` help line (`:601-605`).
+- **Config pattern** (E1's `[fleet]`): `src/config/model.rs:979-989`
+  `FleetConfig { include_local, hosts }` (`#[derive(Debug, Deserialize)]
+  #[serde(default)]`, hand-written `Default` at `:991`, pure `diagnostics()`
+  at `:1046`), `Config.fleet` at `:323` (last field); `src/config/io.rs:7-21`
+  `KNOWN_TOP_LEVEL_CONFIG_KEYS` allowlist (alphabetical; `"gateway"` goes
+  between `"fleet"` and `"keys"`), `load_live_section(table, "fleet", …)` at
+  `:353-360` + `diagnostics.extend(config.fleet.diagnostics())` at `:363`
+  on the live-reload path, `Config::collect_diagnostics()`
+  (`src/config.rs:117-130`, an explicit chain ending in
+  `.chain(self.fleet.diagnostics())`); `src/main.rs:65` `DEFAULT_CONFIG`
+  with the fully commented `[fleet]` block at `:404-414` and two contract
+  tests (`default_config_fleet_block_parses_without_diagnostics` `:910`,
+  `default_config_fleet_block_is_commented_out` `:940`);
+  `scripts/config_reference_check.py:36` `SKIPPED_SUBTREES = ("keys.command",
   "fleet")` — `scripts/test_config_reference_check.py` runs inside `just ci`
-  and fails on any new key outside a skipped subtree because fork rules
-  forbid editing `docs/next/**`. Paths: `config::config_dir()`
-  (`$XDG_CONFIG_HOME/<app>`; `app_dir_name()` = `herdr-dev` in debug,
-  `herdr` in release), `config_path()` (`HERDR_CONFIG_PATH` override),
-  `Config::load() -> LoadedConfig` (no path parameter — `--session` works by
-  setting `HERDR_SESSION` before anything runs, `src/session.rs:62-70`).
+  (`maintenance-test`) and fails on any new key outside a skipped subtree
+  because fork rules forbid editing `docs/next/**`. Paths:
+  `config::config_dir()` (`io.rs:31`, `$XDG_CONFIG_HOME/<app>`;
+  `app_dir_name()` = `herdr-dev` in debug, `herdr` in release),
+  `state_dir()` (`:38`), `config_path()` (`:170`, `HERDR_CONFIG_PATH` =
+  `config::CONFIG_PATH_ENV_VAR` override checked first), `Config::load() ->
+  LoadedConfig` (no path parameter — `--session` works by setting
+  `HERDR_SESSION` before anything runs, `src/session.rs:55-91`).
+  `[server] headless_cols/headless_rows` (`DEFAULT_CONFIG` `:224-226`) is
+  applied live on `herdr server reload-config` (`src/app/mod.rs:872-875`) —
+  the lever PR 3's passivity evidence uses.
 - **Secrets/permissions precedent.** `0o600`/`0o700` via
   `std::os::unix::fs::{OpenOptionsExt, PermissionsExt}` in
-  `src/pane_graphics_files.rs` (`DIRECTORY_MODE`/`FILE_MODE`, verifies mode of
-  an existing dir before use) and `src/ipc.rs:335`
+  `src/pane_graphics_files.rs` (`DIRECTORY_MODE`/`FILE_MODE` `:13-15`,
+  exact-mode verification at `:298`/`:320`) and `src/ipc.rs:328-338`
   `restrict_socket_permissions` with a `#[cfg(windows)]` no-op twin (`just
   check`'s `windows-lint` clippy-compiles the bin for
   `x86_64-pc-windows-msvc`). **No constant-time compare and no CSPRNG exist
-  in `src/`** — unique ids are `AtomicU64`/pid+nanos.
-- **Tests/tooling.** `tests/support/mod.rs` (`build_version()`,
-  `wait_for_socket`, `client_handshake` = a hand-encoded `TerminalHello`,
-  `read_server_message` → `(tag, payload)`, pid/runtime-dir hygiene),
-  `tests/support/fleet_lab.rs` `Lab::{new, up, run, herdr, runtime_dir}` +
-  `unique_root`/`stdout_of`/`stderr_of`/`STEP_TIMEOUT_MS`,
-  `tests/fork_fleet_lab.rs`/`tests/fork_ssh_lab.rs` (the `fork_*` naming),
-  `tests/cli/fleet.rs` (writes `[fleet]` into `<config_home>/<app>/
-  config.toml`, `TWO_LOCAL_HOSTS`). `scripts/fork/fleet-lab.sh up N | status
-  [--json] | env | down` writes only `onboarding = false` — tests append
-  `[fleet]`/`[gateway]` themselves. `scripts/fork/ssh-lab.sh` gives one ssh
-  host (`herdr-ssh-lab`, exit 3 = no sshd). `justfile`: `ci` = `lint`
-  (`cargo fmt --check`, `cargo clippy --all-targets --locked -- -D
-  warnings`) + `cargo nextest run --locked` + `maintenance-test` +
-  `ui-hot-path-architecture-test` + `integration-assets-test` +
-  `plugin-marketplace-test`; **no recipe passes `--features`**. Fork CI
+  in `src/`** — unique ids are `AtomicU64`/pid+nanos (`ProfileId::generate`
+  is SHA-256 of `pid:nanos:sequence`, not a secret).
+- **Tests/tooling.** `tests/support/mod.rs` (`pub mod fleet_lab;` is the
+  only module; `build_version()` `:35`, `wait_for_socket` `:119`,
+  `client_handshake` `:295` = a hand-encoded `TerminalHello`,
+  `read_server_message` `:368` → `(tag, payload)`, pid/runtime-dir hygiene),
+  `tests/support/fleet_lab.rs` `Lab::{new, up, run, run_with_bin, herdr,
+  runtime_dir}` + `unique_root`/`stdout_of`/`stderr_of`/`STEP_TIMEOUT_MS`
+  (`Drop` runs `down`), `tests/fork_fleet_lab.rs`/`tests/fork_ssh_lab.rs`
+  (`#![cfg(unix)]`, the `fork_*` naming), `tests/cli/fleet.rs` (writes
+  `[fleet]` into `<config_home>/<app>/config.toml`, `TWO_LOCAL_HOSTS`).
+  `scripts/fork/` = `dev-setup.sh`, `fleet-lab.sh`, `gate.sh`, `ssh-lab.sh`
+  only. `fleet-lab.sh up N | status [--json] | env | down` writes only
+  `onboarding = false` into `<root>/xdg/{herdr,herdr-dev}/config.toml` —
+  tests append `[fleet]`/`[gateway]` themselves; `env` exports
+  `XDG_CONFIG_HOME`, `HERDR_FLEET_LAB_{ROOT,RUNTIME_DIR,SESSIONS}`,
+  `HERDR_FLEET_LAB_{CLIENT_SOCKET,API_SOCKET,PANE}_N`. `scripts/fork/ssh-lab.sh`
+  gives one ssh host (`herdr-ssh-lab`, exit 3 = no sshd; exports
+  `HERDR_SSH_LAB_{ROOT,HOME,TARGET,PORT,SSH_CONFIG}`). `justfile`: `ci` =
+  `lint` (`cargo fmt --check`, `cargo clippy --all-targets --locked -- -D
+  warnings`) + `cargo nextest run --locked -E "{{filter}}" --status-level
+  fail --final-status-level slow --failure-output final --success-output
+  never` + `maintenance-test` + `ui-hot-path-architecture-test` +
+  `integration-assets-test` + `plugin-marketplace-test`; **no recipe passes
+  `--features`**; `bench-fleet-scale` no longer exists. Fork CI
   (`.github/workflows/fork-ci.yml`): `conventional-commits`, `check
   (ubuntu-latest)` (toolchain 1.96.1 + just/nextest + bun 1.3.14 + Zig
-  0.15.2 + rust-cache key `fork-ubuntu-latest` → `just ci`), `shellcheck -S
-  warning scripts/fork/*.sh`. No `websocat`; `python3` ≥ 3.10 stdlib and
-  `curl` are available. `assets/fork/{logo.svg, logo-192.png, logo-512.png}`
-  exist for E4.
+  0.15.2 + rust-cache key `fork-ubuntu-latest` → `just ci`, 30 min),
+  `shellcheck -S warning scripts/fork/*.sh` (non-recursive). No `websocat`;
+  `python3` ≥ 3.10 stdlib and `curl` are available. `assets/fork/{logo.svg,
+  logo-192.png, logo-512.png, README.md}` exist for E4. `docs/fork/README.md`
+  keeps the fork-wiring table at `:453-464` (with a duplicated
+  `src/remote/attach.rs` row to fold) and the CI table at `:396-400`.
 - **Registry versions (2026-09-05):** `axum 0.8.9`, `qrcode 0.14.1`,
   `subtle 2.6.1`, `getrandom 0.3.4` (already in the lock), `tower-http
   0.7.1`, `tokio-tungstenite 0.30.0`, `hyper 1.11.1`, `http 1.5.0`.
@@ -311,18 +457,21 @@ code):
   successful auth does not reset the counter (no oracle).
 - **(g) Runtime shape** *(auto default)*: one multi-thread tokio runtime
   (`Builder::new_multi_thread().enable_all()`, as the server does). The
-  gateway owns the `FleetConnector` in one task that awaits
-  `connector.events().recv()` and folds `FleetEvent::Host` into a
-  `std::sync::Mutex<FleetState>` (never held across an `.await`),
-  broadcasting every `FleetChange` through `tokio::sync::broadcast` (capacity
-  1024, `Arc<str>` pre-serialized JSON). Handlers read the mutex briefly.
-  Terminal sessions are blocking std threads per session (reader + writer)
-  bridged to the WebSocket task with bounded channels (capacity 2) so a slow
-  browser applies backpressure to the server's render lane instead of
-  buffering; the gateway therefore never holds more than two frames per
-  open terminal. Graceful stop on SIGINT/SIGTERM: stop accepting → close
-  terminal sessions (send `Detach`, drop streams, join threads) → drop
-  terminal transports → `connector.shutdown()` → remove the runtime marker.
+  gateway owns the `FleetConnector` inside `FleetRuntime`; one task owns the
+  receiver from `take_events()`, awaits it in a `select!` with the stop
+  signal, and folds `FleetEvent::Host` into a `std::sync::Mutex<FleetState>`
+  (never held across an `.await`), broadcasting every `FleetChange` through
+  `tokio::sync::broadcast` (capacity 1024, `Arc<str>` pre-serialized JSON).
+  Handlers read the mutex briefly. Terminal sessions are blocking std
+  threads per session (reader + writer) bridged to the WebSocket task with
+  bounded channels (capacity 2) so a slow browser applies backpressure to
+  the server's render lane instead of buffering; the gateway therefore never
+  holds more than two frames per open terminal. Graceful stop on
+  SIGINT/SIGTERM: stop accepting → close terminal sessions (send `Detach`,
+  drop streams, join threads) → drop terminal transports → drop the event
+  receiver → `connector.shutdown()` (in `spawn_blocking`) → remove the
+  runtime marker → return from `main` (which is what finally drops any
+  detached supervisor's `SshTransport` and its forward socket).
 - **(h) `/api/events` carries the full report first** *(auto default)*.
   Because deltas between `GET /api/fleet` and the WebSocket connect would be
   lost, the stream is self-contained: subscribe to the broadcast, then take
@@ -347,8 +496,8 @@ code):
   supervisor threads and cannot be borrowed, and a second `SshTransport`
   with E1's scope collides on the forward socket. PR 6 adds
   `SshTransport::new_scoped(…, scope)` and `transport_for_scoped(spec,
-  options, scope)` (additive, in files E2 never touches) so the gateway holds
-  one `Mutex<Box<dyn HostTransport>>` per host and calls `connect()` once per
+  options, scope)` (additive, fork-owned files) so the gateway holds one
+  `Mutex<Box<dyn HostTransport>>` per host and calls `connect()` once per
   browser terminal (each ssh `connect` is one fresh `ssh` child through the
   bridge, exactly like `herdr --remote`).
 - **(k) `web/dist` is committed and embedded with `include_bytes!`** *(auto
@@ -366,9 +515,10 @@ code):
   client `tests/fork_gateway.rs` shells out to, the way `tests/fork_fleet_
   lab.rs` shells out to the lab script.
 - **(m) `--config <path>` is applied exactly like `--session`** *(auto
-  default)*: set `HERDR_CONFIG_PATH` at the top of `run_gateway_command`
-  before any thread exists, so `config_path()`, `Config::load()` and a later
-  live reload all agree. `--bind` overrides `[gateway] bind`.
+  default)*: set `HERDR_CONFIG_PATH` (`config::CONFIG_PATH_ENV_VAR`) at the
+  top of `run_gateway_command` before any thread exists, so
+  `config_path()`, `Config::load()` and a later live reload all agree.
+  `--bind` overrides `[gateway] bind`.
 - **(n) `--bind 127.0.0.1:0` is supported and the bound address is printed**
   *(auto default)*: the first stdout line is `listening on
   http://127.0.0.1:<port>` and the same is written to
@@ -379,47 +529,98 @@ code):
   caller's `scope`, `loopback`, `features`) so E4 can show the Control toggle
   only when the device has the scope, and E5/E7 can add features without a
   new endpoint.
-- **(p) No E2 code is used** (orchestrator constraint). E3 does not touch
-  `src/client/**` or `src/fleet/sidebar.rs`, uses `FleetConnector::events()`
-  (not E2's `take_events`) and `FleetConnectorOptions::for_config` (not
-  `for_client`), and edits no file E2's PRs own except the three upstream
-  wiring lines every subcommand needs (see hazards).
+- **(p) The gateway is a passive reader: its aggregator hello sends
+  `surface_active: false`** *(auto default; ADR 0002 recommended it)*. PR 3
+  adds `HandshakeParams.surface_active: bool` and makes
+  `HandshakeParams::read_only` set it to `false`, so both consumers with no
+  active host — the gateway and `herdr fleet status` — become passive;
+  `for_client` (unused since E2's retirement) keeps `true` because a console
+  that activates a host needs the server to honour its resizes. Reason: the
+  E2/E1 finding that a connecting client shell becomes the host's foreground
+  client and sets its effective pane geometry (`headless.rs:2024`,
+  `client_views.rs:708`) no longer applies to a client that sends `false`;
+  snapshots still flow (`render_targets` includes every shell client), which
+  is all the fleet reads; and a pre-#3670 server ignores the field (no
+  `deny_unknown_fields`), degrading to the old foreground behaviour instead
+  of refusing the hello. The gateway may therefore hold every configured
+  host for as long as it runs. The residual documented limitation becomes:
+  *against a server older than #3670 the gateway is that host's foreground
+  client at 120×40 (a no-op for a headless default-size server)*.
+- **(q) Daemon ssh: the fleet passes `noninteractive: true` to the bridge
+  when a consumer asks for it** *(auto default)*. PR 3 adds
+  `FleetConnectorOptions.ssh_noninteractive: bool` (default `false`, so
+  `herdr fleet status` is byte-identical) and
+  `FleetConnectorOptions::for_daemon(&Config)` (= `for_config` +
+  `ssh_noninteractive: true`), threaded through `transport_for` into
+  `SshTransport::new(…, noninteractive)` and on to
+  `SshStdioBridge::start_with(…, noninteractive, sink)`. Effect for the
+  gateway: the per-connection `ssh` child's stderr is `Stdio::null()`
+  (nothing is ever painted on the daemon's stderr/journal by ssh itself),
+  and `BatchMode=yes`/`NumberOfPasswordPrompts=0`/`StrictHostKeyChecking=
+  yes`/`ConnectTimeout=10` guarantee the daemon never blocks on a prompt.
+  Failures still reach the host's `Unavailable { reason }` through
+  `BridgeErrorSink::Report` (exit status) and the next attempt's discovery
+  probe (which pipes ssh's stderr into its error text), exactly the chain
+  `fleet-core.md` documents. Discovery probes keep `RemoteSsh::new`
+  (managed config, control master, interactive flag): they pipe stderr and
+  cannot prompt without a tty, so no `attach.rs` edit is needed; a probe to
+  a hung host blocks only that host's supervisor thread. This is the
+  smallest option — no fd redirection in the gateway, no new E1 hook.
+- **(r) Saved machine profiles are an opt-in host source, `[fleet]
+  include_machines = false`** *(auto default — the smallest additive option
+  that adopts the ADR 0002 item)*. Reason: after ADR 0002 the console's host
+  list is `herdr machine …`; a phone user who already ran `herdr machine
+  add` (which installs herdr on the host — the fleet's one precondition)
+  should not have to duplicate every target into `[[fleet.hosts]]`, and the
+  gateway and `herdr fleet status` must show the same fleet, so the switch
+  lives in `[fleet]`, not `[gateway]`. Shape (PR 9, separable): a pure
+  mapper `src/fleet/machines.rs::machine_host_specs(&[MachineProfile],
+  &[HostSpec]) -> Result<Vec<HostSpec>, Vec<String>>` over a fleet-owned
+  `MachineProfile { label, target, session, enabled }`, plus one adapter
+  `src/fleet/hosts_source.rs::hosts_for_config(&Config)` that calls
+  `resolve_hosts` and, when `include_machines`, `crate::client::endpoint::
+  EndpointCatalog::load_profiles()`; `FleetSession::start` and
+  `FleetRuntime::start` both call the adapter. Host id = the machine label
+  when `HostId::new(label)` accepts it, else the label lowercased with runs
+  of other characters folded to `-`; an id that still fails or collides with
+  another machine or a `[[fleet.hosts]]` name is a diagnostic naming the
+  machine and the fix (`herdr machine rename <id> --label <valid>`), and the
+  fleet fails all-or-nothing like `resolve_hosts`. `kind` is `ssh`,
+  `session` is the profile's explicit session, `enabled` follows the
+  profile. E1's `[[fleet.hosts]]` keys and `resolve_hosts` are untouched.
+  Default `false` keeps every existing config byte-identical.
+- **(s) Events are taken, not borrowed** *(auto default)*: `FleetRuntime`
+  calls `take_events()` once, gives the receiver to the fold task, keeps the
+  `FleetConnector` in the struct (E7's `request(host, …)` needs `send`), and
+  drops the receiver before `shutdown` as `connector.rs:469-471` requires.
 
 ### Sequencing hazards
 
-- **E2 is landing concurrently.** Shared upstream lines: `src/cli.rs`
-  (`mod` + match arm), `src/cli/spec.rs` (`.subcommand(…)`), `src/main.rs`
-  (bare-command list, `--help` usage line) are edited by **E3 PR 1** and by
-  E2 PR 4; `src/config/model.rs` (E3 PR 2 appends `GatewayConfig` after
-  `FleetConfig`; E2 PR 6 adds `FleetConfig.keys`); `justfile` (E3 PR 1 adds
-  `lint-no-default`/`ci-no-default`; E2 PR 5 adds `bench-fleet-scale`);
-  `tests/support/mod.rs` (E3 PR 4 adds `pub mod gateway;`; E2 PR 4 adds
-  `pub mod fleet_tui;`). All are adjacent-line textual conflicts: whichever
-  lands second rebases onto `master` keeping both sides, re-runs the gate.
-  E2 PR 1 changes `src/fleet/connector.rs` (`FleetConnectorOptions` grows
-  `for_client`/`ActiveGeometry`, `take_events`, `shutdown` tolerant of a
-  taken receiver) and `handshake.rs`: E3 PR 3 uses only `start`, `events`,
-  `shutdown`, `for_config`, `FleetEvent::Host`, which E2 PR 1's Downstream
-  promises to keep. **If E2 PR 1 lands first and removes `events()` in
-  favour of `take_events()`, PR 3 switches to `take_events()` (an owned
-  receiver suits the gateway's task better) — flag it in the PR body.** E3
-  never edits `src/fleet/mod.rs`, `connector.rs`, `handshake.rs`,
-  `state.rs`, `report.rs`, `hosts.rs`, `refs.rs`, `oneshot.rs` or anything
-  under `src/client/`; its only fleet edit is PR 6's additive
-  `transport/{mod,ssh}.rs`, which no E2 PR lists.
 - **Upstream files touched, and by which PR only:** `Cargo.toml`,
   `Cargo.lock`, `justfile`, `.github/workflows/fork-ci.yml`, `src/main.rs`
   (`mod gateway;`, allowlist, usage), `src/cli.rs`, `src/cli/spec.rs` — PR 1.
-  `src/config/model.rs`, `src/config/io.rs`, `src/config.rs` (only if
-  `collect_diagnostics` needs a line), `src/main.rs` (`DEFAULT_CONFIG` block
-  + two tests), `scripts/config_reference_check.py` — PR 2. `build.rs`
-  (one `rerun-if-changed`), `.gitignore` (nothing expected — `node_modules/`
-  is already ignored; `web/dist` is committed) — PR 4.
-  `src/client/terminal_sessions.rs` (one visibility widening,
-  `pub(super)` → `pub(crate)`, on `terminal_control_command_from_json`) —
-  PR 6 (file not owned by any E2 PR). `tests/support/mod.rs` — PR 4. Never:
-  `src/protocol/**`, `src/server/**`, `src/app/**`, `src/remote/attach.rs`,
-  `tests/fixtures/endpoint-*.json`, `docs/next/**`.
+  `src/config/model.rs` (`GatewayConfig` after `FleetConfig`),
+  `src/config/io.rs`, `src/config.rs` (one `.chain`), `src/main.rs`
+  (`DEFAULT_CONFIG` block + two tests), `scripts/config_reference_check.py`
+  — PR 2. `build.rs` (one `rerun-if-changed`), `tests/support/mod.rs` (one
+  `pub mod gateway;`) — PR 4. `src/client/terminal_sessions.rs` (one
+  visibility widening, `pub(super)` → `pub(crate)`, on
+  `terminal_control_command_from_json`) — PR 6. `src/cli/spec.rs` (three
+  gated subcommands under `gateway_command()`) — PR 8. `src/config/model.rs`
+  (one `FleetConfig` field), `src/main.rs` (one commented line in the
+  `[fleet]` block) — PR 9. Never: `src/protocol/**`, `src/server/**`,
+  `src/app/**`, `src/remote/**` (the E1 hooks are enough), `src/client/**`
+  beyond the one word, `tests/fixtures/endpoint-*.json`, `docs/next/**`.
+- **Fork-owned fleet files touched:** PR 3 edits `src/fleet/handshake.rs`
+  (`surface_active` field), `src/fleet/connector.rs` (`ssh_noninteractive`,
+  `for_daemon`), `src/fleet/transport/{mod,ssh}.rs` (thread the flag) and
+  two paragraphs of `docs/fork/fleet-core.md`; PR 6 edits
+  `src/fleet/transport/{mod,ssh}.rs` again (`new_scoped`,
+  `transport_for_scoped`) — sequenced after PR 3 through PR 4; PR 9 adds
+  `src/fleet/machines.rs`, `src/fleet/hosts_source.rs`, edits
+  `src/fleet/mod.rs` (two `pub mod` lines + `PURE_MODULES`) and
+  `src/fleet/oneshot.rs` (one call), and the `[fleet]` prose of
+  `fleet-core.md`. PR 3 and PR 9 never run in the same wave.
 - **PR 1 changes `Cargo.toml`/`Cargo.lock` and runs alone** in its wave; it
   is the only dependency change of the epic — every later PR is dep-free.
 - **`src/gateway/server.rs` (router) and `tests/fork_gateway.rs` are edited
@@ -427,24 +628,34 @@ code):
   `[5, 6]`, W5 `[7, 8]`); the later PR in a wave rebases onto `master`
   before its gate and re-runs the integration test. Each PR adds its routes
   as a separate `fn <area>_routes() -> Router<AppState>` merged in `router()`
-  so the diffs are one line apart, not interleaved.
-- **Two Rust builds at once** (W2, W4, W5) is the memory hazard the gate
-  lock exists for; with E2 running in parallel the orchestrator's cap, not
-  this plan, bounds the total. Never bypass `scripts/fork/gate.sh`.
-- **The gateway holds every configured host as its foreground client at
-  120×40** for as long as it runs (E1 caveat). Every live validation points
-  `[fleet]` at lab sessions only (`include_local = false`), under the lab's
-  `XDG_CONFIG_HOME`, never at the user's default session; `docs/fork/
-  gateway.md` documents the headless-server assumption.
+  so the diffs are one line apart, not interleaved. `src/gateway/fleet.rs`
+  is created by PR 3 and edited only by PR 9 (one call swap); PR 4 consumes
+  it without editing it, so W3 `[4, 9]` is collision-free.
+- **Two Rust builds at once** (W2, W3, W4, W5) is the memory hazard the
+  gate lock exists for. Never bypass `scripts/fork/gate.sh`.
+- **The gateway holds every configured host for as long as it runs.** With
+  decision (p) that is passive against current servers, but every live
+  validation still points `[fleet]` at lab sessions only (`include_local =
+  false`), under the lab's `XDG_CONFIG_HOME`, never at the user's default
+  session: the user's real server must never see a fork test client, and a
+  pre-#3670 server would still be resized.
 - **Secrets in evidence.** Validation transcripts paste status codes, JSON
   keys and frame headers — never a token, cookie or pairing URL. Test
   fixtures generate tokens under a throwaway `XDG_CONFIG_HOME`; nothing
-  under `~/.config/herdr*` is read or written by any test.
-- **CI now runs the crate twice** (`just ci` and `just ci-no-default`); the
-  second job shares the toolchain/Zig steps but not the cargo cache key, so
-  budget ~10 extra minutes per run. `tests/live_handoff.rs` `wait_for_file`
-  remains a known upstream flake (`gh run rerun --failed -R
-  vinceseguin/herdr`).
+  under `~/.config/herdr*` or `~/.local/state/herdr*` is read or written by
+  any test (PR 9's machine fixture writes `endpoints.json` under a throwaway
+  `XDG_STATE_HOME`).
+- **CI runs the crate twice** from PR 1 on (`just ci` and `just
+  ci-no-default`); the second job shares the toolchain/Zig steps but not the
+  cargo cache key, so budget ~10 extra minutes per run.
+  `tests/live_handoff.rs` `wait_for_file` remains a known upstream flake
+  (`gh run rerun --failed -R vinceseguin/herdr`).
+- **Upstream syncs during the epic** merge upstream's side of
+  `src/client/**` and `src/remote/**` (ADR 0002). E3's only exposure is the
+  one `pub(crate)` word in `terminal_sessions.rs` (PR 6) and the already
+  re-applied E1 hooks in `attach.rs`; `EndpointCatalog::load_profiles` and
+  `SavedSshEndpoint` (PR 9) are `pub(crate)` upstream items — a rename
+  breaks the build loudly at merge time, never silently.
 
 ## Status legend
 
@@ -456,26 +667,28 @@ code):
 | --- | --- | --- | --- | --- |
 | 1 | chore: add gateway cargo feature with axum, qrcode and token dependencies | A · Foundations | — | ⬜ |
 | 2 | feat(gateway): gateway config section, token store, bind and origin policy | A · Foundations | 1 | ⬜ |
-| 3 | feat(gateway): async fleet runtime folding connector events into shared state | A · Foundations | 1 | ⬜ |
+| 3 | feat(gateway): passive async fleet runtime folding connector events into shared state | A · Foundations | 1 | ⬜ |
 | 4 | feat(gateway): herdr gateway serves health, fleet report and embedded assets over http | B · HTTP | 2, 3 | ⬜ |
 | 5 | feat(gateway): websocket fleet event stream | C · Streams | 4 | ⬜ |
 | 6 | feat(gateway): websocket terminal observe stream over per-host transports | C · Streams | 4 | ⬜ |
 | 7 | feat(gateway): terminal control mode gated by the control scope | C · Streams | 6 | ⬜ |
 | 8 | feat(gateway): pairing urls with qr codes, device cookies, status and token rotation | D · Ops | 4 | ⬜ |
-| 9 | docs: gateway guide, systemd unit, adr e3 review, roadmap drift | E · Docs | 5, 7, 8 | ⬜ |
+| 9 | feat(fleet): opt-in hosts from saved machine profiles | D · Ops | 3 | ⬜ |
+| 10 | docs: gateway guide, systemd unit, adr e3 review, roadmap drift | E · Docs | 5, 7, 8, 9 | ⬜ |
 
 **Wave preview (2-agent cap, Cargo PR alone):** W1 `[1]` → W2 `[2, 3]` →
-W3 `[4]` → W4 `[5, 6]` → W5 `[7, 8]` → W6 `[9]`. Critical path 1 → 2 → 4 →
-6 → 7 → 9. Only PR 1 touches `Cargo.toml`/`Cargo.lock`.
+W3 `[4, 9]` → W4 `[5, 6]` → W5 `[7, 8]` → W6 `[10]`. Critical path 1 → 2 →
+4 → 6 → 7 → 10. Only PR 1 touches `Cargo.toml`/`Cargo.lock`.
 
 **Model assignment:** tasks run on `opus`. Review agent must be **`fable`**
 for **PR 2** (token files, constant-time compare, rate limiter, bind/origin
 policy), **PR 4** (the auth middleware and route-level scope gates — the
 first network surface), **PR 6** (a terminal stream attached to the wrong
 host or pane is a silent mis-route; ssh transport scoping and drop order),
-**PR 7** (input reaching a terminal: scope gate, takeover, release), and
-**PR 8** (pairing exchange, cookie minting, rotation/revocation). PRs 1, 3,
-5 and 9 review on `opus`.
+**PR 7** (input reaching a terminal: scope gate, takeover, release), **PR 8**
+(pairing exchange, cookie minting, rotation/revocation) and **PR 9** (host
+identity derived from machine labels — a wrong mapping routes a terminal to
+the wrong machine). PRs 1, 3, 5 and 10 review on `opus`.
 
 ## Verification (the gate — every PR)
 
@@ -497,7 +710,7 @@ fork CI runs both as separate jobs — `check (ubuntu-latest)` and
 `check-no-default-features (ubuntu-latest)`. A PR is green only when both
 jobs and `conventional-commits`/`shellcheck` pass.
 
-Real-server validation is mandatory for every PR with runtime code (2–8):
+Real-server validation is mandatory for every PR with runtime code (2–9):
 `cargo build`, `bash scripts/fork/fleet-lab.sh up 2`, `eval "$(bash
 scripts/fork/fleet-lab.sh env)"`, a `[fleet]` block with `include_local =
 false` naming `lab-1`/`lab-2` as `kind = "local"` hosts (plus the PR's
@@ -514,7 +727,7 @@ frame bytes, and which lab pane changed (`$H --session lab-N pane read
 wait $GW` (expect exit 0 and no `gateway.json` left), then `fleet-lab.sh
 down`, and confirm from a shell **without** the lab env that `herdr session
 list` shows no `lab-*` and that `ls ~/.config/herdr*/gateway` does not exist.
-SSH validations (PR 6) add `ssh-lab.sh up` + `eval "$(bash
+SSH validations (PRs 3, 6, 9) add `ssh-lab.sh up` + `eval "$(bash
 scripts/fork/ssh-lab.sh env)"`, run the gateway with
 `HOME=$HERDR_SSH_LAB_HOME`, and tear down `ssh-lab.sh down` **before**
 `fleet-lab.sh down`; `sshd not found` (exit 3) degrades to local hosts and
@@ -529,7 +742,8 @@ CI gotchas to expect:
 - `cargo nextest run --locked --no-default-features` compiles every
   `tests/*.rs`; gateway tests must be `#![cfg(feature = "gateway")]` and
   in-crate gateway modules `#[cfg(feature = "gateway")]`, or the second job
-  fails to build.
+  fails to build. PR 9's fleet code is **not** feature-gated (the fleet
+  ships in both builds).
 - `just check`'s `windows-lint` is not in the gate but the code must
   clippy-compile for `x86_64-pc-windows-msvc`: token-file modes,
   `tokio::signal::unix`, and `LocalStream` details go behind `#[cfg(unix)]`
@@ -542,7 +756,8 @@ CI gotchas to expect:
   both feature sets.
 - `scripts/test_config_reference_check.py` runs in `just ci` against the
   real model: `[gateway]` must be in `SKIPPED_SUBTREES` (PR 2) or the gate
-  fails; the section is documented in `docs/fork/gateway.md` only.
+  fails; `[fleet] include_machines` (PR 9) is already inside the skipped
+  `fleet` subtree. Both are documented only under `docs/fork/`.
 - `clippy::large_enum_variant`, `too_many_arguments` (threshold 11) and
   `-D warnings` apply; dead code introduced for a later PR carries a narrow
   `#[allow(dead_code)]` with a comment naming that PR, removed by it.
@@ -555,16 +770,18 @@ CI gotchas to expect:
 ## Cross-cutting constraints (all PRs)
 
 - **Servers stay stock; no wire or endpoint-contract change.**
-  `src/protocol/**`, `src/server/**`, `src/app/**`,
-  `tests/fixtures/endpoint-*.json` have an empty diff for the whole epic. The
-  gateway speaks the frozen `TerminalHello`/`ObserveTerminal`/
+  `src/protocol/**`, `src/server/**`, `src/app/**`, `src/remote/**`,
+  `tests/fixtures/endpoint-*.json` have an empty diff for the whole epic.
+  The gateway speaks the frozen `TerminalHello`/`ObserveTerminal`/
   `ControlTerminal`/`Input`/`Resize`/`AttachScroll`/`Detach` messages and
-  the generation-1 endpoint handshake E1 already speaks, nothing else.
-- **Additive, mergeable code.** All new code is `src/gateway/**`, `web/**`,
-  `scripts/fork/ws-client.py`, `scripts/fork/systemd/**`, `tests/
-  fork_gateway.rs`, `tests/support/gateway.rs`, `docs/fork/**`. Upstream
-  edits are limited to the list in *Sequencing hazards*; each is a handful
-  of lines and lands in exactly one PR. No E2 file is edited.
+  the generation-1 endpoint handshake E1 already speaks (now with
+  `surface_active: false`, an existing optional field), nothing else.
+- **Additive, mergeable code.** All new code is `src/gateway/**`,
+  `src/fleet/{machines,hosts_source}.rs`, `web/**`,
+  `scripts/fork/ws-client.py`, `scripts/fork/systemd/**`,
+  `tests/fork_gateway.rs`, `tests/support/gateway.rs`, `docs/fork/**`.
+  Upstream edits are limited to the list in *Sequencing hazards*; each is a
+  handful of lines and lands in exactly one PR.
 - **Security (roadmap principles 3 and 7) is not negotiable:** loopback
   default; non-loopback bind refused without `allowed_origins`; tokens
   `0600` under `<config>/gateway/` (`0700`), verified before use and refused
@@ -577,16 +794,22 @@ CI gotchas to expect:
   reachable from the gateway in E3 (no `pane.close`, no `server.stop`).
 - **State is separated from runtime; render is pure.** `src/gateway/auth.rs`
   (token digests, device records, pairing codes, `AuthLimiter`, bind/origin
-  policy) and `src/gateway/protocol.rs` (message shapes, the binary frame
-  header) are pure, sync, testable without sockets or a runtime; only
-  `fleet.rs`, `terminal.rs`, `server.rs` and the handlers touch tokio, axum
-  or streams. `FleetState` stays the single source of truth; the gateway
-  keeps no second copy of hosts or agents.
+  policy), `src/gateway/protocol.rs` (message shapes, the binary frame
+  header) and `src/fleet/machines.rs` are pure, sync, testable without
+  sockets or a runtime; only `fleet.rs`, `terminal.rs`, `server.rs` and the
+  handlers touch tokio, axum or streams. `FleetState` stays the single
+  source of truth; the gateway keeps no second copy of hosts or agents.
 - **Host failure is local.** An unavailable host is data in `/api/fleet` and
   a `host_connection` delta, never a 5xx; a terminal open on a down host is
   a `terminal.error` on that socket only; a slow browser stalls its own
-  terminal session only. Nothing in the gateway calls `std::process::exit`
+  terminal session only; a hung ssh probe blocks only that host's
+  supervisor thread. Nothing in the gateway calls `std::process::exit`
   after startup or panics because of what a host or a client sent.
+- **Passive by construction.** The gateway never calls `set_active`,
+  `set_active_geometry` or sends a `ClientShellResize`; its aggregator hello
+  is `read_only` (`surface_active: false`, 120×40); its terminal streams are
+  separate observe/control connections that own exactly the semantics the
+  server gives them.
 - **Multiplicative-perf discipline.** Broadcast fan-out is × subscribers
   per change: serialize each `FleetChange` **once** (`Arc<str>`) and clone
   the pointer. `/api/fleet` costs one `from_state` per request (O(hosts ×
@@ -601,10 +824,12 @@ CI gotchas to expect:
   `tracing` (`target: "gateway"`) for logs; `#[allow]` only with a reason;
   platform code compile-gated; no dependency beyond PR 1's five;
   protocol-version untouched.
-- **Docs.** `docs/fork/gateway.md` (PR 9) is the only reference for
-  `[gateway]` keys, the HTTP/WS contract and the token files; every earlier
-  PR adds its keys/endpoints to a running *Reference notes* list in its PR
-  body so PR 9 needs no re-derivation. Never edit `docs/next/**`, root
+- **Docs.** `docs/fork/gateway.md` (PR 10) is the only reference for
+  `[gateway]` keys, the HTTP/WS contract and the token files;
+  `docs/fork/fleet-core.md` stays the only reference for `[fleet]` (PRs 3
+  and 9 update it in the same PR as the behaviour). Every earlier PR adds
+  its keys/endpoints to a running *Reference notes* list in its PR body so
+  PR 10 needs no re-derivation. Never edit `docs/next/**`, root
   `README.md`, `CHANGELOG.md`.
 - **Commits.** Lowercase conventional subjects from the allowed types, the
   `Co-Authored-By`/`Claude-Session` trailers, no `refs #<n>`. Branches
@@ -633,14 +858,17 @@ both feature sets from this PR on. Later PRs are dependency-free.
   run_gateway_command(args: &[String]) -> io::Result<i32>` (usage on
   stderr + exit 2 for everything except `help` → 0), `GATEWAY_USAGE`.
 - `src/main.rs` *(upstream file — minimal wiring)*: `#[cfg(feature =
-  "gateway")] mod gateway;` after `mod fleet;`; `#[cfg(feature = "gateway")]
-  "gateway",` in the bare-command allowlist; a gated `println!("       herdr
-  gateway [--bind ADDR] …")` usage line next to the `fleet` one.
+  "gateway")] mod gateway;` after `mod fleet;` (`:25`); `#[cfg(feature =
+  "gateway")] "gateway",` in the bare-command allowlist (`:752-767`); a
+  gated `println!("       herdr gateway [--bind ADDR] …")` usage line next
+  to the `fleet` one (`:612`).
 - `src/cli.rs` *(upstream file — minimal wiring)*: `#[cfg(feature =
-  "gateway")] "gateway" => crate::gateway::run_gateway_command(&args[2..])?,`.
+  "gateway")] "gateway" => crate::gateway::run_gateway_command(&args[2..])?,`
+  next to `:117`.
 - `src/cli/spec.rs` *(upstream file — minimal wiring)*: `fn
-  gateway_command() -> Command` (gated) and a gated `.subcommand(…)`; keep
-  the three spec invariants green under both feature sets.
+  gateway_command() -> Command` (gated, next to `fleet_command()` `:138`)
+  and a gated `.subcommand(…)` at `:34`; keep the three spec invariants
+  green under both feature sets.
 - `justfile` *(upstream file — minimal wiring)*: `lint-no-default` and
   `ci-no-default` recipes (below).
 - `.github/workflows/fork-ci.yml` (fork-owned): job
@@ -648,7 +876,8 @@ both feature sets from this PR on. Later PRs are dependency-free.
   (ubuntu-latest)`).
 - `docs/fork/README.md`: one row per upstream file in the fork-wiring table
   (`Cargo.toml` feature + deps, `justfile`, `src/main.rs`/`src/cli.rs`/
-  `src/cli/spec.rs` gateway arms) and the CI job in the CI table.
+  `src/cli/spec.rs` gateway arms) and the CI job in the CI table; fold the
+  duplicated `src/remote/attach.rs` row while there.
 
 **Shapes/approach**
 
@@ -682,8 +911,8 @@ dependency. Explicitly **not** added: `tower-http` (static files are ~40
 lines over an embedded table), `hyper`/`http` direct (reached as
 `axum::http`), `tokio-tungstenite` direct, `rand`, `base64`/`sha2` (already
 direct), `include_dir`, `url` (origins are parsed by hand: `scheme://host[:
-port]`, nothing else is accepted). Also decline the E3 deps that E6/E8 will
-need (`web-push` etc.) — one PR, one reason set.
+port]`, nothing else is accepted). Also decline the deps E6/E8 will need
+(`web-push` etc.) — one PR, one reason set.
 
 ```just
 [unix]
@@ -756,20 +985,23 @@ all testable without a socket or a runtime.
 **Files**
 
 - `src/config/model.rs` *(upstream file — minimal wiring)*: `GatewayConfig`
-  appended after `FleetConfig`, `pub gateway: GatewayConfig` as the last
-  field of `Config`, `impl Default`, `diagnostics()`.
+  appended after `FleetConfig` (`:979-1063`), `pub gateway: GatewayConfig`
+  as the new last field of `Config` (after `:323`), `impl Default`,
+  `diagnostics()`.
 - `src/config/io.rs` *(upstream file — minimal wiring)*: `"gateway"` in
-  `KNOWN_TOP_LEVEL_CONFIG_KEYS`; `load_live_section(table, "gateway", …)` +
-  `diagnostics.extend(config.gateway.diagnostics())` on the live path.
-- `src/config.rs` *(upstream file — minimal wiring)*: chain
-  `gateway.diagnostics()` in `collect_diagnostics` if the section list is
-  explicit there.
+  `KNOWN_TOP_LEVEL_CONFIG_KEYS` (`:7-21`); `load_live_section(table,
+  "gateway", …)` after `:360` + `diagnostics.extend(config.gateway.
+  diagnostics())` after `:363`.
+- `src/config.rs` *(upstream file — minimal wiring)*: `.chain(self.gateway.
+  diagnostics())` at the end of `collect_diagnostics` (`:117-130`).
 - `src/main.rs` *(upstream file — minimal wiring)*: a fully commented
-  `[gateway]` block in `DEFAULT_CONFIG` after `[fleet]`, plus
+  `[gateway]` block in `DEFAULT_CONFIG` after `[fleet]` (`:404-414`), plus
   `default_config_gateway_block_parses_without_diagnostics` and
-  `default_config_gateway_block_is_commented_out` mirroring the fleet tests.
+  `default_config_gateway_block_is_commented_out` mirroring the fleet tests
+  (`:910`, `:940`).
 - `scripts/config_reference_check.py` *(upstream file — minimal wiring)*:
-  `"gateway"` in `SKIPPED_SUBTREES` with the same fork comment as `fleet`.
+  `"gateway"` in `SKIPPED_SUBTREES` (`:36`) with the same fork comment as
+  `fleet`.
 - `src/gateway/auth.rs` (new, pure except the file I/O helpers):
   `TokenScope`, `TokenDigest`, `TokenStore`, `DeviceRecord`, `DeviceStore`,
   `PairingCode`, `PairingStore`, `AuthLimiter`, `Principal`.
@@ -918,24 +1150,53 @@ first consumed by PR 4).
 - File names under `<config>/gateway/` are fixed; E6 adds `vapid.json` and
   `subscriptions.json` beside them using the same `write_private_file`.
 
-### PR 3 — feat(gateway): async fleet runtime folding connector events into shared state · deps: 1
+### PR 3 — feat(gateway): passive async fleet runtime folding connector events into shared state · deps: 1
 
-**Goal:** the gateway's fleet half: start the E1 connector from config, fold
-every `FleetEvent::Host` into a shared `FleetState` from a tokio task,
-broadcast each `FleetChange` pre-serialized to any number of subscribers,
-serve `FleetStatusReport` on demand, and shut down cleanly — with no HTTP
-yet.
+**Goal:** the gateway's fleet half: start the E1 connector from config as a
+**passive daemon consumer** (`surface_active: false`, noninteractive ssh
+bridges), own its event receiver in a tokio task, fold every
+`FleetEvent::Host` into a shared `FleetState`, broadcast each `FleetChange`
+pre-serialized to any number of subscribers, serve `FleetStatusReport` on
+demand, and shut down cleanly — with no HTTP yet. The two fleet-side
+switches also fix the E1 caveats for `herdr fleet status`.
 
 **Files**
 
 - `src/gateway/fleet.rs` (new): `FleetRuntime`, `FleetHandle`,
   `ChangeStream`.
 - `src/gateway/mod.rs`: `mod fleet;` (+ narrow allow naming PR 4).
+- `src/fleet/handshake.rs` (fork file): `HandshakeParams.surface_active:
+  bool`; `read_only` sets `false`, `for_client` sets `true`;
+  `endpoint_handshake` writes `params.surface_active` instead of the literal
+  at `:140-144` (delete the "E3 may flip it" comment).
+- `src/fleet/connector.rs` (fork file): `FleetConnectorOptions.
+  ssh_noninteractive: bool` (default `false`), `for_daemon(&Config)`;
+  refresh the `INACTIVE_SURFACE` doc block (`:49-71`) — the foreground
+  caveat now applies only to servers older than #3670 or to `for_client`.
+- `src/fleet/transport/mod.rs` / `ssh.rs` (fork files): `transport_for`
+  passes `options.ssh_noninteractive`; `SshTransport::new(host, target,
+  session, manage_ssh_config, noninteractive)` stores it and hands it to
+  `SshStdioBridge::start_with` at `ssh.rs:177` (replacing the literal
+  `false`); `describe()` unchanged.
+- `src/fleet/oneshot.rs`: no change (`for_config` stays interactive; the
+  `read_only` flip reaches it automatically).
+- `docs/fork/fleet-core.md`: the "What the fleet never does" foreground
+  paragraph (`:544-557`) and "The ssh child inherits stderr" (`:507-514`)
+  rewritten to the new facts; "Driving the connector (E3)" (`:617-632`)
+  names `for_daemon` and `take_events`.
 
 **Shapes/approach**
 
 ```rust
-pub struct FleetRuntime { task: JoinHandle<()>, stop: watch::Sender<bool>, handle: FleetHandle }
+// src/fleet/connector.rs (additive)
+pub struct FleetConnectorOptions { /* … */ pub ssh_noninteractive: bool }
+impl FleetConnectorOptions {
+    /// A daemon with no tty: ssh bridges run BatchMode with stderr discarded (attach.rs `bridge_connection`).
+    pub fn for_daemon(config: &Config) -> Self { Self { ssh_noninteractive: true, ..Self::for_config(config) } }
+}
+
+// src/gateway/fleet.rs
+pub struct FleetRuntime { task: JoinHandle<()>, stop: watch::Sender<bool>, connector: FleetConnector, handle: FleetHandle }
 #[derive(Clone)]
 pub struct FleetHandle {
     state: Arc<Mutex<FleetState>>,                 // std Mutex; never held across .await
@@ -944,10 +1205,10 @@ pub struct FleetHandle {
 }
 impl FleetRuntime {
     /// resolve_hosts(&config.fleet) → FleetState::new(specs) (active host cleared, as `herdr fleet status` reports)
-    /// → FleetConnector::start(specs, FleetConnectorOptions::for_config(config)) → spawn the fold task.
+    /// → FleetConnector::start(specs, FleetConnectorOptions::for_daemon(config)) → take_events() → spawn the fold task.
     pub fn start(config: &Config) -> Result<Self, Vec<String>>      // Err = [fleet] diagnostics (exit 1 in PR 4)
     pub fn handle(&self) -> FleetHandle
-    /// Signal stop, await the task, then `connector.shutdown()` (blocking, run in spawn_blocking).
+    /// Signal stop, await the task (which drops the receiver), then `connector.shutdown()` in spawn_blocking.
     pub async fn shutdown(self)
 }
 impl FleetHandle {
@@ -962,21 +1223,29 @@ pub enum ChangeItem { Change(Arc<str>), Lagged }
 impl ChangeStream { pub async fn next(&mut self) -> Option<ChangeItem> }   // None when the runtime stopped
 ```
 
-The fold task: `loop { select! { _ = stop.changed() => break, ev =
-connector.events().recv() => match ev { Some(FleetEvent::Host{host, event})
-=> { let changes = state.lock().apply(&host, event); for c in changes {
-let _ = changes_tx.send(serde_json::to_string(&c)?.into()); } } Some(_) =>
-{} /* notifications/endpoint responses: ignored in E3 */ None => break } }
-}`. Because the connector is owned by the task, `shutdown` sends the stop
-signal, awaits the task (which returns the connector), then runs
-`connector.shutdown()` inside `spawn_blocking` so the forward sockets are
-unlinked even when no HTTP request is in flight. `report()` calls
-`set_active_host(None)` once at construction so `active_host` is `null`
-exactly as `herdr fleet status --json` prints it. Nothing here imports
-axum.
+The fold task owns `events: mpsc::Receiver<FleetEvent>` from
+`take_events()` and loops `select! { _ = stop.changed() => break, ev =
+events.recv() => match ev { Some(FleetEvent::Host{host, event}) => { let
+changes = state.lock().apply(&host, event); for c in changes { let _ =
+changes_tx.send(serde_json::to_string(&c)?.into()); } } Some(_) => {}
+/* surfaces never arrive (no active host); notifications/endpoint responses
+are ignored in E3 */ None => break } }` and drops the receiver on exit.
+`shutdown` sends the stop signal, awaits the task, then runs
+`connector.shutdown()` inside `spawn_blocking` (bounded 2 s) so a request in
+flight never blocks the runtime. `set_active_host(None)` once at
+construction so `active_host` is `null` exactly as `herdr fleet status
+--json` prints it. Nothing here imports axum.
 
 **Tests** (in-crate; `#[cfg(all(test, unix))]` for the socket ones)
 
+- `handshake.rs`: `read_only(..).surface_active == false`,
+  `for_client(..).surface_active == true`; against a fake listener the hello
+  JSON carries `"surface_active":false` for `read_only` (decode the
+  `EndpointControl` data as `EndpointClientHello`).
+- `connector.rs`/`ssh.rs`: `for_daemon` sets `ssh_noninteractive`; with the
+  existing `fake_ssh` shim, a transport built with `noninteractive: true`
+  records `-o BatchMode=yes` in its trace and one built with `false` does
+  not; `FleetConnectorOptions::default().ssh_noninteractive == false`.
 - Pure fan-out: with a `FleetState::test_new()` behind a `FleetHandle`
   built by a test constructor, applying a synthetic `HostEvent::Connected`
   + `Snapshot` yields the serialized `host_connection`/`snapshot`/
@@ -986,24 +1255,27 @@ axum.
   with a spawned applier).
 - Lag: a subscriber that stops reading past the capacity gets `Lagged`
   then resumes.
-- Against real sockets, the `src/fleet/oneshot.rs` idiom (a throwaway
-  `XDG_CONFIG_HOME`, `bind_local_listener` on the session's client-socket
-  path, a fake endpoint that answers the generation-1 hello and sends one
-  snapshot): `FleetRuntime::start` reports the host `connected`, the
-  subscriber receives `host_connection` + `snapshot`; killing the fake
-  listener yields `unavailable`; `shutdown().await` completes within 3 s.
+- Against real sockets, the `connector.rs` `test_support::FakeHost` idiom:
+  `FleetRuntime::start` reports the host `connected`, the subscriber
+  receives `host_connection` + `snapshot`, the fake host's received hello
+  has `surface_active == false`; killing the fake yields `unavailable`;
+  `shutdown().await` completes within 3 s and the fake saw the half-close.
 - `start` on a `[fleet]` naming `local` while `include_local = true` →
   `Err(diagnostics)`.
 
 **Real-server validation**
 
-No CLI surface yet; prove it with the socket-level test above plus one
-throwaway binary-free check that the connector path is untouched:
+No CLI surface yet; prove passivity and the unchanged status path against
+the lab (the pane geometry lever is `[server] headless_cols/rows`, applied
+live by `server reload-config`):
 
 ```bash
 cargo build && bash scripts/fork/fleet-lab.sh up 2 && eval "$(bash scripts/fork/fleet-lab.sh env)"
 H="env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH -u HERDR_ENV target/debug/herdr"
 cat >> "$XDG_CONFIG_HOME/herdr-dev/config.toml" <<'EOF'
+[server]
+headless_cols = 100
+headless_rows = 30
 [fleet]
 include_local = false
 [[fleet.hosts]]
@@ -1015,26 +1287,46 @@ name = "lab-2"
 kind = "local"
 session = "lab-2"
 EOF
-$H fleet status --json | python3 -c 'import json,sys;r=json.load(sys.stdin);print(r["schema"],[(h["id"],h["connection"]["state"]) for h in r["hosts"]])'
+$H --session lab-1 server reload-config; sleep 1
+$H --session lab-1 pane run "$HERDR_FLEET_LAB_PANE_1" 'stty size'; sleep 1
+$H --session lab-1 pane read "$HERDR_FLEET_LAB_PANE_1" --source recent | grep -c '^30 100$'      # 1 — the lab pane is 100x30
+$H fleet status --watch --json --timeout-ms 3000 > /tmp/e3-pr3-watch.ndjson & W=$!; sleep 2      # a passive reader is attached
+$H --session lab-1 pane run "$HERDR_FLEET_LAB_PANE_1" 'stty size'; sleep 1
+$H --session lab-1 pane read "$HERDR_FLEET_LAB_PANE_1" --source recent | grep -c '^30 100$'      # 2 — still 100x30 (a 120x40 foreground client would print "40 120")
+kill -INT $W; wait $W
+head -1 /tmp/e3-pr3-watch.ndjson | python3 -c 'import json,sys;r=json.load(sys.stdin);print(r["schema"],[(h["id"],h["connection"]["state"]) for h in r["hosts"]])'
 # → herdr.fleet.status.v1 [('lab-1','connected'),('lab-2','connected')]  (unchanged by this PR)
-bash scripts/fork/gate.sh <worktree> "test-one gateway::fleet"           # EXIT=0
-bash scripts/fork/fleet-lab.sh down
+# ssh: BatchMode is visible in the ssh child's argv while a daemon-mode consumer is connected (skip with a note if ssh-lab.sh up exits 3)
+bash scripts/fork/ssh-lab.sh up && eval "$(bash scripts/fork/ssh-lab.sh env)"
+printf '[[fleet.hosts]]\nname = "lab-ssh"\nkind = "ssh"\ntarget = "herdr-ssh-lab"\nsession = "lab-1"\n' >> "$XDG_CONFIG_HOME/herdr-dev/config.toml"
+HOME=$HERDR_SSH_LAB_HOME $H fleet status --json | python3 -c 'import json,sys;r=json.load(sys.stdin);print([(h["id"],h["connection"]["state"]) for h in r["hosts"]])'   # lab-ssh connected (interactive path, unchanged)
+bash scripts/fork/gate.sh <worktree> "test-one gateway::fleet"           # EXIT=0 (the daemon path is covered by the fake_ssh trace test)
+bash scripts/fork/ssh-lab.sh down; bash scripts/fork/fleet-lab.sh down
 ```
 
-Evidence: the unchanged status line and the `test-one` `EXIT=0`.
+Evidence: the two `grep -c` lines (`1`, then `2`), the unchanged status
+line, the ssh host `connected`, and the `test-one` `EXIT=0`. Record in the
+PR body that on `master` before this PR the second grep prints `1` and the
+pane shows `40 120` (the E1 caveat reproduced, then fixed).
 
 **Downstream**
 
 - `FleetHandle` is the only way handlers reach fleet data; PR 4 serves
   `report()`, PR 5 uses `subscribe_with_report`, PR 6 uses
-  `host_connection`/`host_spec` to fail fast and to build transports, E7
-  adds `request(host, …)` here (through the connector's `send`, which then
-  needs the handle to own a `FleetConnector` reference — E7 decides).
+  `host_connection`/`host_spec` to fail fast and to build transports, PR 9
+  swaps `resolve_hosts(&config.fleet)` for `fleet::hosts_source::
+  hosts_for_config(config)` in `start`, E7 adds `request(host, …)` here
+  through `FleetRuntime.connector.send`.
 - The broadcast payload is the `FleetChange` JSON verbatim; PR 5 wraps
   nothing around it. New change kinds arrive automatically; readers skip
   unknown `kind`s.
-- If E2 PR 1 has landed, `take_events()` replaces `events()` here with no
-  other change.
+- `FleetConnectorOptions::for_daemon` is the gateway's only options
+  constructor (PR 6's `HostTransports` reuses the same value so terminal
+  bridges are noninteractive too). `read_only` is passive from now on; a
+  future console consumer must use `for_client`.
+- The passivity guarantee is server-side (`surface_active`); the residual
+  for a pre-#3670 server is documented in `fleet-core.md`, not worked
+  around.
 
 ### PR 4 — feat(gateway): herdr gateway serves health, fleet report and embedded assets over http · deps: 2, 3
 
@@ -1061,9 +1353,9 @@ network surface, loopback by default, with graceful shutdown.
   (title, the E4 note, a `<script>` that fetches `/api/gateway` and prints
   `paired as <scope>` or `not paired — run: herdr gateway pair`).
 - `build.rs` *(upstream file — minimal wiring)*: `println!("cargo:rerun-if-
-  changed=web/dist");`.
+  changed=web/dist");` next to the existing `rerun-if-changed` lines.
 - `tests/support/gateway.rs` (new) + one `pub mod gateway;` line in
-  `tests/support/mod.rs` *(upstream file — minimal wiring)*:
+  `tests/support/mod.rs` *(upstream file — minimal wiring)* after `:11`:
   `Gateway::spawn(lab: &Lab, extra_config: &str) -> Gateway` (writes
   `[fleet]` for the lab sessions + `[gateway]`, runs `herdr gateway --bind
   127.0.0.1:0` with the lab env, parses `listening on …` from stdout,
@@ -1078,7 +1370,7 @@ network surface, loopback by default, with graceful shutdown.
 // run.rs
 struct RunArgs { bind: Option<SocketAddr>, config: Option<PathBuf> }
 pub(crate) fn run(args: &[String]) -> io::Result<i32>
-// 1. --config → std::env::set_var(CONFIG_PATH_ENV_VAR, path) before anything else (decision (m))
+// 1. --config → std::env::set_var(config::CONFIG_PATH_ENV_VAR, path) before anything else (decision (m))
 // 2. Config::load(); print diagnostics; [gateway] invalid → exit 1
 // 3. bind = args.bind.or(config.gateway.bind_addr()); BindPolicy::check → exit 1 with the message
 // 4. TokenStore::load_or_create(gateway_dir()) → exit 1 on a refused mode
@@ -1133,17 +1425,14 @@ stop, `warn` for auth failures (peer + reason, never the credential),
 
 **Tests**
 
-- In-crate, `axum::Router` driven with `tower::ServiceExt::oneshot` (via
-  `axum::body`; no extra dep — `tower` is reachable as a transitive dep of
-  axum only if re-exported; if not, use `axum_test`-free approach: bind on
-  `127.0.0.1:0` inside the test and use `std::net::TcpStream` GETs): each
-  handler with a `FleetHandle` built from `FleetState::test_new()`:
-  `/health` 200 without auth; `/api/fleet` 401 without, 200 with the read
-  token, 200 with control, 403 with a foreign origin, 429 after 5 bad
-  tokens from one peer and still 401 (not 429) from another peer; `/`
-  serves `index.html` with `text/html`; `/nope.png` 404; `/settings`
-  (no extension) → `index.html`; `Authorization: Bearer` with a query-string
-  token is ignored (401).
+- In-crate: bind the router on `127.0.0.1:0` inside a `#[tokio::test]` and
+  drive it with `std::net::TcpStream` GETs (no `tower` dev-dependency) with
+  a `FleetHandle` built from `FleetState::test_new()`: `/health` 200
+  without auth; `/api/fleet` 401 without, 200 with the read token, 200 with
+  control, 403 with a foreign origin, 429 after 5 bad tokens from one peer
+  and still 401 (not 429) from another peer; `/` serves `index.html` with
+  `text/html`; `/nope.png` 404; `/settings` (no extension) → `index.html`;
+  a query-string token is ignored (401).
 - `parse_run_args`: `--bind`, `--bind=`, `--config`, bad address → usage
   error 2.
 - `tests/fork_gateway.rs`: `gateway_serves_health_and_fleet_for_the_lab`
@@ -1187,6 +1476,9 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Origin: https://evil.example' -o /
 curl -s -H "Authorization: Bearer $TOKEN" -H 'Origin: http://127.0.0.1:7788' -o /dev/null -w '%{http_code}\n' http://127.0.0.1:7788/api/fleet  # 200
 for i in 1 2 3 4 5 6; do curl -s -o /dev/null -w '%{http_code} ' -H 'Authorization: Bearer 00' http://127.0.0.1:7788/api/fleet; done; echo   # 401 ×5 then 429
 curl -s -o /dev/null -w '%{http_code} %{content_type}\n' http://127.0.0.1:7788/   # 200 text/html
+# passive: the gateway holds both hosts, yet the lab pane keeps its own geometry
+$H --session lab-1 pane run "$HERDR_FLEET_LAB_PANE_1" 'stty size'; sleep 1
+$H --session lab-1 pane read "$HERDR_FLEET_LAB_PANE_1" --source recent | tail -3     # 40 120 (the lab's own headless default; unchanged with the gateway attached)
 # host failure is local: stop lab-2, the report shows it unavailable and lab-1 still connected
 $H --session lab-2 session stop lab-2; sleep 2
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7788/api/fleet | python3 -c 'import json,sys;r=json.load(sys.stdin);print([(h["id"],h["connection"]["state"]) for h in r["hosts"]])'
@@ -1197,7 +1489,7 @@ bash scripts/fork/fleet-lab.sh down
 ```
 
 Evidence: the status codes in order, the two `python3` lines, the `ls -l`
-modes, the exit lines. Paste no token.
+modes, the `stty size` line, the exit lines. Paste no token.
 
 **Downstream**
 
@@ -1272,12 +1564,9 @@ exit 0 on close/--max-messages, 2 on handshake failure (prints the HTTP status),
 
 **Tests**
 
-- In-crate (`#[tokio::test]` against a bound `127.0.0.1:0` router, client =
-  `tokio_tungstenite` is *not* available directly — use the axum-side
-  `WebSocket` only through a hand-written minimal client over
-  `tokio::net::TcpStream` in the test module, or drive `run_events` with a
-  fake `WebSocket`-like sink behind a small trait `EventSink` so the
-  ordering logic is tested without sockets): hello → fleet → change order;
+- In-crate: drive `run_events` through a small `EventSink` trait (the axum
+  `WebSocket` and a `Vec<String>` test sink both implement it) so the
+  ordering logic is tested without sockets: hello → fleet → change order;
   `Lagged` produces `resync` then `fleet`; the runtime stopping closes the
   socket.
 - `tests/fork_gateway.rs`: `events_stream_sends_report_then_host_delta`
@@ -1335,16 +1624,16 @@ messages with backpressure; `terminal.resize`/`terminal.scroll`/
 - `src/gateway/protocol.rs`: `TerminalOpen`, `TerminalReady`,
   `TerminalClosed`, `TerminalError { code, message }`, `FRAME_HEADER_LEN =
   14`, `encode_frame(&TerminalFrame) -> Vec<u8>`, `decode_frame_header`.
-- `src/fleet/transport/ssh.rs` (fork file, E1's; not owned by E2):
-  `SshTransport::new_scoped(host, target, session, manage_ssh_config,
-  scope: &str)` — `new` becomes `new_scoped(…, "")`-with-host semantics,
-  i.e. the existing socket names are byte-identical.
+- `src/fleet/transport/ssh.rs` (fork file): `SshTransport::new_scoped(host,
+  target, session, manage_ssh_config, noninteractive, scope: &str)` — `new`
+  becomes `new_scoped(…, "")`-with-host semantics, i.e. the existing socket
+  names are byte-identical.
 - `src/fleet/transport/mod.rs`: `transport_for_scoped(spec, options, scope)`;
   `transport_for` delegates with the E1 scope.
 - `src/client/terminal_sessions.rs` *(upstream file — minimal wiring)*:
   `pub(super)` → `pub(crate)` on `terminal_control_command_from_json`
-  (one word; the JSON command vocabulary must stay byte-identical to the
-  CLI's).
+  (`:208`, one word; the JSON command vocabulary must stay byte-identical
+  to the CLI's).
 - `src/gateway/server.rs`: `.merge(terminal::routes())`; `features` gains
   `"terminal"`.
 - `tests/fork_gateway.rs`: the observe test.
@@ -1353,14 +1642,15 @@ messages with backpressure; `terminal.resize`/`terminal.scroll`/
 
 ```rust
 // transports.rs
-pub struct HostTransports { specs: HashMap<HostId, HostSpec>, options: FleetConnectorOptions,
+pub struct HostTransports { specs: HashMap<HostId, HostSpec>, options: FleetConnectorOptions /* for_daemon */,
                             open: Mutex<HashMap<HostId, Arc<Mutex<Box<dyn HostTransport>>>>> }
 impl HostTransports {
     pub fn connect(&self, host: &HostId) -> io::Result<LocalStream>   // blocking; run in spawn_blocking
     pub fn shutdown(&self)                                            // drop transports (after every session stream is closed)
 }
 // scope passed to transport_for_scoped is "gateway" → forward socket
-//   /tmp/herdr-remote-<pid>-gateway-<host>-<target>-<session>.sock (distinct from the connector's)
+//   /tmp/herdr-remote-<pid>-gateway-<host>-<target>-<session>.sock (distinct from the connector's);
+//   the bridge is noninteractive (options.ssh_noninteractive), so no ssh output ever reaches the daemon's stderr
 
 // terminal.rs
 pub fn routes() -> Router<AppState> { Router::new().route("/api/terminal/{host}/{pane}", get(terminal_ws)) }
@@ -1395,8 +1685,10 @@ coalesces, so memory per session is bounded by two frames. Session
 cardinality is logged at `info` on open/close with `host`/`pane`/`mode`,
 never bytes. `terminal.scroll` in observe mode: PR 6 verifies against the
 live server whether `AttachScroll` from a `TerminalObserve` client moves the
-observer's virtual viewport; if the server ignores it, the gateway answers
-`terminal.error {code:"unsupported"}` and the doc says so.
+observer's client-local viewport; if the server ignores it, the gateway
+answers `terminal.error {code:"unsupported"}` and the doc says so. An
+observer's `terminal.resize` is client-local by server design
+(`headless.rs:2205-2222`): every observer gets its own viewport size.
 
 **Tests**
 
@@ -1408,14 +1700,15 @@ observer's virtual viewport; if the server ignores it, the gateway answers
 - `transport_for_scoped` with an ssh spec derives a forward socket path
   that differs from `transport_for`'s and both differ from `--remote`'s
   unscoped name (unit test in `transport/ssh.rs` next to E1's, using the
-  existing fake-ssh shim for a full connect if cheap).
+  existing `fake_ssh` shim for a full connect if cheap; the shim trace
+  shows `BatchMode=yes` for the gateway's options).
 - Socket-level (`#[cfg(all(test, unix))]`): a fake terminal server
-  (`bind_local_listener` under a throwaway `XDG_CONFIG_HOME`) that answers
-  `TerminalHello` with `Welcome{TerminalAnsi}`, expects `ObserveTerminal
-  {target}` and emits two `Terminal` frames then `ServerShutdown`:
-  `TerminalSession` yields the frames in order and ends; `Detach` from the
-  writer arrives at the fake server; a fake that answers `Welcome{error}`
-  yields an `io::Error` naming it.
+  (`bind_private_local_listener` under a throwaway `XDG_CONFIG_HOME`) that
+  answers `TerminalHello` with `Welcome{TerminalAnsi}`, expects
+  `ObserveTerminal {target}` and emits two `Terminal` frames then
+  `ServerShutdown`: `TerminalSession` yields the frames in order and ends;
+  `Detach` from the writer arrives at the fake server; a fake that answers
+  `Welcome{error}` yields an `io::Error` naming it.
 - `tests/fork_gateway.rs`: `terminal_observe_streams_marker_pane_frames`
   (lab up 2; `ws-client.py … /api/terminal/lab-2/<pane_2 id> --send
   '{"type":"terminal.open","mode":"observe","cols":80,"rows":24}'
@@ -1456,17 +1749,20 @@ sleep 1; $H --session lab-1 pane run "$HERDR_FLEET_LAB_PANE_1" 'echo hello-from-
 # many observers, no ownership: three concurrent clients on the same pane all get ready + a full frame
 # ssh host (skip with a note if ssh-lab.sh up exits 3): [fleet] lab-ssh = kind "ssh", target "herdr-ssh-lab", session "lab-1"
 bash scripts/fork/ssh-lab.sh up && eval "$(bash scripts/fork/ssh-lab.sh env)"
-HOME=$HERDR_SSH_LAB_HOME $H gateway --bind 127.0.0.1:7788 & GW=$!; sleep 5
+HOME=$HERDR_SSH_LAB_HOME $H gateway --bind 127.0.0.1:7788 2>/tmp/e3-pr6-gw.err & GW=$!; sleep 5
 ls /tmp/herdr-remote-$GW-* ; ls /tmp/herdr-remote-$GW-gateway-* 2>/dev/null   # connector socket(s) and, only after a terminal opens, the gateway-scoped one
 python3 scripts/fork/ws-client.py "ws://127.0.0.1:7788/api/terminal/lab-ssh/$HERDR_FLEET_LAB_PANE_1" -H "Authorization: Bearer $TOKEN" \
   --send '{"type":"terminal.open","mode":"observe","cols":80,"rows":24}' --max-messages 2 --binary len          # ready + full frame over ssh
+ps -o args= -p "$(pgrep -f 'ssh .*-T herdr-ssh-lab' | head -1)" | grep -c 'BatchMode=yes'                        # 1 — the bridge child runs noninteractive
 kill -TERM $GW; wait $GW; echo "exit=$?"; ls /tmp/herdr-remote-$GW-* 2>&1        # exit=0 within 5 s; no sockets left
+grep -c '' /tmp/e3-pr6-gw.err                                                    # 0 lines from ssh on the daemon's stderr (tracing goes elsewhere)
 bash scripts/fork/ssh-lab.sh down; bash scripts/fork/fleet-lab.sh down
 ```
 
 Evidence: the `terminal.ready` line, the decoded header line with `marker`,
 the `forbidden` line and the `grep -c 0`, the `full=0` follow-up frame, the
-ssh forward-socket names before/after, exit 0 with no sockets left.
+ssh forward-socket names before/after, the `BatchMode` grep, exit 0 with no
+sockets left, the empty stderr capture.
 
 **Downstream**
 
@@ -1506,17 +1802,23 @@ ownership on `terminal.release`/close. `read` still cannot send a byte.
 `terminal.open { mode: "control", takeover: false }` requires
 `principal.scope.allows(Control)` (else `forbidden`, close 1008, counted as
 an auth failure for the limiter) and then `ControlTerminal { target: pane,
-takeover }` instead of `ObserveTerminal`. In control mode every CLI command
-is admitted: `terminal.input {text}` → `Input { data: text.into_bytes() }`,
-`{bytes: base64}` → decoded (≤ 64 KiB; the CLI's decoder), `terminal.resize`
-→ `Resize` (real PTY resize; `cell_*_px` 0), `terminal.scroll`,
-`terminal.release` → `Detach` + `terminal.closed {reason:"released"}` +
-close 1000. A `ServerShutdown` whose reason contains "already has an
-attached client" becomes `terminal.error {code:"busy", message}` so E4 can
-offer takeover. Nothing in E3 confirms destructive actions (there are none:
-input is exactly what the console sends when you type). Logging on open:
-`info` with `host`/`pane`/`mode`/`credential kind`; input bytes are never
-logged.
+takeover }` instead of `ObserveTerminal` — server-side this is the
+`TerminalAttach` mode, the single-owner slot. In control mode every CLI
+command is admitted: `terminal.input {text}` → `Input { data:
+text.into_bytes() }`, `{bytes: base64}` → decoded (≤ 64 KiB; the CLI's
+decoder), `terminal.resize` → `Resize` (real PTY resize; `cell_*_px` 0),
+`terminal.scroll`, `terminal.release` → `Detach` + `terminal.closed
+{reason:"released"}` + close 1000. A `ServerShutdown` whose reason contains
+"already has an attached client" becomes `terminal.error {code:"busy",
+message}` so E4 can offer takeover; the server disconnects that connection
+(`headless.rs:1826-1838`), so the gateway closes the WebSocket with 1000
+after the error. A controller evicted by another's takeover receives the
+server's shutdown as `terminal.closed {reason:"taken_over"}` (the gateway
+classifies the reason text; anything else stays `terminal.closed
+{reason:<server text>}`). Nothing in E3 confirms destructive actions (there
+are none: input is exactly what the console sends when you type). Logging
+on open: `info` with `host`/`pane`/`mode`/`credential kind`; input bytes
+are never logged.
 
 **Tests**
 
@@ -1560,7 +1862,7 @@ sleep 1; python3 scripts/fork/ws-client.py "ws://127.0.0.1:7788/api/terminal/lab
   --send '{"type":"terminal.open","mode":"control","cols":80,"rows":24}' --max-messages 1                       # terminal.error busy
 python3 scripts/fork/ws-client.py "ws://127.0.0.1:7788/api/terminal/lab-1/$P1" -H "Authorization: Bearer $CTRL" \
   --send '{"type":"terminal.open","mode":"control","cols":80,"rows":24,"takeover":true}' --max-messages 2       # ready + frame
-wait $FIRST                                                                                                  # its last line: terminal.closed
+wait $FIRST                                                                                                  # its last line: terminal.closed reason=taken_over
 # a controller resize resizes the real PTY, an observer resize does not:
 python3 scripts/fork/ws-client.py "ws://127.0.0.1:7788/api/terminal/lab-1/$P1" -H "Authorization: Bearer $CTRL" \
   --send '{"type":"terminal.open","mode":"control","cols":60,"rows":20}' --send '{"type":"terminal.input","text":"stty size\n"}' --send '{"type":"terminal.release"}' --max-messages 4
@@ -1576,8 +1878,8 @@ Evidence: the pane greps (lab-1 ≥ 1, lab-2 0), the `forbidden`/`busy`/
   `POST /api/hosts/{host}/agents/{pane}/{prompt|keys|start|rename|close}`
   through the connector's endpoint lane, gated by the same
   `require(principal, Control)` plus `HostConnection::Connected.methods`.
-- `busy`/`takeover` semantics are the server's; E4 shows "take over" on
-  `busy`.
+- `busy`/`takeover`/`taken_over` semantics are the server's; E4 shows
+  "take over" on `busy` and a banner on `taken_over`.
 
 ### PR 8 — feat(gateway): pairing urls with qr codes, device cookies, status and token rotation · deps: 4
 
@@ -1684,7 +1986,147 @@ rotate lines, the `ls -l` modes. Never paste the URL or the cookie.
 - `herdr gateway status --json` fields are additive (`running`, `pid`,
   `listen`, `devices`, `pairings_pending`).
 
-### PR 9 — docs: gateway guide, systemd unit, adr e3 review, roadmap drift · deps: 5, 7, 8
+### PR 9 — feat(fleet): opt-in hosts from saved machine profiles · deps: 3
+
+**Goal:** decision (r): with `[fleet] include_machines = true`, every
+enabled machine saved by `herdr machine add` (upstream #3670's
+`endpoints.json`) becomes an ssh fleet host next to `[[fleet.hosts]]`, for
+both `herdr fleet status` and the gateway, through one shared resolver —
+without touching E1's keys or `resolve_hosts`.
+
+**Files**
+
+- `src/fleet/machines.rs` (new, pure — added to `PURE_MODULES` in
+  `src/fleet/mod.rs`): `MachineProfile`, `machine_host_id(label)`,
+  `machine_host_specs(profiles, existing) -> Result<Vec<HostSpec>,
+  Vec<String>>`.
+- `src/fleet/hosts_source.rs` (new, the only fleet module that names
+  `crate::client`): `hosts_for_config(&Config) -> Result<Vec<HostSpec>,
+  Vec<String>>`.
+- `src/fleet/mod.rs` (fork file): two `pub mod` lines; `machines` in
+  `PURE_MODULES`.
+- `src/fleet/oneshot.rs` (fork file): `FleetSession::start` calls
+  `hosts_for_config(config)` instead of `resolve_hosts(&config.fleet)`.
+- `src/gateway/fleet.rs`: the same one-line swap in `FleetRuntime::start`.
+- `src/config/model.rs` *(upstream file — minimal wiring)*: `FleetConfig.
+  include_machines: bool` (default `false`), no new diagnostic.
+- `src/main.rs` *(upstream file — minimal wiring)*: one commented line
+  `# include_machines = false` with a one-line comment in the `[fleet]`
+  block of `DEFAULT_CONFIG` (`:404-414`); the two fleet block tests still
+  pass unchanged.
+- `docs/fork/fleet-core.md`: the `[fleet]` key table (`include_machines`),
+  the quoted `DEFAULT_CONFIG` block, a short "Saved machines as hosts"
+  subsection (id derivation, diagnostics, `herdr machine rename` as the
+  fix), and the ssh-lab recipe below.
+- `tests/cli/fleet.rs`: one test writing `endpoints.json` under a throwaway
+  `XDG_STATE_HOME`.
+
+**Shapes/approach**
+
+```rust
+// src/fleet/machines.rs (pure)
+pub struct MachineProfile { pub label: String, pub target: String, pub session: String, pub enabled: bool }
+/// The label when `HostId::new` accepts it; otherwise lowercased with every run of other chars folded to '-'.
+pub fn machine_host_id(label: &str) -> Result<HostId, String>
+/// Appends one `HostKind::Ssh { target, session: Some(session) }` spec per profile, in catalog order.
+/// Diagnostics (all-or-nothing, like `resolve_hosts`): an id that still fails validation, an id equal to
+/// `HostId::LOCAL`, an id colliding with `existing` or with another machine — each names the machine label and
+/// says `rename it with: herdr machine rename <id> --label <valid-name>`.
+pub fn machine_host_specs(profiles: &[MachineProfile], existing: &[HostSpec]) -> Result<Vec<HostSpec>, Vec<String>>
+
+// src/fleet/hosts_source.rs (adapter)
+pub fn hosts_for_config(config: &Config) -> Result<Vec<HostSpec>, Vec<String>> {
+    let mut specs = resolve_hosts(&config.fleet)?;
+    if config.fleet.include_machines {
+        let profiles = crate::client::endpoint::EndpointCatalog::load_profiles()   // Err(String) → one diagnostic
+            .map_err(|e| vec![format!("saved machines unavailable: {e}")])?;
+        let profiles: Vec<MachineProfile> = profiles.iter().map(|p| MachineProfile { label: p.label.clone(),
+            target: p.target.clone(), session: p.session.clone(), enabled: p.enabled }).collect();
+        specs.extend(machine_host_specs(&profiles, &specs)?);
+    }
+    Ok(specs)
+}
+```
+
+A missing `endpoints.json` is an empty list, not an error (upstream's
+`load_from_path` already returns an empty catalog for an absent file —
+verify and pin with a test). Disabled machines appear as `enabled = false`
+hosts, exactly like `[[fleet.hosts]] enabled = false` (reported
+`unavailable: host disabled`). The report's `HostReport.kind` stays `"ssh"`;
+no new report field, so `/api/fleet` and `herdr.fleet.status.v1` are
+unchanged.
+
+**Tests**
+
+- Pure (`machines.rs`): `machine_host_id("workbox") == workbox`;
+  `"My Laptop (home)"` → `my-laptop-home`; `"///"` → diagnostic; `"local"`
+  → diagnostic naming the reserved id; two machines folding to the same id
+  → one diagnostic naming both; a collision with an existing
+  `[[fleet.hosts]]` name → diagnostic; order preserved; `enabled` carried.
+  `assert_invariants_for_test` on a `FleetState::new` built from the mixed
+  list.
+- `hosts_source.rs` (unix, throwaway `XDG_STATE_HOME`): `include_machines
+  = false` ignores an existing catalog; `true` with no file → only
+  `[[fleet.hosts]]`; `true` with two profiles → four specs; a corrupt file →
+  `Err` with one diagnostic.
+- `src/config/model.rs`: default `false`; parses `true`; `DEFAULT_CONFIG`
+  block tests unchanged.
+- `tests/cli/fleet.rs`: `fleet_status_includes_saved_machines_when_enabled`
+  — write `endpoints.json` (`{"version":1,"selected_profile":null,"ssh":
+  [{"id":"<32 hex>","label":"lab-ssh","target":"127.0.0.1","session":
+  "lab-1","enabled":true}]}`) under `XDG_STATE_HOME`, `[fleet]
+  include_machines = true`, `herdr fleet status --json` lists `lab-ssh` as
+  `kind == "ssh"` (state `unavailable` is fine — no sshd in this test).
+
+**Real-server validation**
+
+```bash
+cargo build && bash scripts/fork/fleet-lab.sh up 2 && eval "$(bash scripts/fork/fleet-lab.sh env)"
+bash scripts/fork/ssh-lab.sh up && eval "$(bash scripts/fork/ssh-lab.sh env)"          # exit 3 → record and run the unavailable-host variant below
+H="env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH -u HERDR_ENV target/debug/herdr"
+export XDG_STATE_HOME="$HERDR_FLEET_LAB_ROOT/state"; mkdir -p "$XDG_STATE_HOME/herdr-dev/client"
+ID=$(python3 -c 'import secrets;print(secrets.token_hex(16))')
+printf '{"version":1,"selected_profile":null,"ssh":[{"id":"%s","label":"Lab SSH","target":"herdr-ssh-lab","session":"lab-1","enabled":true}]}\n' "$ID" > "$XDG_STATE_HOME/herdr-dev/client/endpoints.json"
+chmod 600 "$XDG_STATE_HOME/herdr-dev/client/endpoints.json"
+cat >> "$XDG_CONFIG_HOME/herdr-dev/config.toml" <<'EOF'
+[fleet]
+include_local = false
+include_machines = true
+[[fleet.hosts]]
+name = "lab-2"
+kind = "local"
+session = "lab-2"
+EOF
+HOME=$HERDR_SSH_LAB_HOME $H machine list --json | python3 -c 'import json,sys;print([(m["label"],m["target"]) for m in json.load(sys.stdin)])'   # [('Lab SSH','herdr-ssh-lab')] — upstream reads the same file
+HOME=$HERDR_SSH_LAB_HOME $H fleet status --json | python3 -c 'import json,sys;r=json.load(sys.stdin);print([(h["id"],h["kind"],h["target"],h["connection"]["state"],[w["label"] for w in h["workspaces"]]) for h in r["hosts"]])'
+# → [('lab-2','local',None,'connected',['lab-2']),('lab-ssh','ssh','herdr-ssh-lab','connected',['lab-1'])]   (id derived from "Lab SSH")
+sed -i 's/"label":"Lab SSH"/"label":"lab-2"/' "$XDG_STATE_HOME/herdr-dev/client/endpoints.json"
+$H fleet status --json; echo "exit=$?"     # one diagnostic naming machine "lab-2" colliding with [[fleet.hosts]] lab-2 and the rename command; exit=1
+sed -i 's/include_machines = true/include_machines = false/' "$XDG_CONFIG_HOME/herdr-dev/config.toml"
+$H fleet status --json | python3 -c 'import json,sys;print([h["id"] for h in json.load(sys.stdin)["hosts"]])'   # ['lab-2'] — opt-in really is off by default
+bash scripts/fork/ssh-lab.sh down; bash scripts/fork/fleet-lab.sh down
+ls ~/.local/state/herdr*/client/endpoints.json 2>&1 | grep -c 'No such file\|herdr-fork-never-wrote-this'   # the user's real catalog was never created or touched (compare mtime if it exists)
+```
+
+Evidence: the `machine list` line, the two-host status line with the
+derived id, the collision diagnostic + `exit=1`, the opt-out line. If the
+gateway is already merged, also `GET /api/fleet` listing `lab-ssh` (the
+E2E validation covers it otherwise).
+
+**Downstream**
+
+- `hosts_for_config` is the one resolver for every fleet consumer; E5's
+  tailnet machines arrive through `herdr machine add <host>.<tailnet>.ts.net`
+  with no fleet change. E7 may key per-machine actions on the derived id.
+- The id derivation is frozen (label first, slug fallback); a future
+  `[[fleet.machines]] id = …` override is the escape hatch if a user needs a
+  stable id for a label they will not rename — not in E3.
+- The fork's only dependency on upstream's catalog is
+  `EndpointCatalog::load_profiles()` + five `SavedSshEndpoint` fields; a
+  sync that renames them breaks the build in `hosts_source.rs`, nowhere
+  else.
+
+### PR 10 — docs: gateway guide, systemd unit, adr e3 review, roadmap drift · deps: 5, 7, 8, 9
 
 **Goal:** the user-facing reference for everything E3 shipped, the example
 `systemd --user` unit, the ADR's E3 review, and factual drift fixed in the
@@ -1695,15 +2137,16 @@ roadmap's E3 section — plus the last janitoring (dead-code allows left for
 
 - `docs/fork/gateway.md` (new): what the gateway is, `[gateway]` keys
   (every key, type, default, diagnostics), running it (`herdr gateway`,
-  `--bind`, `--config`, loopback vs non-loopback, the foreground-client
-  geometry caveat and the "headless servers only" recommendation), tokens
-  and files under `<config>/gateway/` (modes, rotation, revocation),
-  pairing (`pair`, QR, cookie, TTL, one-time), `status`, the HTTP contract
+  `--bind`, `--config`, loopback vs non-loopback, the passive-reader
+  guarantee and the pre-#3670 residual, `include_machines`), tokens and
+  files under `<config>/gateway/` (modes, rotation, revocation), pairing
+  (`pair`, QR, cookie, TTL, one-time), `status`, the HTTP contract
   (`/health`, `/api/gateway`, `/api/fleet`, `/pair`, static assets), the
   WebSocket contracts (`herdr.fleet.events.v1` message order,
   `herdr.fleet.terminal.v1` including the binary header table and every
   `terminal.*` message with its fields and error codes), scopes and what
   `read` can never do, rate limiting, origin policy, shutdown behaviour,
+  ssh in daemon mode (BatchMode, discarded stderr, how failures surface),
   `scripts/fork/ws-client.py` usage, the systemd unit, troubleshooting
   (refused bind, 401/403/429, `busy`, ssh forward sockets). Real output
   from the lab pasted for `/api/fleet`, an events transcript and a decoded
@@ -1721,15 +2164,16 @@ roadmap's E3 section — plus the last janitoring (dead-code allows left for
   `tests/support/mod.rs`), and `check-no-default-features` in the CI table.
 - `docs/fork/decisions/0001-servers-stay-stock-ssh-transport.md`: an *E3
   review* subsection (what held, what was learned — expected: tokens on
-  loopback, the gateway as a permanent foreground client, the gateway-
-  scoped forward socket, backpressure through the server's render lane).
+  loopback, the passive hello, noninteractive bridges, the gateway-scoped
+  forward socket, backpressure through the server's render lane);
+  `0002-adopt-upstream-multi-machine-client.md`: one line closing the
+  "E3 decides" item with decision (r).
 - `docs/fork/ROADMAP.md`: factual drift in the **E3 section only** (e.g.
-  binary frames, `terminal.open`, `/api/gateway`, tokens on loopback); the
-  status row stays `implement-epic`'s.
+  binary frames, `terminal.open`, `/api/gateway`, tokens on loopback,
+  `include_machines`); the status row stays `implement-epic`'s.
 - `src/gateway/**`: remove any `#[allow(dead_code)]` whose named PR has
   landed; `src/fleet/hosts.rs` `HostId::as_str` allow (E1 PR 7 deferred it
-  to "the first later PR touching the file") only if E2 has not already
-  removed it.
+  to "the first later PR touching the file") if still present.
 
 **Tests** — docs-only PR: the gate (both feature sets) stays green;
 `shellcheck` unaffected; every command in `gateway.md` is re-run against
@@ -1752,41 +2196,57 @@ systemd-analyze --user verify scripts/fork/systemd/herdr-gateway.service; echo "
 
 ## Critical files referenced (reuse, don't reinvent)
 
-- `src/fleet/connector.rs` — `FleetConnector::{start, events, shutdown}`,
-  `FleetConnectorOptions::for_config`, `FleetEvent::Host`, `INACTIVE_SURFACE`
-  (never call `set_active`). `src/fleet/oneshot.rs` — the config → specs →
-  connector → state recipe (`FleetSession::start`) and the socket-level
-  fake-endpoint test idiom.
+- `src/fleet/connector.rs` — `FleetConnector::{start, take_events,
+  shutdown, send}`, `FleetConnectorOptions::{for_config, for_daemon}`,
+  `FleetEvent::Host`, `INACTIVE_SURFACE` (never call `set_active` or
+  `set_active_geometry`); `test_support::FakeHost` for socket-level tests.
+  `src/fleet/handshake.rs` — `HandshakeParams::read_only` (passive) and
+  `endpoint_handshake`. `src/fleet/oneshot.rs` — the config → specs →
+  connector → state recipe (`FleetSession::start`).
 - `src/fleet/state.rs` — `FleetState::{new, apply, set_active_host,
   merged_agents}`, `FleetChange` (tagged `kind`), `HostConnection`,
   `test_new`/`assert_invariants_for_test`. `src/fleet/report.rs` —
   `FleetStatusReport::from_state`, `FLEET_STATUS_SCHEMA`. `src/fleet/hosts.rs`
   — `HostId`, `HostSpec`, `resolve_hosts`. `src/fleet/refs.rs` —
-  `FleetPaneRef`, `is_valid_resource_id`.
+  `FleetPaneRef`, `is_valid_resource_id`. `src/fleet/mod.rs` — the purity
+  guard (`PURE_MODULES`, `FORBIDDEN`).
 - `src/fleet/transport/{mod,local,ssh}.rs` — `HostTransport`,
-  `transport_for`, `LocalTransport`, `SshTransport::new` (+ PR 6's
-  `new_scoped`); `src/remote/attach.rs::local_forward_socket_path_scoped`
-  semantics (only the empty scope is unscoped).
+  `transport_for`, `LocalTransport`, `SshTransport::new` (+ PR 3's
+  `noninteractive`, PR 6's `new_scoped`), `fake_ssh` shim;
+  `src/remote/attach.rs` (read-only) — `SshStdioBridge::start_with`
+  (`:1843`), `bridge_connection` stdio (`:2057-2072`),
+  `apply_noninteractive_ssh_options` (`:575`),
+  `local_forward_socket_path_scoped` (`:2320`; only the empty scope is
+  unscoped), `BridgeErrorSink` (`:1935`).
+- `src/client/endpoint/catalog.rs` (read-only) — `SavedSshEndpoint`,
+  `EndpointCatalog::load_profiles`, `catalog_path`; `src/cli/machine.rs`
+  (read-only) — the `herdr machine` surface PR 9's docs point at.
 - `src/protocol/wire.rs` (read-only) — `PROTOCOL_VERSION`, `MAX_FRAME_SIZE`,
   `ClientMessage::{TerminalHello, ObserveTerminal, ControlTerminal, Input,
   Resize, AttachScroll, Detach}`, `ServerMessage::{Welcome, Terminal,
   ServerShutdown}`, `TerminalFrame`, `RenderEncoding::TerminalAnsi`,
-  `write_message`/`read_message`. `src/client/terminal_sessions.rs` —
+  `write_message`/`read_message`. `src/protocol/endpoint.rs` (read-only) —
+  `EndpointClientHello.surface_active`. `src/client/terminal_sessions.rs` —
   `terminal_control_command_from_json` (the JSON command vocabulary) and
   the frame loop shape; `src/client/handshake.rs::do_handshake` as the
   reference for the two-frame terminal hello (re-implemented, not widened).
-- `src/ipc.rs` — `connect_local_stream`, `restrict_socket_permissions`
-  (unix/windows twin idiom). `src/pane_graphics_files.rs` — `0700`/`0600`
-  create-and-verify. `src/checksum.rs` — `sha2` usage.
-- `src/server/headless/bootstrap.rs:40` — the multi-thread runtime shape.
-  `src/server/headless.rs:1349,1760,2145` and `src/server/headless/tests/
-  mod.rs:3088-3440` (read-only) — observer/controller semantics the gateway
-  relies on.
+- `src/ipc.rs` — `connect_local_stream`, `bind_private_local_listener`,
+  `restrict_socket_permissions` (unix/windows twin idiom).
+  `src/pane_graphics_files.rs` — `0700`/`0600` create-and-verify.
+  `src/checksum.rs` — `sha2` usage.
+- `src/server/headless/bootstrap.rs:40-43` — the multi-thread runtime
+  shape. `src/server/headless.rs:1172, 1365-1400, 1826-1838, 2024,
+  2166-2223`, `src/server/headless/client_views.rs:708`,
+  `src/server/clients.rs:12-17`, `src/server/headless/render.rs:409-450,
+  633-651` and `src/server/headless/tests/mod.rs:3152` (read-only) —
+  passive-client, observer/controller and render-lane semantics the
+  gateway relies on.
 - `src/config/model.rs` (`FleetConfig` pattern), `src/config/io.rs`
   (`KNOWN_TOP_LEVEL_CONFIG_KEYS`, live-reload sections, `config_dir`,
+  `state_dir`), `src/config.rs` (`collect_diagnostics`,
   `CONFIG_PATH_ENV_VAR`), `src/main.rs` (`DEFAULT_CONFIG` + block tests,
-  bare-command list, usage), `src/cli.rs` / `src/cli/spec.rs` / `src/cli/
-  fleet.rs` (dispatch, spec, hand-parsed args, exit codes 0/1/2),
+  bare-command list, usage), `src/cli.rs` / `src/cli/spec.rs` /
+  `src/cli/fleet.rs` (dispatch, spec, hand-parsed args, exit codes 0/1/2),
   `src/build_info.rs` (`version()`, `is_fork()`).
 - `tests/support/mod.rs`, `tests/support/fleet_lab.rs` (`Lab`),
   `tests/cli/fleet.rs` (`[fleet]` fixture), `tests/fork_fleet_lab.rs`
@@ -1797,15 +2257,17 @@ systemd-analyze --user verify scripts/fork/systemd/herdr-gateway.service; echo "
   separation, multiplicative paths, runtime/client boundary, stable
   endpoint contract), Testing, Code Conventions; `.claude/rules/fork.md`;
   `docs/fork/ROADMAP.md` principles 1–8 and the E3 section;
-  `docs/fork/decisions/0001-…md` (E0 and E1 reviews);
+  `docs/fork/decisions/0001-…md` (E0 and E1 reviews) and `0002-…md` (the
+  sync policy, the E1 hooks, the `surface_active` and stderr notes);
   `docs/fork/plans/e1-fleet-core.md` Downstream sections and
   `docs/fork/plans/e2-fleet-tui.md` PR 1 Downstream (the connector surface
-  E2 keeps for E3); `docs/fork/fleet-core.md` "Driving the connector (E3)".
+  #23 kept: `for_client`, `take_events`, `set_active_geometry`);
+  `docs/fork/fleet-core.md` "Driving the connector (E3)".
 
 ## End-to-end epic validation
 
 After every PR is ✅, `implement-epic` proves the epic against real servers
-(debug build, isolated lab; `ssh-lab.sh` exit 3 degrades the ssh step to a
+(debug build, isolated lab; `ssh-lab.sh` exit 3 degrades the ssh steps to a
 recorded skip):
 
 1. **Both builds.** `bash scripts/fork/gate.sh . ci` and `bash
@@ -1813,25 +2275,34 @@ recorded skip):
    --no-default-features && target/debug/herdr gateway; echo $?` → `unknown
    command: gateway`, 2; `cargo build && target/debug/herdr --version` →
    `herdr 0.8.2-fork`.
-2. **Fleet of three.** `fleet-lab.sh up 2` + `ssh-lab.sh up`; `[fleet]`
-   with `lab-1` (local), `lab-2` (local), `lab-ssh` (`kind = "ssh"`,
-   `target = "herdr-ssh-lab"`, `session = "lab-1"`), `include_local =
-   false`; `HOME=$HERDR_SSH_LAB_HOME $H gateway --bind 127.0.0.1:7788 &`.
-   `curl /health` → 200 without a token; `/api/fleet` → 401 bare, 200 with
-   the read token, `hosts` = `lab-1`/`lab-2`/`lab-ssh` all `connected`,
-   `workspaces[0].label` = `lab-1`/`lab-2`/`lab-1`, `agents == []`;
-   `/api/gateway.features` ⊇ `["fleet","events","terminal","pairing"]`.
+2. **Fleet of three, two sources.** `fleet-lab.sh up 2` + `ssh-lab.sh up`;
+   `[fleet]` with `lab-1` (local), `lab-2` (local), `include_local =
+   false`, `include_machines = true`, and a saved machine `Lab SSH`
+   (`herdr-ssh-lab`, session `lab-1`) written to `endpoints.json` under the
+   lab's `XDG_STATE_HOME`; `HOME=$HERDR_SSH_LAB_HOME $H gateway --bind
+   127.0.0.1:7788 2>/tmp/e3-gw.err &`. `curl /health` → 200 without a
+   token; `/api/fleet` → 401 bare, 200 with the read token, `hosts` =
+   `lab-1`/`lab-2`/`lab-ssh` all `connected` (`lab-ssh` with `kind ==
+   "ssh"`, `target == "herdr-ssh-lab"`), `workspaces[0].label` =
+   `lab-1`/`lab-2`/`lab-1`, `agents == []`; `/api/gateway.features` ⊇
+   `["fleet","events","terminal","pairing"]`; `herdr fleet status --json`
+   under the same env lists the same three hosts.
 3. **Security invariants.** foreign `Origin` → 403; six bad bearers from
    one peer → 401 ×5 then 429 while another peer still gets 401;
    `--bind 0.0.0.0:7788` without origins → exit 1; token files `0600` in a
    `0700` dir; `chmod 644 read.token` → next start exits 1; `read` token
    opening `mode: control` → `forbidden` + close 1008; `terminal.input` in
    observe mode → `forbidden`, pane unchanged (`grep -c INJECTED` = 0).
-4. **Live events.** `ws-client.py /api/events --timeout 30 --max-messages 4`
+4. **Passive and quiet.** With the gateway holding all three hosts: set
+   `[server] headless_cols = 100 / headless_rows = 30` on `lab-1`, `server
+   reload-config`, `pane run 'stty size'` → `30 100` (the gateway did not
+   become the foreground client); `/tmp/e3-gw.err` contains no ssh output;
+   the bridge child's argv contains `BatchMode=yes`.
+5. **Live events.** `ws-client.py /api/events --timeout 30 --max-messages 4`
    → `hello`, `fleet`, then `host_connection lab-ssh unavailable` when
    `ssh-lab.sh down` runs, and `connected` + `snapshot` after `ssh-lab.sh
    up` (host-local: no line names `lab-1`/`lab-2`).
-5. **Terminals on every transport.** Observe `lab-2/<pane>`: `terminal.ready`
+6. **Terminals on every transport.** Observe `lab-2/<pane>`: `terminal.ready`
    + a binary frame whose decoded header is `full=1 80×24` and whose body
    holds `herdr-fleet-lab:lab-2`; observe `lab-ssh/<pane>` over ssh → the
    same with `lab-1`'s marker and a gateway-scoped forward socket
@@ -1839,34 +2310,37 @@ recorded skip):
    concurrent observers on one pane all receive frames; a `pane run 'echo
    hello'` on the observed pane produces an incremental (`full=0`) frame
    within 2 s.
-6. **Control reaches exactly one pane.** With the control token,
+7. **Control reaches exactly one pane.** With the control token,
    `terminal.open control` on `lab-1/<pane>` + `terminal.input "echo
    E3-EPIC\n"` + `release` → `lab-1` pane read contains `E3-EPIC`, `lab-2`
-   and `lab-ssh`'s target pane (the same server as `lab-1` — expect it
-   there too, and state so) — then the same on `lab-2` → only `lab-2`
-   gains it; a second controller without takeover → `busy`; with takeover
-   → the first sees `terminal.closed`; controller `stty size` after a
+   does not, and `lab-ssh`'s target pane (the same server as `lab-1`) does
+   — state so; then the same on `lab-2` → only `lab-2` gains it; a second
+   controller without takeover → `busy`; with takeover → the first sees
+   `terminal.closed reason=taken_over`; controller `stty size` after a
    60×20 open prints `20 60`, an observer at 60×20 leaves the PTY size
    alone.
-7. **Pairing loop.** `herdr gateway pair --json` → URL; `curl -c jar
+8. **Pairing loop.** `herdr gateway pair --json` → URL; `curl -c jar
    "$URL"` → 303 + `Set-Cookie … HttpOnly; SameSite=Strict`; the cookie
    gets `/api/fleet` 200 and `/api/gateway.scope == read`; the URL a second
    time → 403; `pair --control` → a cookie that opens a control terminal;
    `gateway status --json` → `running: true`, `devices.read == 1`,
    `devices.control == 1`; `rotate-token control` → the control cookie
    gets 401, the new control token 200, `devices.control == 0`.
-8. **Shutdown hygiene.** `kill -TERM $GW; wait` → exit 0 within 5 s while
+9. **Shutdown hygiene.** `kill -TERM $GW; wait` → exit 0 within 5 s while
    two terminals were open; no `/tmp/herdr-remote-<pid>-*` sockets remain;
    `gateway.json` removed; `ssh-lab.sh down`, `fleet-lab.sh down`; from a
    shell without the lab env `herdr session list` shows no `lab-*`,
-   `~/.config/herdr*/gateway` does not exist, and `ls -la ~/.ssh |
-   sha256sum` is unchanged from before the run.
-9. **Contracts and perf.** `git diff master -- src/protocol tests/fixtures`
-   is empty; `grep -rn 'unwrap()' src/gateway` outside `#[cfg(test)]` is
-   empty; `just bench-render-scale` medians are unchanged from `master`
-   (the gateway adds no work to the server); with 15 observers on one pane
-   the gateway RSS stays under 15 × 2 frames + baseline (report the `ps`
-   number); `docs/fork/gateway.md` snippets match the live output.
+   `~/.config/herdr*/gateway` does not exist,
+   `~/.local/state/herdr*/client/endpoints.json` is untouched (absent, or
+   same mtime as before), and `ls -la ~/.ssh | sha256sum` is unchanged from
+   before the run.
+10. **Contracts and perf.** `git diff master -- src/protocol src/server
+    src/remote tests/fixtures` is empty; `grep -rn 'unwrap()' src/gateway`
+    outside `#[cfg(test)]` is empty; `just bench-render-scale` medians are
+    unchanged from `master` (the gateway adds no work to the server); with
+    15 observers on one pane the gateway RSS stays under 15 × 2 frames +
+    baseline (report the `ps` number); `docs/fork/gateway.md` snippets
+    match the live output.
 
-Passing all nine is the acceptance criterion; `implement-epic` then flips
+Passing all ten is the acceptance criterion; `implement-epic` then flips
 E3 to ✅ in `docs/fork/ROADMAP.md`.
