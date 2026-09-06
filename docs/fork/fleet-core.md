@@ -4,8 +4,7 @@ Epic **E1** gives one herdr client process connections to several herdr
 servers at once — this machine's default session, other named sessions on this
 machine, and machines reached over SSH — and merges what they report into a
 single, host-qualified view. `herdr fleet status` is the first surface built on
-it; the Fleet console (E2, [`fleet.md`](./fleet.md)) and the gateway (E3) are
-the next two.
+it; the fleet TUI (E2) and the gateway (E3) are the next two.
 
 Nothing on the other side changes. A fleet host runs a **stock** herdr server
 and speaks the frozen generation-1 client endpoint protocol; the fork adds no
@@ -577,10 +576,8 @@ By design (plan decision (f), ADR 0001), the fleet connector:
 - never installs, uploads, stops or hands off a herdr on any host, and never
   prompts;
 - never reads `HERDR_REMOTE_BINARY`;
-- never sends input of its own: `herdr fleet status` is read-only, and the
-  connector emits `ClientShellPaneInput` only for a `HostCommand` a consumer
-  asked for. In the console that is what you typed, and it goes to the active
-  host only;
+- never sends input: `herdr fleet status` is read-only, and nothing in E1 sends
+  `ClientShellPaneInput` on its own;
 - never turns one host's failure into a fleet-wide failure, and never calls
   `std::process::exit` or panics because of what a host said.
 
@@ -592,11 +589,10 @@ handshakes inactive hosts at herdr's own default headless geometry
 headless server running agents — is a no-op resize. A host that already has an
 attached client, or a `[server]` `headless_cols`/`headless_rows` of its own, is
 still resized while the fleet client is connected and restored when it
-disconnects. **A fleet consumer should therefore hold its connections only
-while it is in use** — the Fleet console does exactly that, starting the
-connector after the terminal is set up and shutting it down on every exit path
-([`fleet.md`](./fleet.md#limits)). A truly passive reader needs an endpoint
-observer capability, which is a server change and out of scope here.
+disconnects. **E2 should
+therefore hold fleet connections only while the fleet console is in use.** A
+truly passive reader needs an endpoint observer capability, which is a server
+change and out of scope here.
 
 ## For developers
 
@@ -627,9 +623,6 @@ Pure-state testing follows upstream's idiom: `FleetState::test_new()`,
 
 ### Driving the connector (E2)
 
-E2 shipped: the console this drives is [`fleet.md`](./fleet.md), and its own
-module map is in that page's *For developers* section.
-
 ```text
 FleetConnector::start(specs, options)
   → set_active(Some(host)) with the real ClientSurfaceSize
@@ -644,21 +637,13 @@ Switching hosts is one `set_active` call; the first frame afterwards is a full
 before anything is allocated into the event channel, so an idle host in the
 sidebar costs no presentation work.
 
-The two gaps this section listed for E2 are closed:
+Known gaps E2 owns:
 
-- The active geometry is no longer fixed at `start`.
-  `FleetConnectorOptions::for_client(config, handshake, ActiveGeometry)` seeds
-  a shared `ActiveGeometry` that `FleetConnector::set_active_geometry` replaces
-  and every supervisor reads at handshake time, so a *reconnect* of the active
-  host comes back at the console's current size — in the hello, not in a
-  post-handshake resize. `HostCommand::Resize` and a raw `ClientShellResize` to
-  the active host update the same cell, so the two paths cannot disagree.
-- The ssh child's inherited stderr (see above) is redirected by the console:
-  it `dup2`s the herdr client log over fd 2 while it runs and restores the
-  original on every exit path, panic hook included (unix).
-
-One that remains:
-
+- `FleetConnectorOptions.active_surface` is fixed at `start`, so a *reconnect*
+  of the active host re-handshakes with the size the connector was built with,
+  not the last size sent through `HostCommand::Resize`. Add a setter (or have
+  the connector remember the last active resize) when E2 lands.
+- The ssh child's stderr is inherited (see above) — redirect it.
 - On unix, `SshStdioBridge::drop` joins its accept thread, and each bridged
   connection waits for its `ssh` child without killing it, so **dropping an ssh
   transport while a bridged stream is still open blocks until that child

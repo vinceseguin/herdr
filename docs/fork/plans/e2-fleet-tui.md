@@ -380,7 +380,7 @@ the binary, commands and paths stay `herdr`.
 | 6 | feat(fleet): host picker overlay and fleet.keys host_picker binding | C · Fleet UX | 5 | ✅ |
 | 7 | feat(fleet): host-aware notifications and cross-host notification targets | C · Fleet UX | 5 | ✅ |
 | 8 | feat(fleet): reconnect notice for the active host and resize on reconnect | C · Fleet UX | 5 | ✅ |
-| 9 | docs: fleet console guide, adr e2 review, roadmap drift | D · Docs | 6, 7, 8 | ✅ |
+| 9 | docs: fleet console guide, adr e2 review, roadmap drift | D · Docs | 6, 7, 8 | ⬜ |
 | 10 | fix(fleet): log fleet console active-host changes | C · Fleet UX | 5 | ✅ |
 
 **Wave preview (2-agent cap):** W1 `[1, 2]` → W2 `[3]` → W3 `[4]` → W4 `[5]`
@@ -2230,65 +2230,10 @@ Walk `fleet.md` top to bottom against `fleet-lab.sh up 3` + `ssh-lab.sh up`;
 paste real screen dumps (trimmed); `ssh-lab.sh down`, `fleet-lab.sh down`;
 confirm the user's `herdr session list` shows no `lab-*`.
 
-**As built (PR 9, merged).** Deviations from the sketch above, all deliberate:
-
-- **The walkthrough is what the commands actually do.** Every block in
-  `fleet.md` was executed against `fleet-lab.sh up 3` + `ssh-lab.sh up`, and
-  three of them had to change to stay true:
-  - **`kill $(cat sshd.pid)` alone does not drop a connected console.** The
-    listener's *per-connection* sshd child keeps herdr's ControlMaster session
-    alive, so the active host never notices. The documented recipe reads the
-    pid first, then `pkill -P "$sshd_pid"` (the children — the console's link)
-    and only then `kill "$sshd_pid"`. Restarting with
-    `sshd -f "$HERDR_SSH_LAB_ROOT/sshd_config" -E "$HERDR_SSH_LAB_ROOT/sshd.log"`
-    then recovers the host on its own, with `HOME` and the ssh config intact —
-    the half `ssh-lab.sh down`/`up` cannot express (PR 8's recorded
-    degradation, now expressible).
-  - **A `--dump` is stripped text in draw order, not a rectangle.** The console
-    draws region by region, so pane and sidebar text interleave. The sidebar is
-    the right-hand 25 columns, and `sed 's/│/\n/g' | sed -E 's/^.*(.{25})$/\1/'`
-    pulls it back out; every sidebar excerpt in `fleet.md` came from that
-    pipeline, and the pipeline is documented next to the first dump.
-  - **PR 6's "one expectation per frame" rule needed a second half.** An
-    expectation must also be text a frame writes *contiguously*: a sidebar
-    label whose state word changed arrives as a cell diff, so
-    `--expect 'lab-1 · no agents'` never matches a recovery. Expect pane-area
-    text, or `--redraw` first. Recorded in `fleet.md` for every later PR's
-    screen evidence.
-- **A notification and a host drop are two-shell walkthroughs**, not one
-  `tui-drive.py` invocation: both have to be triggered from outside while the
-  console is up. `fleet.md` says so rather than pretending a single command
-  line does it.
-- **`HERDR_SSH_LAB_ROOT` is an output, not an input.** `ssh-lab.sh` derives its
-  root as `$HERDR_FLEET_LAB_ROOT/ssh` and refuses to run anywhere else, so an
-  isolated ssh lab is obtained by setting `HERDR_FLEET_LAB_ROOT`.
-- **`fleet-core.md` was corrected, not rewritten.** Its `[fleet.keys]` section,
-  key table, precedence rule and `DEFAULT_CONFIG` quote were verified against
-  the code and left alone (PR 6 wrote them). What changed: the two "known gaps
-  E2 owns" (fixed active geometry, inherited ssh stderr) are recorded as
-  closed and how; the foreground-geometry caveat now points at the console; and
-  "never sends input" is reworded so it stays true of a console that does.
-- **The ROADMAP's E2 section** lost `prefix+shift+h` / `[keys]` for
-  `prefix+shift+f` / `[fleet.keys]`, its launch deliverable names
-  `run_client_with_launch` (the entry PR 3/4 actually built), and its
-  Docs/Tests deliverables now name what shipped (`tui-drive.py`,
-  `tests/support/fleet_tui.rs`). The Epic status table row was **not**
-  touched — `implement-epic` owns it.
-- **One thing deferred, with an owner:** `scripts/fork/tui-drive.py` strips
-  ANSI per `os.read()` chunk, so a sequence that lands on a read boundary can
-  leak a fragment such as `[0;38;2;…m` into the dumped text (seen once, in a
-  toast frame). It cannot produce a false *positive* match on a plain-text
-  expectation, only noise in a dump. Fixing it means holding a partial-escape
-  tail across reads — code, not docs. Owner: whichever epic next edits the
-  harness (E7's console actions).
-
 **Downstream**
 
 - E7 adds its console actions to `fleet.md`; E8's install doc links here for
   "console machine".
-- The `fleet.md` walkthrough's three `tui-drive.py` rules (`--redraw` before
-  `--dump`, the 25-column sidebar extraction, one contiguous expectation per
-  frame) are the fixture contract for every later PTY validation.
 
 ### PR 10 — fix(fleet): log fleet console active-host changes · deps: 5
 
