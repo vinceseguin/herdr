@@ -18,11 +18,9 @@ mod clipboard_images;
 mod direct_graphics;
 mod endpoint_commands;
 mod errors;
-mod fleet;
 mod frame_output;
 mod handshake;
 mod input;
-mod link;
 mod notifications;
 mod shell;
 mod terminal_geometry;
@@ -113,8 +111,6 @@ use crate::protocol::{
 use crate::protocol::{AttachScrollDirection, AttachScrollSource, NotifyKind};
 use crate::server::socket_paths::client_socket_path;
 
-use link::{ClientLink, ServerLink};
-
 // ---------------------------------------------------------------------------
 // Client state
 // ---------------------------------------------------------------------------
@@ -190,8 +186,6 @@ struct ClientState {
     detached_process_children: Vec<std::process::Child>,
     /// Experimental client-owned shell state.
     shell: Option<shell::ClientShellState>,
-    /// Fleet console state, `None` for a single-host client (E2 PR 4 fills it).
-    fleet: Option<fleet::FleetClientState>,
 }
 
 impl Drop for ClientState {
@@ -312,9 +306,6 @@ enum ClientLoopEvent {
     TerminalUnavailable(io::Error),
     /// Server message received.
     ServerMessage(Box<ServerMessage>),
-    /// One host of the fleet said something (E2; never produced by a
-    /// single-host client, whose `fleet_events` receiver is `None`).
-    Fleet(Box<crate::fleet::connector::FleetEvent>),
     /// Server reader thread exited (connection lost).
     ServerDisconnected,
     /// Timer tick.
@@ -446,7 +437,7 @@ fn run_client_with_mode(
             terminal_id,
             takeover,
         };
-        if let Err(err) = link::write_stream_message(&mut stream, &attach) {
+        if let Err(err) = write_to_server(&mut stream, &attach) {
             eprintln!("herdr: failed to request terminal attach: {err}");
             std::process::exit(1);
         }
@@ -492,7 +483,7 @@ fn run_client_with_mode(
 
     let result = rt.block_on(async {
         run_client_loop(
-            ClientLink::single(stream),
+            stream,
             cols,
             rows,
             cell_width_px,
@@ -538,7 +529,7 @@ fn run_client_with_mode(
 fn dispatch_client_shell_actions(
     actions: Vec<shell::ClientShellAction>,
     endpoint_commands: &mut endpoint_commands::EndpointCommands,
-    write_stream: &mut ServerLink,
+    write_stream: &mut LocalStream,
     detached_process_children: &mut Vec<std::process::Child>,
 ) -> Result<Vec<crossterm::event::MouseEvent>, ClientError> {
     let mut replay_mouse = Vec::new();
@@ -628,7 +619,7 @@ fn apply_client_shell_input_source_changes(
 fn install_client_shell_snapshot(
     state: &mut ClientState,
     snapshot: Box<crate::protocol::ClientShellSnapshot>,
-    write_stream: &mut ServerLink,
+    write_stream: &mut LocalStream,
     prefix_input_source: &mut impl crate::platform::PrefixInputSource,
 ) -> Result<(), ClientError> {
     let (composed, resize, graphics_cleanup) = if let Some(shell) = &mut state.shell {
@@ -668,7 +659,7 @@ fn finish_client_shell_input(
     state: &mut ClientState,
     outcome: shell::ClientShellInput,
     frame: Option<FrameData>,
-    write_stream: &mut ServerLink,
+    write_stream: &mut LocalStream,
     endpoint_commands: &mut endpoint_commands::EndpointCommands,
     prefix_input_source: &mut impl crate::platform::PrefixInputSource,
 ) -> Result<bool, ClientError> {
@@ -716,151 +707,6 @@ fn finish_client_shell_input(
     Ok(false)
 }
 
-/// Finishes one endpoint command that has an answer, from either link.
-///
-/// Shared by the single-host response-chunk arm and the fleet console's
-/// reassembled response, so both replay mouse events, repaint and detach the
-/// same way. Returns whether the client loop should stop.
-fn finish_endpoint_command(
-    state: &mut ClientState,
-    completed: endpoint_commands::EndpointCommandResult,
-    write_stream: &mut ServerLink,
-    endpoint_commands: &mut endpoint_commands::EndpointCommands,
-    prefix_input_source: &mut impl crate::platform::PrefixInputSource,
-) -> Result<bool, ClientError> {
-    let (repaint, actions) = state.shell.as_mut().map_or_else(
-        || (false, Vec::new()),
-        |shell| {
-            shell.handle_endpoint_result(
-                &completed.boot_id,
-                &completed.request_id,
-                completed.result,
-            )
-        },
-    );
-    if let Some(shell) = state.shell.as_mut() {
-        shell.reconcile_input_source();
-    }
-    apply_client_shell_input_source_changes(state, prefix_input_source);
-    let replay_mouse = dispatch_client_shell_actions(
-        actions,
-        endpoint_commands,
-        write_stream,
-        &mut state.detached_process_children,
-    )?;
-    if replay_mouse.is_empty() {
-        if repaint {
-            if let Some(frame) = state
-                .shell
-                .as_mut()
-                .and_then(|shell| shell.compose(state.reported_size.0, state.reported_size.1))
-            {
-                state.present_frame(frame);
-            }
-        }
-        return Ok(false);
-    }
-    let (outcome, frame) = {
-        let Some(shell) = state.shell.as_mut() else {
-            return Ok(false);
-        };
-        let mut outcome = shell.replay_mouse_events(replay_mouse);
-        outcome.repaint |= repaint;
-        let frame = outcome
-            .repaint
-            .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
-            .flatten();
-        (outcome, frame)
-    };
-    finish_client_shell_input(
-        state,
-        outcome,
-        frame,
-        write_stream,
-        endpoint_commands,
-        prefix_input_source,
-    )
-}
-
-/// What the loop must do with a fleet event that has been translated.
-enum FleetOutcome {
-    /// Re-dispatch through the loop's own `ServerMessage` handling.
-    Server(Box<ServerMessage>),
-    /// Already handled (or deliberately dropped): take the next event.
-    Handled,
-    /// The console is done; return cleanly.
-    Detached,
-}
-
-/// Turns one fleet event into something the client loop already handles.
-///
-/// Only the active host's frames, messages and endpoint answers get through;
-/// everything else is fleet-model state. See `fleet::translate`.
-fn handle_fleet_event(
-    state: &mut ClientState,
-    event: crate::fleet::connector::FleetEvent,
-    write_stream: &mut ServerLink,
-    endpoint_commands: &mut endpoint_commands::EndpointCommands,
-    prefix_input_source: &mut impl crate::platform::PrefixInputSource,
-) -> Result<FleetOutcome, ClientError> {
-    let translated = match state.fleet.as_mut() {
-        Some(fleet) => fleet.translate(event),
-        None => {
-            debug!("dropping a fleet event: this client has no fleet state");
-            return Ok(FleetOutcome::Handled);
-        }
-    };
-    match translated {
-        fleet::Translated::Server(message) => Ok(FleetOutcome::Server(message)),
-        fleet::Translated::Snapshot { snapshot, changes } => {
-            if let Some(fleet) = state.fleet.as_mut() {
-                fleet::apply_changes(fleet, changes);
-            }
-            install_client_shell_snapshot(state, snapshot, write_stream, prefix_input_source)?;
-            Ok(FleetOutcome::Handled)
-        }
-        fleet::Translated::EndpointResponse { request_id, result } => {
-            let Some(completed) = endpoint_commands.complete(&request_id, result) else {
-                return Ok(FleetOutcome::Handled);
-            };
-            if finish_endpoint_command(
-                state,
-                completed,
-                write_stream,
-                endpoint_commands,
-                prefix_input_source,
-            )? {
-                return Ok(FleetOutcome::Detached);
-            }
-            Ok(FleetOutcome::Handled)
-        }
-        fleet::Translated::Changes(changes) => {
-            if let Some(fleet) = state.fleet.as_mut() {
-                fleet::apply_changes(fleet, changes);
-            }
-            Ok(FleetOutcome::Handled)
-        }
-        fleet::Translated::Dropped => Ok(FleetOutcome::Handled),
-    }
-}
-
-/// The next event from the fleet connector, or never.
-///
-/// A single-host client has no receiver, and a closed channel means every host
-/// supervisor has exited and nothing else can arrive. Both stay pending: a
-/// branch that resolved immediately would spin the loop.
-async fn next_fleet_event(
-    events: Option<&mut tokio::sync::mpsc::Receiver<crate::fleet::connector::FleetEvent>>,
-) -> crate::fleet::connector::FleetEvent {
-    let Some(events) = events else {
-        return std::future::pending().await;
-    };
-    match events.recv().await {
-        Some(event) => event,
-        None => std::future::pending().await,
-    }
-}
-
 /// The main client event loop.
 ///
 /// Uses a threaded architecture:
@@ -869,7 +715,7 @@ async fn next_fleet_event(
 /// - server reader thread → reads ServerMessages and sends to main loop
 /// - main loop: coordinates input, output, and server communication
 async fn run_client_loop(
-    link: ClientLink,
+    stream: LocalStream,
     cols: u16,
     rows: u16,
     initial_cell_width_px: u32,
@@ -917,7 +763,6 @@ async fn run_client_loop(
         draw_host_cursor,
         detached_process_children: Vec::new(),
         shell: config.shell_config.map(shell::ClientShellState::new),
-        fleet: None,
     };
     if let Some(shell) = state.shell.as_mut() {
         shell.set_graphics_cell_size(initial_cell_width_px, initial_cell_height_px);
@@ -1008,36 +853,29 @@ async fn run_client_loop(
 
     // Spawn the server reader thread (blocking reads from the socket).
     // Clone the stream's file descriptor so we can read from a blocking stream.
-    // A fleet console has no single socket: one reader per host lives in the
-    // connector, and their events arrive on `fleet_events` instead.
-    let ClientLink {
-        link: mut write_stream,
-        mut fleet_events,
-    } = link;
-    if let ServerLink::Single(stream) = &mut write_stream {
-        let server_read_quit = should_quit.clone();
-        let server_read_tx = event_tx.clone();
-        let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
-        std::thread::spawn(move || {
-            let max_frame_size = if kitty_graphics_enabled {
-                MAX_GRAPHICS_FRAME_SIZE
-            } else {
-                MAX_FRAME_SIZE
-            };
-            server_reader_thread(
-                read_stream,
-                server_read_tx,
-                &server_read_quit,
-                max_frame_size,
-            );
-        });
+    let server_read_quit = should_quit.clone();
+    let server_read_tx = event_tx.clone();
+    let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
+    std::thread::spawn(move || {
+        let max_frame_size = if kitty_graphics_enabled {
+            MAX_GRAPHICS_FRAME_SIZE
+        } else {
+            MAX_FRAME_SIZE
+        };
+        server_reader_thread(
+            read_stream,
+            server_read_tx,
+            &server_read_quit,
+            max_frame_size,
+        );
+    });
 
-        // Use the original stream for writing (blocking is fine since we write
-        // from the async loop).
-        stream
-            .set_nonblocking(false)
-            .map_err(ClientError::ConnectionFailed)?;
-    }
+    // Use the original stream for writing (blocking is fine since we write
+    // from the async loop).
+    let mut write_stream = stream;
+    write_stream
+        .set_nonblocking(false)
+        .map_err(ClientError::ConnectionFailed)?;
 
     // This (foreground) client owns the prefix ASCII input-source switch
     // (implemented on macOS and Windows; a no-op on other platforms).
@@ -1066,39 +904,17 @@ async fn run_client_loop(
                 }
             },
             ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
-            ev = next_fleet_event(fleet_events.as_mut()) => ClientLoopEvent::Fleet(Box::new(ev)),
         };
         #[cfg(unix)]
         let event = tokio::select! {
             biased;
             _ = tokio::time::sleep_until(timer_deadline.into()) => ClientLoopEvent::Timer,
             ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
-            ev = next_fleet_event(fleet_events.as_mut()) => ClientLoopEvent::Fleet(Box::new(ev)),
         };
         let now = std::time::Instant::now();
         if let Some(shell) = state.shell.as_mut() {
             shell.tick_popup_pending(now);
         }
-
-        // A fleet event either *is* one of the loop's existing events, or was
-        // already handled by the translation. No rendering or input arm is
-        // duplicated for the console.
-        let event = match event {
-            ClientLoopEvent::Fleet(event) => {
-                match handle_fleet_event(
-                    &mut state,
-                    *event,
-                    &mut write_stream,
-                    &mut endpoint_commands,
-                    &mut prefix_input_source,
-                )? {
-                    FleetOutcome::Server(message) => ClientLoopEvent::ServerMessage(message),
-                    FleetOutcome::Handled => continue,
-                    FleetOutcome::Detached => return Ok(()),
-                }
-            }
-            other => other,
-        };
 
         match event {
             #[cfg(unix)]
@@ -1706,14 +1522,57 @@ async fn run_client_loop(
                     let Some(completed) = completed else {
                         continue;
                     };
-                    if finish_endpoint_command(
-                        &mut state,
-                        completed,
-                        &mut write_stream,
+                    let (repaint, actions) = state.shell.as_mut().map_or_else(
+                        || (false, Vec::new()),
+                        |shell| {
+                            shell.handle_endpoint_result(
+                                &completed.boot_id,
+                                &completed.request_id,
+                                completed.result,
+                            )
+                        },
+                    );
+                    if let Some(shell) = state.shell.as_mut() {
+                        shell.reconcile_input_source();
+                    }
+                    apply_client_shell_input_source_changes(&mut state, &mut prefix_input_source);
+                    let replay_mouse = dispatch_client_shell_actions(
+                        actions,
                         &mut endpoint_commands,
-                        &mut prefix_input_source,
-                    )? {
-                        return Ok(());
+                        &mut write_stream,
+                        &mut state.detached_process_children,
+                    )?;
+                    if replay_mouse.is_empty() {
+                        if repaint {
+                            if let Some(frame) = state.shell.as_mut().and_then(|shell| {
+                                shell.compose(state.reported_size.0, state.reported_size.1)
+                            }) {
+                                state.present_frame(frame);
+                            }
+                        }
+                    } else {
+                        let (outcome, frame) = {
+                            let shell = state.shell.as_mut().expect("shell endpoint response");
+                            let mut outcome = shell.replay_mouse_events(replay_mouse);
+                            outcome.repaint |= repaint;
+                            let frame = outcome
+                                .repaint
+                                .then(|| {
+                                    shell.compose(state.reported_size.0, state.reported_size.1)
+                                })
+                                .flatten();
+                            (outcome, frame)
+                        };
+                        if finish_client_shell_input(
+                            &mut state,
+                            outcome,
+                            frame,
+                            &mut write_stream,
+                            &mut endpoint_commands,
+                            &mut prefix_input_source,
+                        )? {
+                            return Ok(());
+                        }
                     }
                 }
                 ServerMessage::Clipboard { data } => {
@@ -1893,11 +1752,6 @@ async fn run_client_loop(
                     debug!("received unexpected Welcome in main loop");
                 }
             },
-            // Translated above, before this match; kept so a future variant
-            // cannot silently fall through.
-            ClientLoopEvent::Fleet(event) => {
-                debug!(?event, "fleet event reached the loop untranslated");
-            }
             ClientLoopEvent::ServerDisconnected => {
                 return Err(ClientError::ConnectionLost(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -2018,12 +1872,9 @@ fn server_reader_thread(
 // Write helper
 // ---------------------------------------------------------------------------
 
-/// Writes a message to whichever server this client's link addresses.
-///
-/// The one write path: a single-host client's socket, or the fleet console's
-/// one active host. See `link::ServerLink`.
-fn write_to_server(link: &mut ServerLink, msg: &ClientMessage) -> io::Result<()> {
-    link::io_result(link.write(msg))
+/// Writes a message to the server stream (blocking).
+fn write_to_server(stream: &mut LocalStream, msg: &ClientMessage) -> io::Result<()> {
+    protocol::write_message(stream, msg).map_err(|e| io::Error::other(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------

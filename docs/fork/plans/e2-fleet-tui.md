@@ -369,7 +369,7 @@ the binary, commands and paths stay `herdr`.
 | --- | --- | --- | --- | --- |
 | 1 | feat(fleet): connector client options, active-surface tracking and takeable events | A · Foundations | — | ✅ |
 | 2 | feat(fleet): pure sidebar and host picker models | A · Foundations | — | ✅ |
-| 3 | refactor: route client writes and fleet events through a server link seam | B · Console loop | 1 | ✅ |
+| 3 | refactor: route client writes and fleet events through a server link seam | B · Console loop | 1 | ⬜ |
 | 4 | feat: herdr fleet opens the client shell over the fleet connector | B · Console loop | 2, 3 | ⬜ |
 | 5 | feat(fleet): sidebar host groups with live status and click-to-switch | C · Fleet UX | 4 | ⬜ |
 | 6 | feat(fleet): host picker overlay and fleet.keys host_picker binding | C · Fleet UX | 5 | ⬜ |
@@ -900,75 +900,6 @@ bash scripts/fork/fleet-lab.sh down
 Evidence: `MARKER_SEEN`, the typed line reached the pane through
 `ServerLink::Single`, detach (`prefix+q`) exits cleanly, gate green.
 
-**As built (PR 3, merged).** Deviations from the shapes above, all
-deliberate:
-
-- **`ClientLink` replaces the separate `fleet_events` parameter.**
-  `run_client_loop`'s first argument is `ClientLink { link: ServerLink,
-  fleet_events: Option<mpsc::Receiver<FleetEvent>> }` — the loop's whole
-  server side in one value. Two parameters would have pushed the signature to
-  12 arguments and failed `clippy::too_many_arguments`. `ClientLink::single
-  (stream)` is the single-host constructor; PR 4 builds the fleet one.
-- **`Rc<FleetConnector>`, not `Arc`,** in both `FleetLink` and
-  `FleetClientState`. `FleetConnector` owns a `std::sync::mpsc::Receiver`
-  (the supervisors' completion channel), so it is `!Sync` and `Arc::new`
-  fails `clippy::arc_with_non_send_sync`. `run_client_loop` runs under
-  `rt.block_on` on a `new_current_thread` runtime and spawns nothing, so the
-  future needs no `Send` bound and both owners live on one thread. **PR 4's
-  exit path is `Rc::try_unwrap(connector).shutdown()`** after dropping the
-  taken receiver and the link.
-- **`LinkWriteError` has three variants:** `Io`, `Detached` and
-  `HostUnavailable(String)`. `Detach` on a fleet link returns `Detached`,
-  which `link::io_result` turns into `Ok(())` with a `debug!` — no
-  synthesized `ServerShutdown{"detached"}` is needed, because all four
-  `Detach` call sites are already `let _ = write(…)` followed by an immediate
-  clean return. `HostUnavailable` exists because `FleetConnector::send`
-  answers **only** endpoint requests it accepted: a `NotConnected` endpoint
-  request would otherwise hold `EndpointCommands`' single lane forever
-  (upstream's `expire` keeps the lane after its 60 s timeout, waiting for a
-  late answer that cannot come). A raw write still drops `NotConnected`/`Io`
-  with a `debug!` per the plan; an endpoint request records the reason on the
-  in-flight command (`InFlightCommand.unavailable`) and the next `expire`
-  tick fails it with `endpoint_unavailable` **and releases the lane**. That
-  field is only ever set by a fleet link, so the single-host path is
-  untouched.
-- **`Translated::Snapshot { snapshot, changes }`** carries the fleet model's
-  changes alongside the projection, so an active host's snapshot cannot
-  silently drop its `FleetChange`s. The active host's snapshot is cloned once
-  per snapshot event (the shell draws it, the fleet model counts its agents);
-  no other host's is.
-- **`endpoint_commands::send_next` writes through
-  `ServerLink::write_endpoint_request(boot_id, request_id, request)`**, which
-  owns the per-link correlation: the boot id on the wire for a single host,
-  `HostCommand::Endpoint { request_id }` for a fleet host. `complete
-  (request_id, result)` matches only the in-flight request id.
-- **The `select!` fleet branch is unguarded**: `ev = next_fleet_event(
-  fleet_events.as_mut())`, where `next_fleet_event` returns
-  `std::future::pending()` both when there is no receiver and when the channel
-  closed. An `if fleet_events.is_some()` guard plus a `None` arm would have
-  spun the loop once the last supervisor exited.
-- **`write_to_server` kept its name and its 21 call sites**; the raw-stream
-  body moved to `link::write_stream_message`, which `terminal_sessions.rs`
-  (four sites, its own stream) and the pre-loop `AttachTerminal` write use.
-  `finish_client_shell_input`, `install_client_shell_snapshot`,
-  `dispatch_client_shell_actions`, `write_remote_image_to_server` and
-  `write_attach_semantic_action` take `&mut ServerLink`.
-- **One helper was extracted rather than duplicated:**
-  `finish_endpoint_command(state, completed, …) -> Result<bool, ClientError>`
-  holds what the `ClientShellEndpointResponseChunk` arm used to do inline, so
-  the fleet path replays mouse events, repaints and detaches identically.
-  Its one `expect("shell endpoint response")` became a let-else returning
-  `Ok(false)` (unreachable: a non-empty replay only comes from
-  `handle_endpoint_result`, which needs a shell).
-- **Characterization:** no file under `tests/` was touched;
-  `tests/client_mode.rs`, `tests/multi_client.rs`, `tests/detach_reattach.rs`
-  and the rest of the client suite pass unchanged (3336 tests green).
-- **Hazard recorded for PR 4/5:** `translate` drops an *inactive* host's
-  `EndpointResponse`, so a request still in flight to the old host at switch
-  time is released only when the switch resets the lane. Whichever PR lands
-  the host switch must add `EndpointCommands::reset()` and call it there; it
-  does not exist yet.
-
 **Downstream**
 
 - PR 4 constructs `ServerLink::Fleet` and `Some(fleet_events)`; nothing else
@@ -997,13 +928,7 @@ PR 5 — this PR proves the loop.
   `run_client_with_mode` (or a `run_client_with_launch(ClientLaunch)` wrapper
   it delegates to — pick whichever keeps the existing two callers untouched)
   so the fleet path shares config loading, geometry, terminal setup, panic
-  hook, runtime, `ctrlc`, and the exit handling. **As built in PR 3:**
-  `run_client_loop` already takes a `link::ClientLink`, so the fleet branch
-  passes `ClientLink { link: ServerLink::Fleet(FleetLink::new(connector,
-  active)), fleet_events: Some(rx) }` and sets `ClientState.fleet =
-  Some(FleetClientState { .. })` — no further loop surgery. The reader thread
-  and the write stream's `set_nonblocking(false)` are already inside
-  `if let ServerLink::Single`, so a fleet console starts neither.
+  hook, runtime, `ctrlc`, and the exit handling.
 - `src/cli/fleet.rs` (fork file): `run_fleet_command -> io::Result<Option<i32>>`
   (`None` for a bare `herdr fleet`); help text mentions the console.
 - `src/cli.rs` *(upstream — the `fleet` arm becomes the `server`-arm pattern)*;
@@ -1030,7 +955,7 @@ PR 5 — this PR proves the loop.
 // src/client/fleet.rs
 pub fn run_fleet() -> io::Result<()>;   // main.rs entry
 pub(super) struct FleetLaunch { pub specs: Vec<HostSpec>, pub options: FleetConnectorOptions }
-pub(super) struct FleetClientState { pub state: FleetState, pub connector: Rc<FleetConnector>,
+pub(super) struct FleetClientState { pub state: FleetState, pub connector: Arc<FleetConnector>,
     pub active: HostId, pub pending_switch: Option<HostId>, pub sidebar: FleetSidebarModel,
     pub collapsed: HashSet<HostId>, pub stderr: Option<StderrRedirect> }
 ```
@@ -1046,12 +971,10 @@ fleet-core.md", exit 1) → `ClientShellConfig::from_config(..)
 FleetConnectorOptions::for_client(&config, HandshakeParams::for_client(cell_w,
 cell_h, exact && unix, mouse_capture), ActiveGeometry { surface:
 shell_config.initial_surface_size(cols, rows), .. }))` → `take_events()` →
-`set_active(Some(first enabled host))` → `run_client_loop(ClientLink { link:
-ServerLink::Fleet(..), fleet_events: Some(rx) }, …, endpoint_methods: None)`
-(one `ClientLink` argument, PR 3 As built). Exit: after the loop
-returns (any reason) drop the receiver, drop the link, then
-`Rc::try_unwrap(connector)` — `Rc`, not `Arc` (PR 3 As built) —
-`.shutdown()` (fall back to `Drop` with a `warn!` if another owner remains),
+`set_active(Some(first enabled host))` → `run_client_loop(ServerLink::Fleet,
+fleet_events: Some(rx), …, endpoint_methods: None)`. Exit: after the loop
+returns (any reason) drop the receiver, `Arc::try_unwrap(connector)
+.shutdown()` (fall back to `Drop` with a `warn!` if another owner remains),
 restore stderr, then the existing terminal-restore/exit code. The fleet
 branch never `exit(1)`s for a host reason.
 
