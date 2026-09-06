@@ -122,40 +122,6 @@ pub struct AgentRow {
     pub state_change_seq: u64,
 }
 
-/// One drawable sidebar row, borrowed from the model.
-///
-/// Borrowed rather than owned (the plan sketched owned rows): the renderer
-/// walks this on every frame, and cloning a `String` per visible row per frame
-/// is exactly the per-frame allocation the model exists to avoid.
-///
-/// The console's sidebar turned out to have *two* lists, not one — spaces
-/// above, agents below — so it walks [`FleetSidebarModel::groups`] once per
-/// section instead of this flat order (E2 PR 5). Kept because it is the order
-/// a single-list surface (E4's phone list, a future overlay) needs, and
-/// because dropping it would take its tests with it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum FleetSidebarRow<'a> {
-    HostHeader(&'a HostHeaderRow),
-    Workspace(&'a WorkspaceRow),
-    Agent(&'a AgentRow),
-}
-
-#[allow(dead_code)]
-impl<'a> FleetSidebarRow<'a> {
-    /// The host this row belongs to — the routing target of a click on it.
-    ///
-    /// Borrowed from the model, not from the row, so a caller that copied a
-    /// row out of [`FleetSidebarModel::visible_rows`] can still hold the id.
-    pub fn host(&self) -> &'a HostId {
-        match self {
-            Self::HostHeader(header) => &header.host,
-            Self::Workspace(row) => &row.workspace.host,
-            Self::Agent(row) => &row.pane.host,
-        }
-    }
-}
-
 /// One host's rows: a header, its workspaces, its agents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostGroup {
@@ -165,19 +131,6 @@ pub struct HostGroup {
     pub workspaces: Vec<WorkspaceRow>,
     /// Upstream's agent-panel order; see [`host_status_rank`].
     pub agents: Vec<AgentRow>,
-}
-
-impl HostGroup {
-    /// Rows drawn for this group right now: the header alone when collapsed.
-    // Flat-order helper; see [`FleetSidebarRow`].
-    #[allow(dead_code)]
-    pub fn visible_row_count(&self) -> usize {
-        if self.header.collapsed {
-            1
-        } else {
-            1 + self.workspaces.len() + self.agents.len()
-        }
-    }
 }
 
 /// Every host's rows, in `[fleet]` order with `local` first.
@@ -244,39 +197,6 @@ impl FleetSidebarModel {
             .iter()
             .find(|agent| agent.pane.pane_id == pane.pane_id)
             .map(|agent| agent.status)
-    }
-
-    /// Rows to draw, top to bottom, collapsed groups contributing their header
-    /// only. Borrows, so walking it allocates nothing.
-    // Flat-order helper; see [`FleetSidebarRow`].
-    #[allow(dead_code)]
-    pub fn visible_rows(&self) -> impl Iterator<Item = FleetSidebarRow<'_>> {
-        self.groups.iter().flat_map(|group| {
-            let body = if group.header.collapsed {
-                &[][..]
-            } else {
-                &group.workspaces[..]
-            };
-            let agents = if group.header.collapsed {
-                &[][..]
-            } else {
-                &group.agents[..]
-            };
-            std::iter::once(FleetSidebarRow::HostHeader(&group.header))
-                .chain(body.iter().map(FleetSidebarRow::Workspace))
-                .chain(agents.iter().map(FleetSidebarRow::Agent))
-        })
-    }
-
-    /// How many rows [`FleetSidebarModel::visible_rows`] yields. O(hosts), so a
-    /// scroll metric costs nothing per frame.
-    // Flat-order helper; see [`FleetSidebarRow`].
-    #[allow(dead_code)]
-    pub fn visible_row_count(&self) -> usize {
-        self.groups
-            .iter()
-            .map(HostGroup::visible_row_count)
-            .sum::<usize>()
     }
 }
 
@@ -685,9 +605,11 @@ mod tests {
             "the first enabled host is active"
         );
         assert!(!model.groups[1].header.active);
-        assert_eq!(
-            model.visible_row_count(),
-            3,
+        assert!(
+            model
+                .groups
+                .iter()
+                .all(|group| group.workspaces.is_empty() && group.agents.is_empty()),
             "headers only, no snapshots yet"
         );
     }
@@ -833,7 +755,13 @@ mod tests {
 
         let mut model = FleetSidebarModel::default();
         model.rebuild(&state, &HashSet::new(), AgentPanelSortConfig::Priority);
-        assert_eq!(model.visible_row_count(), 4);
+        assert_eq!(
+            (
+                model.groups[0].workspaces.len(),
+                model.groups[0].agents.len()
+            ),
+            (1, 1)
+        );
         assert!(!model.groups[0].header.collapsed);
         assert_eq!(model.groups[0].header.label, "▾ local · 1 working");
 
@@ -847,16 +775,15 @@ mod tests {
             (1, 1),
             "collapse is a render decision; the rows stay built"
         );
-        assert_eq!(model.visible_row_count(), 2, "two headers, no body");
-        let rows = model.visible_rows().collect::<Vec<_>>();
-        assert_eq!(rows.len(), 2);
-        assert!(rows
-            .iter()
-            .all(|row| matches!(row, FleetSidebarRow::HostHeader(_))));
+        let other = &model.groups[1];
+        assert!(
+            other.workspaces.is_empty() && other.agents.is_empty(),
+            "a host without a snapshot is a header and nothing else"
+        );
     }
 
     #[test]
-    fn visible_rows_walk_header_then_workspaces_then_agents_per_host() {
+    fn groups_hold_each_hosts_own_workspaces_and_agents_in_host_order() {
         let mut state = FleetState::new(vec![local_spec(), ssh_spec("workbox")]);
         for (id, pane) in [(HostId::local(), "w1:p1"), (host("workbox"), "w2:p9")] {
             connect(&mut state, &id, "0.8.2-fork");
@@ -874,12 +801,20 @@ mod tests {
             );
         }
         let model = model_of(&state);
+        // The renderer walks the groups in this order, header first, then
+        // that host's workspaces, then its agents.
         let described = model
-            .visible_rows()
-            .map(|row| match row {
-                FleetSidebarRow::HostHeader(header) => format!("h:{}", header.host),
-                FleetSidebarRow::Workspace(row) => format!("w:{}", row.workspace),
-                FleetSidebarRow::Agent(row) => format!("a:{}", row.pane),
+            .groups
+            .iter()
+            .flat_map(|group| {
+                std::iter::once(format!("h:{}", group.header.host))
+                    .chain(
+                        group
+                            .workspaces
+                            .iter()
+                            .map(|row| format!("w:{}", row.workspace)),
+                    )
+                    .chain(group.agents.iter().map(|row| format!("a:{}", row.pane)))
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -893,10 +828,13 @@ mod tests {
                 "a:workbox/w2:p9",
             ]
         );
-        assert_eq!(model.visible_row_count(), described.len());
-        for row in model.visible_rows() {
+        for group in &model.groups {
             assert!(
-                matches!(row.host().as_str(), "local" | "workbox"),
+                group
+                    .workspaces
+                    .iter()
+                    .all(|row| row.workspace.host == group.host)
+                    && group.agents.iter().all(|row| row.pane.host == group.host),
                 "every row names its own host"
             );
         }
@@ -1189,11 +1127,10 @@ mod tests {
         // must still address two different panes.
         assert_eq!(
             model
-                .visible_rows()
-                .filter_map(|row| match row {
-                    FleetSidebarRow::Agent(agent) => Some(agent.pane.to_string()),
-                    _ => None,
-                })
+                .groups
+                .iter()
+                .flat_map(|group| group.agents.iter())
+                .map(|agent| agent.pane.to_string())
                 .collect::<Vec<_>>(),
             vec!["local/w1:p1", "twin/w1:p1"]
         );
@@ -1311,8 +1248,6 @@ mod tests {
         let state = FleetState::new(Vec::new());
         let model = model_of(&state);
         assert!(model.groups.is_empty());
-        assert_eq!(model.visible_row_count(), 0);
-        assert_eq!(model.visible_rows().count(), 0);
         assert!(model.group(&HostId::local()).is_none());
         assert!(model
             .agent_status(&FleetPaneRef::new(HostId::local(), "w1:p1"))

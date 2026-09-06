@@ -126,6 +126,12 @@ pub(super) fn render_fleet_spaces(
     *state.workspace_scroll = metrics
         .max_offset_from_bottom
         .saturating_sub(metrics.offset_from_bottom);
+    // A body with no rows gets no rows: a header is one line tall whatever
+    // rect it is given, and drawing it here would paint the footer and leave
+    // a switch target on it.
+    if body.height == 0 {
+        return;
+    }
     let show_scrollbar = metrics.max_offset_from_bottom > 0 && body.width > 1;
     let content_width = body.width.saturating_sub(u16::from(show_scrollbar));
 

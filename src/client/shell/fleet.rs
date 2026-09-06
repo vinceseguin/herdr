@@ -19,11 +19,20 @@
 //! E2 PR 5. PR 6 adds the picker overlay on top of the same action, PR 7 the
 //! notification target, PR 8 the reconnect notice.
 
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Modifier, Style},
+};
+
 use crate::fleet::hosts::HostId;
 use crate::fleet::refs::{FleetPaneRef, FleetWorkspaceRef};
 use crate::fleet::sidebar::FleetSidebarModel;
+use crate::protocol::{ClientShellSnapshot, FrameData, PaneSurfaceFrame};
 
-use super::{ClientShellAction, ClientShellInput, ClientShellState, ShellHitMap};
+use super::{
+    ClientShellAction, ClientShellConfig, ClientShellInput, ClientShellState, ShellHitMap,
+};
 
 /// A clickable fleet row, always naming the host it belongs to.
 ///
@@ -85,19 +94,91 @@ pub(super) struct FleetShellState {
     /// with the reason. Every other fleet row is exactly one line, so this is
     /// the only height the renderer would otherwise have to derive per frame.
     header_heights: Vec<u16>,
+    /// The one line the pane area shows while `switching_to` is set, built
+    /// when it changes rather than on every frame.
+    pane_notice: Option<String>,
+    /// What the shell composes against while the active host has no
+    /// projection or no surface: an empty one.
+    ///
+    /// A console must keep drawing its chrome — the host groups above all —
+    /// when the machine it is pointed at has nothing to show, or a switch to
+    /// a host that is down would leave the previous host's last frame on the
+    /// terminal with no clickable row to leave it by. The single-host client
+    /// has no such state: it draws nothing until its one server does.
+    placeholder: Box<FleetPlaceholder>,
+}
+
+/// An empty projection and surface, for a console whose active host has none.
+struct FleetPlaceholder {
+    snapshot: ClientShellSnapshot,
+    surface: PaneSurfaceFrame,
+}
+
+impl FleetPlaceholder {
+    fn new() -> Self {
+        Self {
+            snapshot: ClientShellSnapshot {
+                boot_id: String::new(),
+                revision: 0,
+                config_diagnostic: None,
+                product_announcement: None,
+                update_available: None,
+                update_install_command: String::new(),
+                server_keybindings_toml: None,
+                latest_release_notes_available: false,
+                integration_updates_available: false,
+                worktree_directory: String::new(),
+                release_notes: None,
+                focused_workspace_id: None,
+                focused_tab_id: None,
+                focused_pane_id: None,
+                tab_bar_right: Vec::new(),
+                tab_bar_right_separator: String::new(),
+                agent_view_label: None,
+                agent_order: Vec::new(),
+                workspaces: Vec::new(),
+                tabs: Vec::new(),
+                panes: Vec::new(),
+                agents: Vec::new(),
+                commands: Vec::new(),
+            },
+            surface: PaneSurfaceFrame {
+                boot_id: String::new(),
+                projection_revision: 0,
+                surface_revision: 0,
+                frame: FrameData {
+                    cells: Vec::new(),
+                    width: 0,
+                    height: 0,
+                    cursor: None,
+                    hyperlinks: Vec::new(),
+                    graphics: Vec::new(),
+                },
+                panes: Vec::new(),
+                splits: Vec::new(),
+                popup: None,
+                graphics: Default::default(),
+            },
+        }
+    }
+}
+
+/// The pane-area line for a switch still waiting on its host's first surface.
+fn pane_notice(switching_to: Option<&HostId>) -> Option<String> {
+    switching_to.map(|host| format!("switching to {host}…"))
 }
 
 impl FleetShellState {
     fn new(model: FleetSidebarModel, active: HostId, switching_to: Option<HostId>) -> Self {
-        let mut state = Self {
+        Self {
             heights_generation: model.generation,
             header_heights: header_heights(&model),
+            pane_notice: pane_notice(switching_to.as_ref()),
+            placeholder: Box::new(FleetPlaceholder::new()),
             model,
             active,
             switching_to,
-        };
-        state.heights_generation = state.model.generation;
-        state
+        }
     }
 
     /// Drawn height of one group's header row.
@@ -119,6 +200,49 @@ impl FleetShellState {
     /// Whether a switch to this host is waiting for its first surface.
     pub(super) fn is_switching_to(&self, host: &HostId) -> bool {
         self.switching_to.as_ref() == Some(host)
+    }
+
+    /// What to compose when the active host has no projection or no surface.
+    ///
+    /// The real projection is preferred when there is one: the sidebar then
+    /// shows the host's own workspaces while its first surface is on its way.
+    pub(super) fn placeholder<'a>(
+        &'a self,
+        snapshot: Option<&'a ClientShellSnapshot>,
+    ) -> (&'a ClientShellSnapshot, &'a PaneSurfaceFrame) {
+        (
+            snapshot.unwrap_or(&self.placeholder.snapshot),
+            &self.placeholder.surface,
+        )
+    }
+
+    /// Draw the pane-area notice, if a switch is waiting on its host.
+    ///
+    /// Only ever called for a frame composed against the placeholder surface,
+    /// so it cannot paint over a real pane. PR 8 adds the active host's
+    /// reconnect notice on the same line.
+    pub(super) fn render_pane_notice(
+        &self,
+        buffer: &mut Buffer,
+        area: Rect,
+        config: &ClientShellConfig,
+    ) {
+        let Some(notice) = self.pane_notice.as_deref() else {
+            return;
+        };
+        if area.is_empty() {
+            return;
+        }
+        super::render::put_text(
+            buffer,
+            area.x.saturating_add(1),
+            area.y,
+            area.width.saturating_sub(1),
+            notice,
+            Style::default()
+                .fg(config.palette.overlay0)
+                .add_modifier(Modifier::DIM),
+        );
     }
 }
 
@@ -183,6 +307,7 @@ impl ClientShellState {
         if fleet.switching_to == switching_to {
             return false;
         }
+        fleet.pane_notice = pane_notice(switching_to.as_ref());
         fleet.switching_to = switching_to;
         true
     }
@@ -203,6 +328,11 @@ impl ClientShellState {
     /// would otherwise leave the old machine's pane ids in the hit map and its
     /// leases, scroll targets and pending requests in flight.
     pub(crate) fn reset_for_host_switch(&mut self) {
+        // Everything `set_snapshot` resets on a boot change, and for the same
+        // reason: the ids, deadlines and in-flight requests below describe a
+        // server this shell is no longer talking to. `set_snapshot` will not
+        // do it for us — the snapshot is dropped here, so the new host's first
+        // projection does not read as a boot change.
         self.pane_surface = None;
         // The one that would mis-route: `hits.agents` and `hits.workspaces`
         // hold the *old* host's server-side ids, and a click resolves them
@@ -216,23 +346,43 @@ impl ClientShellState {
         self.workspace_press = None;
         self.tab_press = None;
         self.pane_mouse_gesture = None;
+        self.url_click_consumes_until_up = false;
         self.last_pane_click = None;
         self.selection = None;
+        self.stop_selection_autoscroll();
+        self.selection_highlight_clear_deadline = None;
+        self.pending_word_selection = None;
         self.copy_mode = None;
         self.reset_copy_pipeline();
+        self.copy_feedback = None;
+        self.copy_feedback_deadline = None;
         self.pending_requests.clear();
         self.pane_scroll_in_flight.clear();
         self.pane_scroll_queued.clear();
         self.pane_scroll_targets.clear();
+        self.pending_integration_installs = 0;
         self.pending_notifications.clear();
         self.visible_notification = None;
+        self.endpoint_notice_seen.clear();
+        self.visible_endpoint_notice = None;
         self.navigate_workspace_id = None;
         self.previous_pane_id = None;
         self.endpoint_error = None;
+        self.dismissed_product_announcement = None;
+        // Deviation from the plan's sketch, which kept the overlay: every
+        // overlay that outlives a click carries the previous host's ids
+        // (a rename, a close confirmation, a worktree action) or indexes
+        // into its projection (the navigator), and accepting one after the
+        // switch would send those ids to the new host. The picker overlay
+        // (PR 6) emits the switch and expects to be gone afterwards anyway.
+        self.overlay = None;
         self.workspace_scroll = 0;
         self.agent_scroll = 0;
         self.tab_scroll = 0;
+        self.mobile_switcher_scroll = 0;
         self.reveal_focused_workspace = true;
+        self.reveal_mobile_workspace = false;
+        self.mobile_switcher_suspended = false;
         self.reveal_focused_tab = true;
         self.last_composed_size = None;
         self.last_tab_bar_width = None;

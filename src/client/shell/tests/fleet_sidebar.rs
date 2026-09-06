@@ -95,6 +95,13 @@ fn fleet_state() -> FleetState {
     state
 }
 
+/// The model as the loop rebuilds it right after switching to `active`.
+fn model_switched_to(active: &str) -> FleetSidebarModel {
+    let mut fleet = fleet_state();
+    fleet.set_active_host(Some(host(active)));
+    model_for(&fleet, &[])
+}
+
 fn model_for(state: &FleetState, collapsed: &[&str]) -> FleetSidebarModel {
     let collapsed = collapsed
         .iter()
@@ -457,10 +464,16 @@ fn a_host_switch_drops_every_id_that_belonged_to_the_previous_host() {
     assert!(state.pane_surface.is_none());
     assert!(state.pending_requests.is_empty());
     assert!(state.endpoint_methods.is_none());
+    // The console keeps drawing — its chrome, from the placeholder — but
+    // nothing of the previous host's projection or surface survives in it.
+    let text = screen(&mut state);
     assert!(
-        state.compose(120, 40).is_none(),
-        "nothing draws until the new host does"
+        !text.contains("alpha-space"),
+        "the old host's own rows are gone:\n{text}"
     );
+    assert!(state.hits.panes.is_empty());
+    assert!(state.hits.agents.is_empty());
+    assert!(state.hits.workspaces.is_empty());
 }
 
 #[test]
@@ -574,4 +587,112 @@ fn five_hosts_of_fifteen_agents_can_be_scrolled_down_to_the_last_row() {
         text.contains("lab-5-agent-14"),
         "scrolling reaches the last host's last agent:\n{text}"
     );
+}
+
+#[test]
+fn a_switch_to_a_host_without_a_surface_still_draws_the_console_and_says_so() {
+    let mut state = console(&[]);
+    let _ = screen(&mut state);
+
+    // The loop's order: reset, install the new host's projection (beta has
+    // one), rebuild the model with the switch pending. No surface yet.
+    state.reset_for_host_switch();
+    state.set_snapshot(Box::new(host_snapshot("beta", "boot-beta")));
+    state.fleet_sidebar_update(model_switched_to("beta"), host("beta"), Some(host("beta")));
+    let text = screen(&mut state);
+    assert!(
+        text.contains("switching to beta…"),
+        "the pane area says what it is waiting for:\n{text}"
+    );
+    assert!(
+        text.contains("beta-space"),
+        "the new host's own rows come from its projection:\n{text}"
+    );
+    assert!(
+        state.hits.panes.is_empty(),
+        "nothing of the pane area is clickable until a real surface draws it"
+    );
+    // The reason this exists: a switch to a host that never answers must
+    // leave every other host one click away.
+    let _ = fleet_hit(&state, &FleetSidebarHit::HostHeader(host("alpha")));
+
+    // A host with no projection at all draws from the placeholder.
+    state.reset_for_host_switch();
+    state.fleet_sidebar_update(
+        model_switched_to("gamma"),
+        host("gamma"),
+        Some(host("gamma")),
+    );
+    let text = screen(&mut state);
+    assert!(
+        text.contains("switching to gamma…") && text.contains("▾ alpha"),
+        "the chrome draws with no projection at all:\n{text}"
+    );
+    let _ = fleet_hit(&state, &FleetSidebarHit::HostHeader(host("alpha")));
+
+    // And once the switch lands, the notice is gone.
+    assert!(state.set_fleet_switching(None));
+    let text = screen(&mut state);
+    assert!(!text.contains("switching to"), "{text}");
+}
+
+#[test]
+fn a_single_host_client_still_draws_nothing_before_its_server_does() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(host_snapshot("alpha", "boot-1")));
+    assert!(
+        state.compose(120, 40).is_none(),
+        "the placeholder is a fleet console's, not the single-host client's"
+    );
+}
+
+#[test]
+fn a_host_switch_closes_the_overlay_and_forgets_the_previous_hosts_timers() {
+    let mut state = console(&[]);
+    let _ = screen(&mut state);
+    state.overlay = Some(ClientShellOverlay::Onboarding);
+    state.selection_autoscroll_deadline = Some(std::time::Instant::now());
+    state.pending_integration_installs = 2;
+    state.workspace_press = Some(ClientWorkspacePress {
+        workspace_id: "ws_1".into(),
+        start_column: 3,
+        start_row: 3,
+    });
+
+    state.reset_for_host_switch();
+
+    assert!(
+        state.overlay.is_none(),
+        "an overlay accepted after the switch would carry the old host's ids"
+    );
+    assert!(state.selection_autoscroll_deadline.is_none());
+    assert_eq!(state.pending_integration_installs, 0);
+    assert!(
+        state.workspace_press.is_none(),
+        "a press released after the switch would focus the old workspace id"
+    );
+}
+
+#[test]
+fn fleet_rows_never_leave_the_sidebar_bodies() {
+    fn inside(rect: Rect, body: Rect) -> bool {
+        rect.x >= body.x
+            && rect.right() <= body.right()
+            && rect.y >= body.y
+            && rect.bottom() <= body.bottom()
+    }
+    for rows in [40u16, 12, 9, 8, 7, 6, 5, 4, 3] {
+        let mut state = console(&[]);
+        if state.compose(120, rows).is_none() {
+            continue;
+        }
+        let (spaces, agents) = (state.hits.workspace_body, state.hits.agent_body);
+        for (rect, hit) in &state.hits.fleet_rows {
+            assert!(
+                inside(*rect, spaces) || inside(*rect, agents),
+                "{hit:?} at {rect:?} is outside {spaces:?} and {agents:?} at {rows} rows: \
+                 a click there would switch hosts from the footer"
+            );
+        }
+    }
 }

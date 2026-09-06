@@ -194,31 +194,67 @@ pub(super) fn present(state: &mut ClientState) {
     state.present_frame(frame);
 }
 
-/// Handle one fleet action the shell asked the loop for.
+/// What one fleet action did to the console.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct FleetActionOutcome {
+    /// The chrome changed: recompose rather than present a frame composed
+    /// before the action.
+    pub(super) repaint: bool,
+    /// The routing target moved. Anything the shell produced *before* this —
+    /// in the same input batch — named the previous host's ids and must not
+    /// be sent to the new one.
+    pub(super) switched: bool,
+}
+
+/// Recompose after a terminal resize the active host cannot answer.
 ///
-/// Returns whether the console needs a repaint.
+/// A resize drops the pane surface *and the hit map* and waits for the server
+/// to render at the new size (`invalidate_pane_surface`). A host that is down,
+/// or one a switch is still waiting on, never will — and until something else
+/// repainted, the console would have no clickable row to leave it by. A
+/// connected host keeps the single-host behaviour: its next surface redraws.
+pub(super) fn present_after_resize(state: &mut ClientState) {
+    let waiting_on_host = state.fleet.as_ref().is_some_and(|fleet| {
+        fleet.pending_switch.is_some()
+            || !fleet
+                .state
+                .host(&fleet.active)
+                .is_some_and(|host| matches!(host.connection, HostConnection::Connected { .. }))
+    });
+    if waiting_on_host {
+        present(state);
+    }
+}
+
+/// Handle one fleet action the shell asked the loop for.
 pub(super) fn handle_shell_action(
     state: &mut ClientState,
     write_stream: &mut ServerLink,
     endpoint_commands: &mut EndpointCommands,
     action: FleetShellAction,
-) -> Result<bool, ClientError> {
+) -> Result<FleetActionOutcome, ClientError> {
     match action {
         FleetShellAction::SwitchHost { host, then_focus } => {
             switch_host(state, write_stream, endpoint_commands, host, then_focus)
         }
         FleetShellAction::ToggleCollapsed(host) => {
             let Some(fleet) = state.fleet.as_mut() else {
-                return Ok(false);
+                return Ok(FleetActionOutcome::default());
             };
             if !fleet.collapsed.remove(&host) {
                 fleet.collapsed.insert(host);
             }
-            Ok(rebuild_sidebar(state))
+            Ok(FleetActionOutcome {
+                repaint: rebuild_sidebar(state),
+                switched: false,
+            })
         }
         // Agent order inside every group is a function of this preference, so
         // every group's rows are stale, not just the active host's.
-        FleetShellAction::SortChanged => Ok(rebuild_sidebar(state)),
+        FleetShellAction::SortChanged => Ok(FleetActionOutcome {
+            repaint: rebuild_sidebar(state),
+            switched: false,
+        }),
     }
 }
 
@@ -238,13 +274,13 @@ pub(super) fn switch_host(
     endpoint_commands: &mut EndpointCommands,
     host: HostId,
     then_focus: Option<FleetFocusTarget>,
-) -> Result<bool, ClientError> {
+) -> Result<FleetActionOutcome, ClientError> {
     let Some(fleet) = state.fleet.as_mut() else {
         debug!(%host, "ignoring a host switch outside a fleet console");
-        return Ok(false);
+        return Ok(FleetActionOutcome::default());
     };
     if !switch_target_allowed(fleet, &host) {
-        return Ok(false);
+        return Ok(FleetActionOutcome::default());
     }
 
     // The connector decides what a host's surface is; tell it the console's
@@ -264,7 +300,7 @@ pub(super) fn switch_host(
         pixel_mouse: state.pixel_geometry_exact,
     };
     let Some(fleet) = state.fleet.as_mut() else {
-        return Ok(false);
+        return Ok(FleetActionOutcome::default());
     };
     let changes = retarget_host(
         fleet,
@@ -293,10 +329,19 @@ pub(super) fn switch_host(
             shell.set_snapshot(snapshot);
         }
     }
-    let mut repaint = !changes.is_empty();
-    repaint |= rebuild_sidebar(state);
+    // The sidebar always changes (the active marker moved) and the pane area
+    // now shows the switching notice: a frame composed before this call
+    // describes the previous host.
+    rebuild_sidebar(state);
     flush_pending_focus(state, write_stream, endpoint_commands)?;
-    Ok(repaint)
+    debug_assert!(
+        !changes.is_empty(),
+        "an allowed switch changes the active host"
+    );
+    Ok(FleetActionOutcome {
+        repaint: true,
+        switched: true,
+    })
 }
 
 /// Whether this host may become the routing target at all.

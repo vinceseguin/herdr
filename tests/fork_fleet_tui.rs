@@ -98,7 +98,8 @@ fn sgr_click(column: u16, row: u16) -> Vec<u8> {
 /// The spaces list starts two rows under the sidebar's " spaces" title, and
 /// each lab session has exactly one workspace, so the rows are: the first
 /// host's header, its workspace, then the second host's header. If the sidebar
-/// layout ever moves, the assertions below fail with the screen attached.
+/// layout ever moves, the click lands on nothing and the "switching to lab-2"
+/// assertion below fails with the screen attached.
 const SECOND_HOST_HEADER_ROW: u16 = 5;
 /// Column 3: past the `▾`/`▸` collapse cell, inside the header's text.
 const HEADER_COLUMN: u16 = 3;
@@ -156,6 +157,19 @@ fn sidebar_lists_every_host_and_click_switches() {
 
     // Click lab-2's header: one real SGR press through the real hit map.
     console.send(&sgr_click(HEADER_COLUMN, SECOND_HOST_HEADER_ROW));
+    // The pane area follows the switch: first the console's own "switching
+    // to lab-2…" frame blanks it, then lab-2's first surface draws over the
+    // blank — so this text is emitted whole, not as a cell diff against
+    // lab-1's frame. A click that lands on the wrong row fails here, with
+    // the screen attached, rather than by typing into lab-1 below. Typing
+    // waits for it because a keystroke in the same input batch as the click
+    // still names the host that was on screen, and goes there.
+    assert_screen(
+        &console,
+        "herdr-fleet-lab:lab-2",
+        RENDER_TIMEOUT,
+        "the click on lab-2's header did not switch the console to it",
+    );
     console.send(b"switch-marker");
 
     // The console draws the *new* host, so the echo of what was typed can only

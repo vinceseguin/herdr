@@ -674,8 +674,18 @@ fn dispatch_client_shell_actions(
 ) -> Result<(Vec<crossterm::event::MouseEvent>, bool), ClientError> {
     let mut replay_mouse = Vec::new();
     let mut fleet_repaint = false;
+    let mut host_switched = false;
     for action in actions {
         match action {
+            // Built from the projection the shell had *before* the switch in
+            // this same batch: its ids belong to the previous host, and the
+            // link now writes to the new one (fork, E2 PR 5).
+            shell::ClientShellAction::Endpoint { request, .. } if host_switched => {
+                debug!(
+                    request_id = request.id,
+                    "dropping an endpoint request built before a host switch"
+                );
+            }
             shell::ClientShellAction::Endpoint { boot_id, request } => {
                 endpoint_commands.enqueue(boot_id, request);
             }
@@ -702,8 +712,10 @@ fn dispatch_client_shell_actions(
                 );
             }
             shell::ClientShellAction::Fleet(action) => {
-                fleet_repaint |=
+                let outcome =
                     fleet::handle_shell_action(state, write_stream, endpoint_commands, action)?;
+                fleet_repaint |= outcome.repaint;
+                host_switched |= outcome.switched;
             }
         }
     }
@@ -833,13 +845,28 @@ fn finish_client_shell_input(
         query_host_terminal_theme();
     }
     sync_client_shell_keyboard_report_all(state)?;
+    // A Fleet console's host switch (fork, E2 PR 5) moves the link mid-batch.
+    // The raw requests of this outcome name pane and workspace ids of the
+    // host that was on screen when they were produced, so they go to *that*
+    // host — before the switch — never to the one the batch ends on.
+    let mut requests = outcome.requests;
+    if outcome.actions.iter().any(|action| {
+        matches!(
+            action,
+            shell::ClientShellAction::Fleet(shell::FleetShellAction::SwitchHost { .. })
+        )
+    }) {
+        for request in requests.drain(..) {
+            write_to_server(write_stream, &request).map_err(ClientError::ConnectionLost)?;
+        }
+    }
     let (replay, fleet_repaint) =
         dispatch_client_shell_actions(outcome.actions, endpoint_commands, write_stream, state)?;
     debug_assert!(
         replay.is_empty(),
         "mouse replay only follows endpoint results"
     );
-    for request in outcome.requests {
+    for request in requests {
         write_to_server(write_stream, &request).map_err(ClientError::ConnectionLost)?;
     }
     // A host switch happened *during* the dispatch above, so `frame` describes
@@ -1633,6 +1660,9 @@ async fn run_client_loop(
                     write_to_server(&mut write_stream, &msg)
                         .map_err(ClientError::ConnectionLost)?;
                 }
+                // A host that cannot render the new size must not leave the
+                // console without a hit map (fork, E2 PR 5).
+                fleet::present_after_resize(&mut state);
             }
             ClientLoopEvent::ServerMessage(msg) => match *msg {
                 ServerMessage::ClientShellSnapshot(_) => {
