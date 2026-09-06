@@ -2,8 +2,10 @@ name: Fork CI
 
 # Fork CI for vinceseguin/herdr. Upstream's workflows are disabled through
 # repository state (`gh workflow disable`), so this file is the only CI that
-# runs here. It runs exactly the fork gate (`just ci`) plus the upstream
-# conventional-commit check and shellcheck over the fork's own scripts.
+# runs here. It runs exactly the fork gate (`just ci`) for the default
+# feature set and `just ci-no-default` for the upstream-shaped build, plus
+# the upstream conventional-commit check and shellcheck over the fork's own
+# scripts.
 # Action SHAs are kept identical to .github/workflows/ci.yml so upstream
 # Dependabot-style bumps stay mergeable.
 
@@ -110,6 +112,43 @@ jobs:
 
       - name: Run the gate
         run: just ci
+
+  check-no-default-features:
+    name: check-no-default-features (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          components: rustfmt,clippy
+
+      - name: Install Rust tools
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: just,cargo-nextest
+
+      # No bun: `just ci-no-default` runs clippy and nextest only. Zig is still
+      # required because build.rs always builds the vendored libghostty-vt.
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: false
+          key: fork-ubuntu-latest-nodefault
+
+      - name: Run the gate without default features
+        run: just ci-no-default
 
   shellcheck:
     runs-on: ubuntu-latest

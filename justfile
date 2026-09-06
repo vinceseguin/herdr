@@ -43,6 +43,16 @@ ci filter='all()': lint
     just integration-assets-test
     just plugin-marketplace-test
 
+# Lint the upstream-shaped build (fork feature `gateway` off)
+[unix]
+lint-no-default:
+    cargo clippy --all-targets --locked --no-default-features -- -D warnings
+
+# Run PR CI checks for the second feature set (fork: `check-no-default-features`)
+[unix]
+ci-no-default filter='all()': lint-no-default
+    cargo nextest run --locked --no-default-features -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
+
 # Run Windows target lint from Unix/macOS to catch cfg(windows) compile and clippy failures before CI
 [unix]
 windows-lint:

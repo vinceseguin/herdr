@@ -101,6 +101,23 @@ prints `EXIT=4` — name a test that exists.
 A path that is not a herdr checkout exits 2. The gate's last suite runs
 `bun install --frozen-lockfile`, so a full `just ci` needs network.
 
+Since E3 PR 1 the crate has a cargo feature, `gateway`, on by default, so
+green means **two** feature sets. Run the second one through the same wrapper
+before opening a pull request:
+
+```bash
+bash scripts/fork/gate.sh .claude/worktrees/<branch-slug> ci-no-default
+```
+
+`just ci-no-default` is `cargo clippy --all-targets --locked
+--no-default-features -- -D warnings` plus `cargo nextest run --locked
+--no-default-features` — the upstream-shaped build, with no `herdr gateway`,
+no axum and no other optional dependency linked. It needs no bun (it skips the
+python and bun suites `just ci` already covers) but still needs Zig, because
+`build.rs` always builds the vendored libghostty-vt. Anything gateway-only
+must therefore carry `#[cfg(feature = "gateway")]`, and a `tests/*.rs` file
+that uses it needs a crate-level `#![cfg(feature = "gateway")]`.
+
 ### Testing a debug build by hand
 
 Never point a debug build at your live herdr. Use a throwaway
@@ -390,13 +407,14 @@ reconnect behaviour, and the `src/fleet/` module map for E3 — is in
 ## Continuous integration
 
 Fork CI is [`.github/workflows/fork-ci.yml`](../../.github/workflows/fork-ci.yml)
-— three jobs on `ubuntu-latest`, and their names are what
+— four jobs on `ubuntu-latest`, and their names are what
 `gh pr checks <pr> -R vinceseguin/herdr --watch` reports:
 
 | Job | What it runs |
 | --- | --- |
 | `conventional-commits` | `scripts/conventional_commits.py` on the PR title (PR) or on the pushed subjects (push to `master`) |
 | `check (ubuntu-latest)` | `just ci` — the same gate you run locally |
+| `check-no-default-features (ubuntu-latest)` | `just ci-no-default` — clippy and nextest for the upstream-shaped build (no bun; Zig still required) |
 | `shellcheck` | `shellcheck -S warning scripts/fork/*.sh` |
 
 Two deliberate divergences from upstream's `ci.yml`: the push check walks
@@ -442,11 +460,12 @@ After every sync, re-run `gh workflow list --all -R vinceseguin/herdr` and
 
 Fork-owned paths never conflict — whole directories (`docs/fork/`, `.claude/`,
 `scripts/fork/`, including `fleet-lab.sh`, `ssh-lab.sh`, `gate.sh` and
-`dev-setup.sh`; `src/fleet/`, and `src/gateway/` and `web/` once later epics
-create them) plus fork-only files that live inside upstream directories:
+`dev-setup.sh`; `src/fleet/` and `src/gateway/`, and `web/` once E4 creates
+it) plus fork-only files that live inside upstream directories:
 `src/cli/fleet.rs`, `.github/workflows/fork-*.yml`, every `tests/fork_*.rs`
 (today `tests/fork_channel.rs`, `tests/fork_fleet_lab.rs`,
-`tests/fork_ssh_lab.rs`), `tests/support/fleet_lab.rs` and `tests/cli/fleet.rs`.
+`tests/fork_gateway.rs`, `tests/fork_ssh_lab.rs`), `tests/support/fleet_lab.rs`
+and `tests/cli/fleet.rs`.
 
 The upstream files that currently carry fork wiring, and may conflict:
 
@@ -454,11 +473,12 @@ The upstream files that currently carry fork wiring, and may conflict:
 | --- | --- |
 | `.cargo/config.toml` | the `[env]` build channel |
 | `src/build_info.rs`, `src/update.rs`, `src/release_notes.rs` | fork build identity, self-update disabled |
-| `src/main.rs` | `mod fleet;`, the `[fleet]` block of `DEFAULT_CONFIG`, one `--help` usage line, `"fleet"` in the bare-command list |
+| `Cargo.toml`, `Cargo.lock` | the `[features]` section (`default = ["gateway"]`) and the five gateway dependencies (E3 PR 1) |
+| `justfile` | `lint-no-default` and `ci-no-default` (E3 PR 1) |
+| `src/main.rs` | `mod fleet;`, gated `mod gateway;`, the `[fleet]` block of `DEFAULT_CONFIG`, two `--help` usage lines, `"fleet"` and gated `"gateway"` in the bare-command list |
 | `src/remote/attach.rs` | `pub(crate)` visibility on the ssh stdio bridge and remote discovery, plus `start_with`/`local_forward_socket_path_scoped`/`BridgeErrorSink` (E1 PR 3) — upstream's side first, then re-apply |
-| `src/cli.rs`, `src/cli/spec.rs` | one `mod fleet;` + match arm, and `fleet_command()` |
+| `src/cli.rs`, `src/cli/spec.rs` | one `mod fleet;` + match arm and a gated `"gateway"` arm, `fleet_command()` and a gated `gateway_command()` |
 | `src/config/model.rs`, `src/config/io.rs`, `src/config.rs` | the `[fleet]` section, its `KNOWN_TOP_LEVEL_CONFIG_KEYS`/live-reload entry, and its diagnostics |
-| `src/remote/attach.rs` | `pub(crate)` visibility on the ssh stdio bridge and remote discovery, plus `start_with`/`local_forward_socket_path_scoped`/`BridgeErrorSink` (E1 PR 3) |
 | `scripts/config_reference_check.py` | one `SKIPPED_SUBTREES` entry for `fleet` |
 | `src/app/mod.rs` (tests only), `tests/support/mod.rs`, `tests/api_ping.rs`, `tests/cli/sessions.rs`, `tests/cli/mod.rs` | fork test wiring |
 | `.gitignore`, the fork section at the tail of `AGENTS.md` | fork layout and rules |
