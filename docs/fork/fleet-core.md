@@ -4,7 +4,10 @@ Epic **E1** gives one herdr client process connections to several herdr
 servers at once — this machine's default session, other named sessions on this
 machine, and machines reached over SSH — and merges what they report into a
 single, host-qualified view. `herdr fleet status` is the first surface built on
-it; the fleet TUI (E2) and the gateway (E3) are the next two.
+it; the gateway (E3) is the next. (The fork's own fleet TUI, E2, was
+retired in favour of upstream's multi-machine client — see
+[ADR 0002](./decisions/0002-adopt-upstream-multi-machine-client.md);
+`herdr machine …` is the console.)
 
 Nothing on the other side changes. A fleet host runs a **stock** herdr server
 and speaks the frozen generation-1 client endpoint protocol; the fork adds no
@@ -28,7 +31,7 @@ The fleet is configured in the normal `config.toml`
 
 ```toml
 [fleet]
-# Hosts aggregated by `herdr fleet status` and the fork's fleet console.
+# Hosts aggregated by `herdr fleet status` and the fork's gateway.
 # This machine's default session is always host "local" unless disabled.
 # include_local = true
 #
@@ -315,7 +318,7 @@ two hosts are elided, for length. Nothing else is edited.)
 | --- | --- |
 | `schema` | Always `herdr.fleet.status.v1`. |
 | `client_version` | Version of the client that produced the report (`0.8.2-fork`). |
-| `active_host` | `null` for `herdr fleet status`; E2 sets it. |
+| `active_host` | `null` for `herdr fleet status`; a long-lived consumer that installs one host's surfaces sets it. |
 | `hosts[]` | Every configured host, in config order, `local` first. |
 | `hosts[].kind` | `"local"` or `"ssh"`; treat an unknown value as a transport you cannot use. |
 | `hosts[].connection` | Tagged by `state`; see [Connection states](#connection-states). |
@@ -377,7 +380,7 @@ snapshot lab-ssh boot 1613778-1788644429866237637 revision 1
 | `agent_added` | `agent + <ref> <status> <workspace>` | An agent joined the merged list, or rejoined it. Treat it as an upsert keyed by `ref`: a reconnecting host re-announces every agent it still has. |
 | `agent_removed` | `agent - <ref>` | An agent left, or its host stopped contributing. |
 | `agent_status` | `agent ~ <ref> <from> -> <to>` | Status transition. |
-| `active_host` | `active host <id>` / `active host none` | The active host changed (E2). |
+| `active_host` | `active host <id>` / `active host none` | The active host changed (a consumer called `set_active`). |
 
 Every line is flushed as it is written, so `herdr fleet status --watch --json |
 jq` works live. A closed pipe (`| head`) ends the watch: like every herdr CLI
@@ -505,7 +508,8 @@ up until it times out. A long-running consumer (the gateway, E3) must call
 
 `bridge_connection` spawns `ssh` with `stderr` inherited, exactly as
 `herdr --remote` does. In a CLI that is what you want — ssh's own errors reach
-your terminal. **A full-screen consumer (E2) must redirect it**, or an ssh
+your terminal. **A full-screen or daemon consumer (the gateway, E3) must
+redirect it**, or an ssh
 warning will be painted straight over the TUI.
 
 ## Reconnecting
@@ -539,7 +543,7 @@ By design (plan decision (f), ADR 0001), the fleet connector:
 - never turns one host's failure into a fleet-wide failure, and never calls
   `std::process::exit` or panics because of what a host said.
 
-One caveat that is **not** a no-op, and that E2 must respect: a connecting
+One caveat that is **not** a no-op, and that every consumer must respect: a connecting
 client shell becomes that host's *foreground* client, and the foreground
 client's surface size is the host's effective pane geometry. The fleet
 handshakes inactive hosts at herdr's own default headless geometry
@@ -547,8 +551,8 @@ handshakes inactive hosts at herdr's own default headless geometry
 headless server running agents — is a no-op resize. A host that already has an
 attached client, or a `[server]` `headless_cols`/`headless_rows` of its own, is
 still resized while the fleet client is connected and restored when it
-disconnects. **E2 should
-therefore hold fleet connections only while the fleet console is in use.** A
+disconnects. **A consumer should
+therefore hold fleet connections only while something is reading them.** A
 truly passive reader needs an endpoint observer capability, which is a server
 change and out of scope here.
 
@@ -579,7 +583,7 @@ Pure-state testing follows upstream's idiom: `FleetState::test_new()`,
 `FleetState::test_with_adversarial_identity_state()` and
 `FleetState::assert_invariants_for_test()`.
 
-### Driving the connector (E2)
+### Driving the connector with an active host
 
 ```text
 FleetConnector::start(specs, options)
@@ -595,12 +599,12 @@ Switching hosts is one `set_active` call; the first frame afterwards is a full
 before anything is allocated into the event channel, so an idle host in the
 sidebar costs no presentation work.
 
-Known gaps E2 owns:
+Known gaps a consumer with an active host owns:
 
 - `FleetConnectorOptions.active_surface` is fixed at `start`, so a *reconnect*
   of the active host re-handshakes with the size the connector was built with,
   not the last size sent through `HostCommand::Resize`. Add a setter (or have
-  the connector remember the last active resize) when E2 lands.
+  the connector remember the last active resize) when a consumer needs it.
 - The ssh child's stderr is inherited (see above) — redirect it.
 - On unix, `SshStdioBridge::drop` joins its accept thread, and each bridged
   connection waits for its `ssh` child without killing it, so **dropping an ssh
@@ -635,8 +639,8 @@ cached and recomputed only when a snapshot or a connection changes — never per
 render.
 
 It is deliberately different from upstream's per-host sidebar priority
-(`status_priority`, which puts done above working). E2's *per-host* rows keep
-upstream's order so a host group looks like today's sidebar; every *fleet*-wide
+(`status_priority`, which puts done above working). A *per-host* view should
+keep upstream's order so it looks like upstream's sidebar; every *fleet*-wide
 list uses `merged_agents()`.
 
 ### Testing locally

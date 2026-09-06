@@ -402,7 +402,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # manage_ssh_config = true
 
 [fleet]
-# Hosts aggregated by `herdr fleet status` and the fork's fleet console.
+# Hosts aggregated by `herdr fleet status` and the fork's gateway.
 # This machine's default session is always host "local" unless disabled.
 # include_local = true
 #

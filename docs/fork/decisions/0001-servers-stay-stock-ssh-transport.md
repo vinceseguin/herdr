@@ -154,8 +154,9 @@ fleet host runs a stock server. Six facts are worth recording.
   the fleet is connected. A
   genuinely passive reader would need an *advertised optional* endpoint
   observer method — exactly the escape hatch the decision reserves — and is out
-  of scope until an epic needs it. Until then E2 must hold fleet connections
-  only while the fleet console is in use.
+  of scope until an epic needs it. Until then a fleet consumer (the gateway,
+  E3 — the fork's console was retired by ADR 0002) must hold fleet
+  connections only while something is reading them.
 - **A user-space sshd is a sufficient SSH stand-in.** `scripts/fork/ssh-lab.sh`
   runs sshd as the invoking user on `127.0.0.1:2299` with a throwaway key, an
   in-lab `HOME`, and `SetEnv HOME/XDG_CONFIG_HOME/PATH`, so the whole ssh path —

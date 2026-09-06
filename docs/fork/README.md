@@ -16,14 +16,14 @@ architecture decisions in [`decisions/`](./decisions/).
 
 | | Upstream herdr | This fork |
 | --- | --- | --- |
-| Console | one TUI ↔ one server (local or one `--remote`) | `herdr fleet`: every LAN host's workspaces and agents in one sidebar, work in any of them |
+| Console | upstream's multi-machine client (`herdr machine add`, `list`, …; machine sidebar, background connects, reconnects — upstream #3670) | **the same** — the fork's own console (E2) was retired in favour of it, see [ADR 0002](./decisions/0002-adopt-upstream-multi-machine-client.md) |
 | Phone | — (third-party bridges) | `herdr gateway` + installable web app: agents grouped blocked-first, live terminals, answer prompts |
 | Away from home | SSH | same thing over Tailscale; gateway gets HTTPS from `tailscale serve` |
 | Servers | stock | **stock** — LAN hosts run upstream or the fork interchangeably |
 
-Design in one line: servers are untouched, SSH is the only transport, the
-gateway is loopback-first and token-gated, and every new line of code lives in
-an additive module so upstream merges stay cheap.
+Design in one line: servers are untouched, the console is upstream's, SSH is
+the only transport, the gateway is loopback-first and token-gated, and every
+new line of code lives in an additive module so upstream merges stay cheap.
 
 ## Working in the fork with Claude Code
 
@@ -376,10 +376,15 @@ lab-2    local  connected    0.8.2-fork  0        0        0     0     0
 no agents
 ```
 
+The multi-machine **console** is upstream's: `herdr machine add <target>`
+saves an SSH machine, and the client's machine sidebar shows every saved
+machine's workspaces and agents (upstream #3670). `herdr fleet status` is the
+fork's headless view of the same hosts, and the shape the gateway (E3) serves.
+
 `--json` prints the `herdr.fleet.status.v1` report the gateway will serve, and
 `--watch` streams one `FleetChange` per line. Full reference — every `[fleet]`
 key, the `host/w1:p1` id form, connection states and reasons, ssh host setup and
-reconnect behaviour, and the `src/fleet/` module map for E2/E3 — is in
+reconnect behaviour, and the `src/fleet/` module map for E3 — is in
 [`fleet-core.md`](./fleet-core.md).
 
 ## Continuous integration
@@ -417,8 +422,20 @@ git fetch upstream
 git switch -c chore/sync-upstream-$(date +%Y%m%d) origin/master
 git merge upstream/master          # merge, never rebase master
 bash scripts/fork/gate.sh          # EXIT=0
-git push -u origin HEAD && gh pr create -R vinceseguin/herdr --base master --fill && gh pr merge -R vinceseguin/herdr --squash --delete-branch
+git push -u origin HEAD && gh pr create -R vinceseguin/herdr --base master --fill && gh pr merge -R vinceseguin/herdr --merge --delete-branch
 ```
+
+A sync PR is merged with a **merge commit** (`--merge`, never `--squash`) so
+upstream's history stays in the fork's `master`. Resolve conflicts by
+ownership (ADR 0002): upstream's side for `src/client/**`,
+`src/remote/attach.rs` and new `src/remote/*` files, `src/server/**`,
+`src/api/**`, `src/platform/**`, `docs/next/**`; the fork's side for
+`src/fleet/**`, `src/gateway/**`, `scripts/fork/**`, `docs/fork/**`,
+`.claude/**`, `.github/workflows/fork-*.yml`, `assets/fork/**`; both sides in
+the wiring files of the table below. Then re-apply E1's three
+`src/remote/attach.rs` hooks onto upstream's version (or adapt
+`src/fleet/transport/ssh.rs` to an equivalent upstream bridge, and say so in
+the merge commit).
 
 After every sync, re-run `gh workflow list --all -R vinceseguin/herdr` and
 `gh workflow disable <file>` any **new** upstream workflow the merge added.
@@ -438,6 +455,7 @@ The upstream files that currently carry fork wiring, and may conflict:
 | `.cargo/config.toml` | the `[env]` build channel |
 | `src/build_info.rs`, `src/update.rs`, `src/release_notes.rs` | fork build identity, self-update disabled |
 | `src/main.rs` | `mod fleet;`, the `[fleet]` block of `DEFAULT_CONFIG`, one `--help` usage line, `"fleet"` in the bare-command list |
+| `src/remote/attach.rs` | `pub(crate)` visibility on the ssh stdio bridge and remote discovery, plus `start_with`/`local_forward_socket_path_scoped`/`BridgeErrorSink` (E1 PR 3) — upstream's side first, then re-apply |
 | `src/cli.rs`, `src/cli/spec.rs` | one `mod fleet;` + match arm, and `fleet_command()` |
 | `src/config/model.rs`, `src/config/io.rs`, `src/config.rs` | the `[fleet]` section, its `KNOWN_TOP_LEVEL_CONFIG_KEYS`/live-reload entry, and its diagnostics |
 | `src/remote/attach.rs` | `pub(crate)` visibility on the ssh stdio bridge and remote discovery, plus `start_with`/`local_forward_socket_path_scoped`/`BridgeErrorSink` (E1 PR 3) |
