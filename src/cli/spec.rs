@@ -146,7 +146,7 @@ fn status_command() -> Command {
 
 fn fleet_command() -> Command {
     Command::new("fleet")
-        .about("Open the Fleet console, or inspect the configured fleet")
+        .about("Inspect the configured fleet of herdr hosts")
         .subcommand(
             Command::new("status")
                 .about("Show every configured fleet host and its agents")

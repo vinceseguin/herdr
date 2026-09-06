@@ -30,7 +30,6 @@ mod terminal_sessions;
 mod terminal_setup;
 mod timer;
 
-pub use fleet::run_fleet;
 #[cfg(test)]
 pub(crate) use shell::{ClientShellConfig, ClientShellState};
 pub use terminal_sessions::{run_terminal_session_control, run_terminal_session_observe};
@@ -350,109 +349,41 @@ pub fn run_terminal_attach(_terminal_id: String, _takeover: bool) -> io::Result<
     ))
 }
 
-/// One client launch, in one value: which server — or servers — it opens.
-struct ClientLaunch {
-    attach_request: Option<(String, bool)>,
-    attach_escape: Option<AttachEscapeState>,
-    log_message: &'static str,
-    /// `Some` for the Fleet console, which opens every configured host instead
-    /// of one client socket.
-    fleet: Option<fleet::FleetLaunch>,
-}
-
-impl ClientLaunch {
-    /// `herdr fleet` / `herdr --fleet`.
-    fn fleet() -> Self {
-        Self {
-            attach_request: None,
-            attach_escape: None,
-            log_message: "opening the fleet console",
-            fleet: Some(fleet::FleetLaunch),
-        }
-    }
-}
-
 fn run_client_with_mode(
     attach_request: Option<(String, bool)>,
     attach_escape: Option<AttachEscapeState>,
     log_message: &'static str,
 ) -> io::Result<()> {
-    run_client_with_launch(ClientLaunch {
-        attach_request,
-        attach_escape,
-        log_message,
-        fleet: None,
-    })
-}
-
-fn run_client_with_launch(launch: ClientLaunch) -> io::Result<()> {
-    let ClientLaunch {
-        attach_request,
-        attach_escape,
-        log_message,
-        fleet,
-    } = launch;
-    let fleet_console = fleet.is_some();
     init_logging();
 
     let loaded_config = crate::config::Config::load();
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
     let client_rendered_shell = attach_request.is_none();
-    // Resolved before anything touches the terminal: an invalid `[fleet]`
-    // section is a plain message, not a wrecked screen. A host that is merely
-    // unreachable is never an error here — it is sidebar state.
-    let fleet_hosts =
-        fleet.map(
-            |fleet::FleetLaunch| match fleet::resolve_console_hosts(&loaded_config.config) {
-                Ok(specs) => specs,
-                Err(diagnostics) => {
-                    for diagnostic in &diagnostics {
-                        eprintln!("herdr: {diagnostic}");
-                    }
-                    std::process::exit(1);
-                }
-            },
-        );
     let socket_path = client_socket_path();
-    let keybinding_source = if fleet_console {
-        fleet::console_keybinding_source()
-    } else {
-        client_shell_keybinding_source()
-    };
+    let keybinding_source = client_shell_keybinding_source();
     let startup_config_diagnostic =
         if keybinding_source == shell::ClientShellKeybindingSource::Endpoint {
             crate::config::config_diagnostic_summary_without_keybindings(&loaded_config.diagnostics)
         } else {
             crate::config::config_diagnostic_summary(&loaded_config.diagnostics)
         };
-    // The console's chrome preferences belong to the console, not to whichever
-    // host it happens to be showing; every other client keys them on its socket.
-    let preferences_key = if fleet_console {
-        fleet::console_preferences_key()
-    } else {
-        socket_path.clone()
-    };
     let shell_config = client_rendered_shell.then(|| {
         shell::ClientShellConfig::from_config(&loaded_config.config)
             .with_startup_config_diagnostic(startup_config_diagnostic)
             .with_startup_onboarding(loaded_config.config.should_show_onboarding())
             .with_keybinding_source(keybinding_source)
-            .with_local_endpoint(&preferences_key)
+            .with_local_endpoint(&socket_path)
     });
     let mouse_capture = loaded_config.config.ui.mouse_capture;
     let mouse_scroll_lines = loaded_config.config.ui.mouse_scroll_lines();
     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
     let host_cursor = loaded_config.config.ui.host_cursor;
-    // A console is not a remote client process, whatever the environment says,
-    // and locked decision (h) keeps graphics out of fleet mode v1.
-    let remote_image_paste_key = (!fleet_console)
-        .then(|| client_remote_image_paste_key(&loaded_config.config))
-        .flatten();
+    let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
     let kitty_graphics_enabled =
-        loaded_config.config.kitty_graphics_enabled() && client_rendered_shell && !fleet_console;
+        loaded_config.config.kitty_graphics_enabled() && client_rendered_shell;
     let pixel_geometry_enabled = kitty_graphics_enabled || attach_escape.is_some();
     let loop_config = ClientLoopConfig {
-        sound_config: loaded_config.config.ui.sound.clone(),
+        sound_config: loaded_config.config.ui.sound,
         mouse_scroll_lines,
         redraw_on_focus_gained,
         host_cursor,
@@ -465,25 +396,17 @@ fn run_client_with_launch(launch: ClientLaunch) -> io::Result<()> {
     };
 
     crate::logging::startup("client");
-    match fleet_hosts.as_ref() {
-        Some(hosts) => info!(hosts = hosts.len(), "{log_message}"),
-        None => info!(path = %socket_path.display(), "{log_message}"),
-    }
+    info!(path = %socket_path.display(), "{log_message}");
 
-    // Try to connect to the server. A fleet console has no single socket: it
-    // opens every host after the terminal is up, so no host can keep it from
-    // starting (locked decision (i)).
-    let mut stream = match fleet_hosts {
-        Some(_) => None,
-        None => match crate::ipc::connect_local_stream(&socket_path) {
-            Ok(s) => Some(s),
-            Err(err) => {
-                // Server unreachable — show clear error and exit.
-                let client_err = ClientError::ConnectionFailed(err);
-                eprintln!("herdr: {client_err}");
-                std::process::exit(1);
-            }
-        },
+    // Try to connect to the server.
+    let mut stream = match crate::ipc::connect_local_stream(&socket_path) {
+        Ok(s) => s,
+        Err(err) => {
+            // Server unreachable — show clear error and exit.
+            let client_err = ClientError::ConnectionFailed(err);
+            eprintln!("herdr: {client_err}");
+            std::process::exit(1);
+        }
     };
 
     // Get the terminal geometry before handshake (before raw mode).
@@ -499,35 +422,31 @@ fn run_client_with_launch(launch: ClientLaunch) -> io::Result<()> {
         .as_ref()
         .is_some_and(shell::ClientShellConfig::uses_endpoint_keybindings);
 
-    // Perform handshake while the stream is still in blocking mode. The
-    // console handshakes each host inside the connector instead, after the
-    // terminal is up.
-    let handshake = stream.as_mut().map(|stream| {
-        match do_handshake(
-            stream,
-            cols,
-            rows,
-            cell_width_px,
-            cell_height_px,
-            exact_cell_size,
-            shell_surface_size,
-            endpoint_keybindings,
-            loop_config.mouse_capture_active,
-        ) {
-            Ok(encoding) => encoding,
-            Err(err) => {
-                eprintln!("herdr: {err}");
-                std::process::exit(1);
-            }
+    // Perform handshake while the stream is still in blocking mode.
+    let handshake = match do_handshake(
+        &mut stream,
+        cols,
+        rows,
+        cell_width_px,
+        cell_height_px,
+        exact_cell_size,
+        shell_surface_size,
+        endpoint_keybindings,
+        loop_config.mouse_capture_active,
+    ) {
+        Ok(encoding) => encoding,
+        Err(err) => {
+            eprintln!("herdr: {err}");
+            std::process::exit(1);
         }
-    });
+    };
 
-    if let (Some((terminal_id, takeover)), Some(stream)) = (attach_request, stream.as_mut()) {
+    if let Some((terminal_id, takeover)) = attach_request {
         let attach = ClientMessage::AttachTerminal {
             terminal_id,
             takeover,
         };
-        if let Err(err) = link::write_stream_message(stream, &attach) {
+        if let Err(err) = link::write_stream_message(&mut stream, &attach) {
             eprintln!("herdr: failed to request terminal attach: {err}");
             std::process::exit(1);
         }
@@ -551,9 +470,6 @@ fn run_client_with_launch(launch: ClientLaunch) -> io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         panic_restore();
-        // A console redirects stderr to the log while it owns the screen; the
-        // panic message belongs on the terminal the hook just restored.
-        fleet::restore_console_stderr();
         original_hook(info);
     }));
 
@@ -574,38 +490,9 @@ fn run_client_with_launch(launch: ClientLaunch) -> io::Result<()> {
         warn!(%err, "failed to install termination handler; terminal restore relies on TerminalGuard::Drop and the panic hook");
     }
 
-    // The console's hosts live exactly as long as the loop does.
-    let (client_link, console) = match fleet_hosts {
-        Some(specs) => {
-            let (link, console) = fleet::open_console(
-                specs,
-                &loaded_config.config,
-                fleet::ConsoleGeometry {
-                    surface: shell_surface_size.unwrap_or(crate::protocol::ClientSurfaceSize {
-                        cols: cols.max(1),
-                        rows: rows.max(1),
-                    }),
-                    cell_width_px,
-                    cell_height_px,
-                    pixel_mouse: exact_cell_size && cfg!(unix),
-                    mouse_capture,
-                },
-            )?;
-            (link, Some(console))
-        }
-        None => match stream {
-            Some(stream) => (ClientLink::single(stream), None),
-            None => {
-                return Err(io::Error::other(
-                    "client launch produced neither a server connection nor a fleet",
-                ))
-            }
-        },
-    };
-
     let result = rt.block_on(async {
         run_client_loop(
-            client_link,
+            ClientLink::single(stream),
             cols,
             rows,
             cell_width_px,
@@ -613,22 +500,12 @@ fn run_client_with_launch(launch: ClientLaunch) -> io::Result<()> {
             exact_cell_size,
             should_quit,
             loop_config,
-            handshake
-                .as_ref()
-                .map_or(RenderEncoding::SemanticFrame, |handshake| {
-                    handshake.encoding
-                }),
-            handshake.and_then(|handshake| handshake.endpoint_methods),
+            handshake.encoding,
+            handshake.endpoint_methods,
             attach_escape,
         )
         .await
     });
-
-    // Every way out of the loop — a quit, a detach, a termination signal, a
-    // terminal hangup — stops the console's hosts here; a panic runs the same
-    // shutdown while unwinding past `console`. Nothing else unlinks an ssh
-    // host's forward socket.
-    drop(console);
 
     // Restore the terminal before printing any final status message.
     let terminal_restore_failed = terminal_guard.restore().is_err();
@@ -957,15 +834,6 @@ fn handle_fleet_event(
             }
             Ok(FleetOutcome::Handled)
         }
-        fleet::Translated::EndpointMethods { methods, changes } => {
-            if let Some(fleet) = state.fleet.as_mut() {
-                fleet::apply_changes(fleet, changes);
-            }
-            if let Some(shell) = state.shell.as_mut() {
-                shell.set_endpoint_methods(Some(methods));
-            }
-            Ok(FleetOutcome::Handled)
-        }
         fleet::Translated::Changes(changes) => {
             if let Some(fleet) = state.fleet.as_mut() {
                 fleet::apply_changes(fleet, changes);
@@ -1016,16 +884,7 @@ async fn run_client_loop(
     #[cfg(windows)]
     let _ = config.mouse_scroll_lines;
     let draw_host_cursor = attach_escape.is_none() && should_draw_host_cursor(config.host_cursor);
-    // A fleet console has no single socket: one reader per host lives in the
-    // connector, and their events arrive on `fleet_events` instead.
-    let ClientLink {
-        link: mut write_stream,
-        mut fleet_events,
-        fleet,
-    } = link;
-    // The console is a local process talking to N servers; it is never the
-    // remote-client process `--remote` spawns, whatever the environment says.
-    let is_remote_client = fleet.is_none() && is_remote_client_process();
+    let is_remote_client = is_remote_client_process();
 
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
@@ -1058,7 +917,7 @@ async fn run_client_loop(
         draw_host_cursor,
         detached_process_children: Vec::new(),
         shell: config.shell_config.map(shell::ClientShellState::new),
-        fleet,
+        fleet: None,
     };
     if let Some(shell) = state.shell.as_mut() {
         shell.set_graphics_cell_size(initial_cell_width_px, initial_cell_height_px);
@@ -1149,6 +1008,12 @@ async fn run_client_loop(
 
     // Spawn the server reader thread (blocking reads from the socket).
     // Clone the stream's file descriptor so we can read from a blocking stream.
+    // A fleet console has no single socket: one reader per host lives in the
+    // connector, and their events arrive on `fleet_events` instead.
+    let ClientLink {
+        link: mut write_stream,
+        mut fleet_events,
+    } = link;
     if let ServerLink::Single(stream) = &mut write_stream {
         let server_read_quit = should_quit.clone();
         let server_read_tx = event_tx.clone();
@@ -1581,27 +1446,8 @@ async fn run_client_loop(
                         pixel_mouse: pixel_geometry_exact,
                     }
                 };
-                // The console follows the terminal even while the active host
-                // is down: the connector adopts the geometry either way, sends
-                // it to the active host only when connected and only when it
-                // changed, and a reconnecting host handshakes at it. That *is*
-                // the resize — writing the message through the link as well
-                // would send the active host every resize twice.
-                let announced = match (state.fleet.as_ref(), &msg) {
-                    (Some(fleet), ClientMessage::ClientShellResize { surface_size, .. }) => {
-                        fleet.announce_geometry(
-                            *surface_size,
-                            cell_width_px,
-                            cell_height_px,
-                            pixel_geometry_exact,
-                        );
-                        true
-                    }
-                    _ => false,
-                };
-                if !announced {
-                    write_to_server(&mut write_stream, &msg)
-                        .map_err(ClientError::ConnectionLost)?;
+                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                    return Err(ClientError::ConnectionLost(e));
                 }
             }
             ClientLoopEvent::ServerMessage(msg) => match *msg {
