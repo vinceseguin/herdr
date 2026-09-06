@@ -107,8 +107,13 @@ impl SshTransport {
     /// Building it may write herdr's managed ssh config, so it is deliberately
     /// not done in `new`: constructing a transport performs no I/O.
     fn ssh_session(&mut self) -> &RemoteSsh {
-        self.ssh
-            .get_or_insert_with(|| RemoteSsh::new(self.target.clone(), self.manage_ssh_config))
+        self.ssh.get_or_insert_with(|| {
+            RemoteSsh::new(
+                self.target.clone(),
+                self.manage_ssh_config,
+                self.session_name.clone(),
+            )
+        })
     }
 
     /// The remote herdr, discovered once and cached.
@@ -167,6 +172,9 @@ impl SshTransport {
             local_socket,
             session_name,
             options.as_ref(),
+            // Interactive ssh, as `herdr --remote` uses: the managed ssh
+            // config, control master and the user's own auth flow.
+            false,
             sink,
         )?;
         self.bridge = Some(bridge);

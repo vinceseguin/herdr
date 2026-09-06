@@ -660,7 +660,7 @@ impl FleetConnector {
                     // Half-closing makes the server hang up, which unblocks the
                     // reader thread. Windows named pipes have no equivalent; the
                     // thread there exits on its next message or with the process.
-                    if let Err(error) = crate::ipc::shutdown_local_stream_write(&stream) {
+                    if let Err(error) = shutdown_stream_write(&stream) {
                         tracing::debug!(host = %link.id, error = %error, "fleet host half-close failed");
                     }
                 }
@@ -1380,6 +1380,17 @@ fn drive_to_ceiling(backoff: &mut Backoff) -> Duration {
     delay
 }
 
+/// Half-close the write side of a unix-socket stream.
+///
+/// Upstream removed its `ipc::shutdown_local_stream_write` helper in #3670;
+/// the fleet is its only remaining caller, so it lives here.
+#[cfg(unix)]
+fn shutdown_stream_write(stream: &LocalStream) -> io::Result<()> {
+    match stream {
+        LocalStream::UdSocket(stream) => stream.inner().shutdown(std::net::Shutdown::Write),
+    }
+}
+
 #[cfg(all(test, unix))]
 pub(crate) mod test_support {
     //! A real endpoint server, minus herdr, for tests that must drive the
@@ -1590,6 +1601,7 @@ pub(crate) mod test_support {
                 input_codec: "shell.input.semantic.v2".to_string(),
                 blob_codec: "shell.blob.v2".to_string(),
                 methods: Vec::new(),
+                capabilities: Vec::new(),
                 error: None,
             },
             _ => EndpointServerWelcome::compatible(vec!["pane.write".to_string()]),
