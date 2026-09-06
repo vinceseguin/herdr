@@ -109,6 +109,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help=r"send BYTES to the terminal, with \r and \xNN escapes",
     )
     parser.add_argument(
+        "--redraw",
+        action=Step,
+        nargs=0,
+        help=(
+            "force a full repaint (resize the window and back) and forget the "
+            "text so far, so a --dump after it reads as one whole screen"
+        ),
+    )
+    parser.add_argument(
         "--dump", action="store_true", help="print the final screen text to stdout"
     )
     parser.add_argument(
@@ -129,11 +138,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return args
 
 
+def set_winsize(fd: int, cols: int, rows: int) -> None:
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
 def spawn(command: list[str], cols: int, rows: int) -> tuple[int, int]:
     """Fork `command` on a PTY that already has a real window size."""
     master, slave = pty.openpty()
     # Before the fork: the child must never observe a 0x0 grid.
-    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    set_winsize(master, cols, rows)
     pid = os.fork()
     if pid == 0:  # child
         try:
@@ -247,6 +260,19 @@ def main(argv: list[str]) -> int:
                         file=sys.stderr,
                     )
                     break
+            elif kind == "redraw":
+                # A client draws frame diffs, so a screen that changed one
+                # character only ever wrote that character.  Resizing forces a
+                # whole frame; dropping the text so far makes the next --dump
+                # exactly that frame.
+                screen.pump(0.2)
+                set_winsize(master, args.cols - 1, args.rows)
+                for _ in range(6):
+                    screen.pump(0.1)
+                screen.text = ""
+                set_winsize(master, args.cols, args.rows)
+                for _ in range(10):
+                    screen.pump(0.1)
             else:
                 # Give the client a beat to consume what it was shown before
                 # typing into it: input written into a PTY that is not being

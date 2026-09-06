@@ -67,6 +67,7 @@ impl ClientShellState {
                     .flatten(),
                 dragged_workspace_id,
                 workspace_drop_indicator_row,
+                fleet: self.fleet.as_ref(),
             },
         );
         self.hits.panes = surface

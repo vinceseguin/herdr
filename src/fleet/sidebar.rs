@@ -15,14 +15,6 @@
 //! and glyphs for a row's [`AgentStatus`] stay with the renderer (upstream's
 //! `status_icon`/`status_color`); what travels from here is the status itself.
 
-// Every item below is built for the console: PR 5 renders `FleetSidebarModel`,
-// PR 6 renders `host_picker_rows`, PR 7 reads `agent_status`. This PR lands the
-// model and its tests on their own so the render PRs are pure wiring, which
-// leaves the whole module without a production caller until PR 5. A module-wide
-// allow, rather than one per item, because there is exactly one reason and it
-// disappears in one commit: delete this attribute when PR 5 lands.
-#![allow(dead_code)]
-
 use std::cmp::Reverse;
 use std::collections::HashSet;
 
@@ -69,6 +61,9 @@ impl HostRowState {
     }
 
     /// Short lowercase name, matching [`HostConnection::state_name`].
+    // Read by the host picker overlay (E2 PR 6), which names the state in
+    // prose next to each row; the sidebar draws the state as a style instead.
+    #[allow(dead_code)]
     pub fn state_name(&self) -> &'static str {
         match self {
             Self::Connected => "connected",
@@ -132,13 +127,21 @@ pub struct AgentRow {
 /// Borrowed rather than owned (the plan sketched owned rows): the renderer
 /// walks this on every frame, and cloning a `String` per visible row per frame
 /// is exactly the per-frame allocation the model exists to avoid.
+///
+/// The console's sidebar turned out to have *two* lists, not one — spaces
+/// above, agents below — so it walks [`FleetSidebarModel::groups`] once per
+/// section instead of this flat order (E2 PR 5). Kept because it is the order
+/// a single-list surface (E4's phone list, a future overlay) needs, and
+/// because dropping it would take its tests with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum FleetSidebarRow<'a> {
     HostHeader(&'a HostHeaderRow),
     Workspace(&'a WorkspaceRow),
     Agent(&'a AgentRow),
 }
 
+#[allow(dead_code)]
 impl<'a> FleetSidebarRow<'a> {
     /// The host this row belongs to — the routing target of a click on it.
     ///
@@ -166,6 +169,8 @@ pub struct HostGroup {
 
 impl HostGroup {
     /// Rows drawn for this group right now: the header alone when collapsed.
+    // Flat-order helper; see [`FleetSidebarRow`].
+    #[allow(dead_code)]
     pub fn visible_row_count(&self) -> usize {
         if self.header.collapsed {
             1
@@ -230,6 +235,9 @@ impl FleetSidebarModel {
     }
 
     /// Status of one agent, addressed across hosts.
+    // Read by host-aware notifications (E2 PR 7) to decide whether a toast for
+    // another host's agent is still worth showing.
+    #[allow(dead_code)]
     pub fn agent_status(&self, pane: &FleetPaneRef) -> Option<AgentStatus> {
         self.group(&pane.host)?
             .agents
@@ -240,6 +248,8 @@ impl FleetSidebarModel {
 
     /// Rows to draw, top to bottom, collapsed groups contributing their header
     /// only. Borrows, so walking it allocates nothing.
+    // Flat-order helper; see [`FleetSidebarRow`].
+    #[allow(dead_code)]
     pub fn visible_rows(&self) -> impl Iterator<Item = FleetSidebarRow<'_>> {
         self.groups.iter().flat_map(|group| {
             let body = if group.header.collapsed {
@@ -260,6 +270,8 @@ impl FleetSidebarModel {
 
     /// How many rows [`FleetSidebarModel::visible_rows`] yields. O(hosts), so a
     /// scroll metric costs nothing per frame.
+    // Flat-order helper; see [`FleetSidebarRow`].
+    #[allow(dead_code)]
     pub fn visible_row_count(&self) -> usize {
         self.groups
             .iter()
@@ -273,6 +285,8 @@ impl FleetSidebarModel {
 /// Same hosts, same order as the sidebar, so a `1-9` jump in the picker names
 /// the same host as the *n*-th sidebar group.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Every field is read by the picker overlay's renderer (E2 PR 6).
+#[allow(dead_code)]
 pub struct HostPickerRow {
     pub host: HostId,
     pub active: bool,
@@ -286,6 +300,9 @@ pub struct HostPickerRow {
 }
 
 /// The picker's rows, in `[fleet]` order with `local` first.
+// Rendered by the host picker overlay (E2 PR 6). The sidebar (PR 5) draws
+// `FleetSidebarModel` instead; both derive from the same `FleetState`.
+#[allow(dead_code)]
 pub fn host_picker_rows(state: &FleetState) -> Vec<HostPickerRow> {
     let active = state.active_host();
     state

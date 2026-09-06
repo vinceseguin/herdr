@@ -144,6 +144,10 @@ pub(super) struct ShellHitMap {
     pub(super) agent_scroll_metrics: Option<crate::pane::ScrollMetrics>,
     pub(super) agent_max_scroll: usize,
     pub(super) agent_sort_toggle: Rect,
+    /// Host-qualified fleet rows (fork, E2 PR 5): every header, and every
+    /// workspace/agent row of a host that is *not* active. The two lists above
+    /// carry bare server-side ids and so only ever hold the active host's rows.
+    pub(super) fleet_rows: Vec<(Rect, FleetSidebarHit)>,
     pub(super) sidebar_divider: Rect,
     pub(super) sidebar_section_divider: Rect,
     pub(super) sidebar_toggle: Rect,
@@ -287,6 +291,9 @@ pub(crate) enum ClientShellAction {
     OpenSafeWebUrl(String),
     ReplayMouse(Vec<crossterm::event::MouseEvent>),
     Keybind(crate::input::KeybindAction),
+    /// Something only the client loop can do about the fleet (fork, E2 PR 5):
+    /// the connector, the link and the fleet state must change together.
+    Fleet(super::fleet::FleetShellAction),
 }
 
 #[derive(Default)]
@@ -936,6 +943,9 @@ pub(crate) struct ClientShellState {
     pub(super) config_diagnostic: Option<String>,
     pub(super) endpoint_error: Option<String>,
     pub(super) dismissed_product_announcement: Option<(String, String)>,
+    /// Every other host of a Fleet console (fork, E2 PR 5); `None` for the
+    /// single-host client. The active host stays in `snapshot`/`pane_surface`.
+    pub(super) fleet: Option<super::fleet::FleetShellState>,
 }
 
 pub(super) fn product_announcement_state(
@@ -1075,6 +1085,7 @@ impl ClientShellState {
             local_config_diagnostic,
             endpoint_error: None,
             dismissed_product_announcement: None,
+            fleet: None,
         }
     }
 

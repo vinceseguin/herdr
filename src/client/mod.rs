@@ -658,13 +658,22 @@ fn run_client_with_launch(launch: ClientLaunch) -> io::Result<()> {
     Ok(())
 }
 
+/// Runs the actions one shell outcome produced.
+///
+/// Takes the whole [`ClientState`] rather than just its child processes
+/// because a Fleet console's action changes the routing target itself (fork,
+/// E2 PR 5): the connector, the link, the fleet state and the shell all move
+/// together. Returns the mouse events to replay and whether the console needs
+/// recomposing, which the callers must honour *instead of* a frame composed
+/// before the switch.
 fn dispatch_client_shell_actions(
     actions: Vec<shell::ClientShellAction>,
     endpoint_commands: &mut endpoint_commands::EndpointCommands,
     write_stream: &mut ServerLink,
-    detached_process_children: &mut Vec<std::process::Child>,
-) -> Result<Vec<crossterm::event::MouseEvent>, ClientError> {
+    state: &mut ClientState,
+) -> Result<(Vec<crossterm::event::MouseEvent>, bool), ClientError> {
     let mut replay_mouse = Vec::new();
+    let mut fleet_repaint = false;
     for action in actions {
         match action {
             shell::ClientShellAction::Endpoint { boot_id, request } => {
@@ -679,7 +688,7 @@ fn dispatch_client_shell_actions(
             shell::ClientShellAction::OpenSafeWebUrl(url) => {
                 if crate::app::actions::safe_web_url(&url).is_some() {
                     match crate::platform::open_url(&url) {
-                        Ok(Some(child)) => detached_process_children.push(child),
+                        Ok(Some(child)) => state.detached_process_children.push(child),
                         Ok(None) => {}
                         Err(err) => warn!(err = %err, url = %url, "failed to open pane URL"),
                     }
@@ -692,12 +701,16 @@ fn dispatch_client_shell_actions(
                     "client shell action awaits its presentation family"
                 );
             }
+            shell::ClientShellAction::Fleet(action) => {
+                fleet_repaint |=
+                    fleet::handle_shell_action(state, write_stream, endpoint_commands, action)?;
+            }
         }
     }
     endpoint_commands
         .send_next(write_stream)
         .map_err(ClientError::ConnectionLost)?;
-    Ok(replay_mouse)
+    Ok((replay_mouse, fleet_repaint))
 }
 
 fn client_shell_resize_message(
@@ -820,12 +833,8 @@ fn finish_client_shell_input(
         query_host_terminal_theme();
     }
     sync_client_shell_keyboard_report_all(state)?;
-    let replay = dispatch_client_shell_actions(
-        outcome.actions,
-        endpoint_commands,
-        write_stream,
-        &mut state.detached_process_children,
-    )?;
+    let (replay, fleet_repaint) =
+        dispatch_client_shell_actions(outcome.actions, endpoint_commands, write_stream, state)?;
     debug_assert!(
         replay.is_empty(),
         "mouse replay only follows endpoint results"
@@ -833,6 +842,16 @@ fn finish_client_shell_input(
     for request in outcome.requests {
         write_to_server(write_stream, &request).map_err(ClientError::ConnectionLost)?;
     }
+    // A host switch happened *during* the dispatch above, so `frame` describes
+    // the machine the console has just left: recompose rather than present it.
+    let frame = if fleet_repaint {
+        state
+            .shell
+            .as_mut()
+            .and_then(|shell| shell.compose(state.reported_size.0, state.reported_size.1))
+    } else {
+        frame
+    };
     if let Some(frame) = frame {
         state.present_frame(frame);
     }
@@ -865,14 +884,10 @@ fn finish_endpoint_command(
         shell.reconcile_input_source();
     }
     apply_client_shell_input_source_changes(state, prefix_input_source);
-    let replay_mouse = dispatch_client_shell_actions(
-        actions,
-        endpoint_commands,
-        write_stream,
-        &mut state.detached_process_children,
-    )?;
+    let (replay_mouse, fleet_repaint) =
+        dispatch_client_shell_actions(actions, endpoint_commands, write_stream, state)?;
     if replay_mouse.is_empty() {
-        if repaint {
+        if repaint || fleet_repaint {
             if let Some(frame) = state
                 .shell
                 .as_mut()
@@ -888,7 +903,7 @@ fn finish_endpoint_command(
             return Ok(false);
         };
         let mut outcome = shell.replay_mouse_events(replay_mouse);
-        outcome.repaint |= repaint;
+        outcome.repaint |= repaint || fleet_repaint;
         let frame = outcome
             .repaint
             .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
@@ -933,13 +948,17 @@ fn handle_fleet_event(
             return Ok(FleetOutcome::Handled);
         }
     };
+    // The header's "switching…" marker follows `pending_switch`, which the
+    // translation above clears when the new host's first surface arrives.
+    let mut chrome_changed = fleet::sync_switching_notice(state);
     match translated {
         fleet::Translated::Server(message) => Ok(FleetOutcome::Server(message)),
         fleet::Translated::Snapshot { snapshot, changes } => {
-            if let Some(fleet) = state.fleet.as_mut() {
-                fleet::apply_changes(fleet, changes);
-            }
+            fleet::apply_changes(state, changes);
             install_client_shell_snapshot(state, snapshot, write_stream, prefix_input_source)?;
+            // The host a switch focused may only now have a projection to
+            // resolve that focus against.
+            fleet::flush_pending_focus(state, write_stream, endpoint_commands)?;
             Ok(FleetOutcome::Handled)
         }
         fleet::Translated::EndpointResponse { request_id, result } => {
@@ -958,21 +977,32 @@ fn handle_fleet_event(
             Ok(FleetOutcome::Handled)
         }
         fleet::Translated::EndpointMethods { methods, changes } => {
-            if let Some(fleet) = state.fleet.as_mut() {
-                fleet::apply_changes(fleet, changes);
-            }
+            chrome_changed |= fleet::apply_changes(state, changes);
             if let Some(shell) = state.shell.as_mut() {
                 shell.set_endpoint_methods(Some(methods));
+            }
+            // A host that just connected can answer the focus a switch asked
+            // for as soon as it sends its projection; nothing else here draws.
+            if chrome_changed {
+                fleet::present(state);
             }
             Ok(FleetOutcome::Handled)
         }
         fleet::Translated::Changes(changes) => {
-            if let Some(fleet) = state.fleet.as_mut() {
-                fleet::apply_changes(fleet, changes);
+            chrome_changed |= fleet::apply_changes(state, changes);
+            // Another host's status is sidebar-only: nothing else in the loop
+            // would repaint for it.
+            if chrome_changed {
+                fleet::present(state);
             }
             Ok(FleetOutcome::Handled)
         }
-        fleet::Translated::Dropped => Ok(FleetOutcome::Handled),
+        fleet::Translated::Dropped => {
+            if chrome_changed {
+                fleet::present(state);
+            }
+            Ok(FleetOutcome::Handled)
+        }
     }
 }
 

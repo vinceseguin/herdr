@@ -88,6 +88,108 @@ fn fleet_console_shows_the_active_host_and_routes_input_to_it() {
     );
 }
 
+/// SGR mouse press and release at a 1-based screen position.
+fn sgr_click(column: u16, row: u16) -> Vec<u8> {
+    format!("\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m").into_bytes()
+}
+
+/// Screen row of the second host's header, on a console showing the first.
+///
+/// The spaces list starts two rows under the sidebar's " spaces" title, and
+/// each lab session has exactly one workspace, so the rows are: the first
+/// host's header, its workspace, then the second host's header. If the sidebar
+/// layout ever moves, the assertions below fail with the screen attached.
+const SECOND_HOST_HEADER_ROW: u16 = 5;
+/// Column 3: past the `▾`/`▸` collapse cell, inside the header's text.
+const HEADER_COLUMN: u16 = 3;
+
+#[test]
+fn sidebar_lists_every_host_and_click_switches() {
+    let mut lab = Lab::new("tui-hosts");
+    let up = lab.up("2");
+    assert!(
+        up.status.success(),
+        "fleet-lab up 2 failed: {}{}",
+        stdout_of(&up),
+        stderr_of(&up)
+    );
+    for session in ["lab-1", "lab-2"] {
+        support::wait_for_socket(&lab_client_socket(&lab, session), SOCKET_TIMEOUT);
+    }
+    let pane_1 = lab_pane_id(&lab, 1);
+    let pane_2 = lab_pane_id(&lab, 2);
+    append_lab_config(&lab, &lab_fleet_config(2));
+
+    let mut console = FleetConsole::spawn(&lab, COLS, ROWS);
+
+    // Both hosts have a group. lab-2's rows are drawn from the fleet model —
+    // the console has never shown that machine.
+    assert_screen(
+        &console,
+        "▾ lab-1",
+        RENDER_TIMEOUT,
+        "the active host's group",
+    );
+    assert_screen(
+        &console,
+        "▾ lab-2",
+        RENDER_TIMEOUT,
+        "the inactive host's group is listed too",
+    );
+    assert_screen(
+        &console,
+        "herdr-fleet-lab:lab-1",
+        RENDER_TIMEOUT,
+        "the active host's pane never rendered",
+    );
+    // lab-2's *workspace* row only exists once lab-2 sent a projection, so this
+    // is the console saying that host is connected. Switching earlier is
+    // allowed and routes correctly, but what is typed while the target is
+    // still connecting is dropped rather than queued, which would make the
+    // marker below a race.
+    assert_screen(
+        &console,
+        "· lab-2",
+        RENDER_TIMEOUT,
+        "lab-2 never reported a projection",
+    );
+
+    // Click lab-2's header: one real SGR press through the real hit map.
+    console.send(&sgr_click(HEADER_COLUMN, SECOND_HOST_HEADER_ROW));
+    console.send(b"switch-marker");
+
+    // The console draws the *new* host, so the echo of what was typed can only
+    // be on screen if the pane area followed the switch. (A client draws frame
+    // diffs, so asserting on lab-2's pre-existing text would assert on bytes
+    // that never had to be redrawn.)
+    assert_screen(
+        &console,
+        "switch-marker",
+        RENDER_TIMEOUT,
+        "the console never showed the host it switched to",
+    );
+    assert!(
+        support::wait_until(Duration::from_secs(20), Duration::from_millis(200), || {
+            pane_text(&lab, "lab-2", &pane_2).contains("switch-marker")
+        }),
+        "input after the switch never reached lab-2:\n{}",
+        pane_text(&lab, "lab-2", &pane_2)
+    );
+    // The failure this PR is shaped around: typing into the machine the console
+    // just left.
+    assert!(
+        !pane_text(&lab, "lab-1", &pane_1).contains("switch-marker"),
+        "input after the switch reached the previous host:\n{}",
+        pane_text(&lab, "lab-1", &pane_1)
+    );
+
+    assert!(
+        console.detach(EXIT_TIMEOUT),
+        "prefix+q did not end the console:\n{}",
+        console.screen_text()
+    );
+}
+
 #[test]
 fn a_fleet_with_no_enabled_host_refuses_before_it_touches_the_terminal() {
     let mut lab = Lab::new("tui-empty");

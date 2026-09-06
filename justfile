@@ -75,6 +75,10 @@ build:
 bench-render-scale:
     cargo test --release --locked --bin herdr render_scale_profile -- --ignored --nocapture --test-threads=1
 
+# Non-gating Fleet console sidebar scaling profile (1 vs 5 hosts x 15 agents)
+bench-fleet-scale:
+    cargo test --release --locked --bin herdr fleet_sidebar_scale_profile -- --ignored --nocapture --test-threads=1
+
 # ~3-5 minute CPU comparison; downloads stable unless HERDR_PERF_BASELINE_BIN is set
 bench-release-smoke:
     cargo build --release --locked

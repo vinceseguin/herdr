@@ -14,6 +14,7 @@
 //! E2 PR 3 lands the seam; PR 4 constructs it (`run_fleet`), PR 5 renders the
 //! host groups, PR 7 targets notifications and PR 8 shows a reconnect notice.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -24,11 +25,17 @@ use crate::config::Config;
 use crate::fleet::connector::{ActiveGeometry, FleetConnector, FleetConnectorOptions, FleetEvent};
 use crate::fleet::handshake::HandshakeParams;
 use crate::fleet::hosts::{resolve_hosts, HostId, HostSpec};
-use crate::fleet::state::{FleetChange, FleetState, HostEvent};
+use crate::fleet::sidebar::FleetSidebarModel;
+use crate::fleet::state::{FleetChange, FleetState, HostConnection, HostEvent};
 use crate::protocol::{ClientShellSnapshot, ClientSurfaceSize, ServerMessage};
 
+use super::endpoint_commands::EndpointCommands;
+use super::errors::ClientError;
 use super::link::{ClientLink, FleetLink, ServerLink};
-use super::shell::ClientShellKeybindingSource;
+use super::shell::{
+    ClientShellAction, ClientShellKeybindingSource, FleetFocusTarget, FleetShellAction,
+};
+use super::ClientState;
 
 /// What one fleet event means to the client loop.
 pub(super) enum Translated {
@@ -70,15 +77,28 @@ pub(super) struct FleetClientState {
     /// addresses.
     pub(super) active: HostId,
     /// A switch asked for, waiting for the new host's first full surface.
-    // Written by the host switch (E2 PR 5); the console tracks it from the
-    // first switch on, and PR 8 renders the notice it implies.
-    #[allow(dead_code)]
     pub(super) pending_switch: Option<HostId>,
+    /// The sidebar rows, rebuilt here and handed to the shell. Owning it on
+    /// this side means a rebuild can be compared against what the shell is
+    /// already drawing before it costs a repaint.
+    pub(super) sidebar: FleetSidebarModel,
+    /// Host groups the user folded away. A render decision, so it lives with
+    /// the console rather than in [`FleetState`].
+    pub(super) collapsed: HashSet<HostId>,
+    /// What to focus once the host being switched to has a snapshot.
+    pub(super) pending_focus: Option<FleetFocusTarget>,
 }
 
 impl FleetClientState {
     /// Turns one connector event into something the client loop can act on.
     pub(super) fn translate(&mut self, event: FleetEvent) -> Translated {
+        // The switch is over when the host being switched to has drawn: that
+        // is the first frame the console shows from the new machine.
+        if let FleetEvent::Surface { host, .. } = &event {
+            if self.pending_switch.as_ref() == Some(host) && *host == self.active {
+                self.pending_switch = None;
+            }
+        }
         translate_event(&mut self.state, &self.active, event)
     }
 
@@ -109,18 +129,298 @@ impl FleetClientState {
     }
 }
 
-/// Applies fleet-model changes to the console.
+/// Rebuilds the sidebar rows after a fleet change and installs them.
 ///
-/// A no-op until the sidebar model lands (E2 PR 5); the loop calls it now so
-/// changes are never silently discarded once it does.
-pub(super) fn apply_changes(fleet: &mut FleetClientState, changes: Vec<FleetChange>) {
-    let _ = fleet;
-    if !changes.is_empty() {
-        debug!(
-            changes = changes.len(),
-            "fleet changes await the sidebar model"
-        );
+/// Returns whether the shell's view actually changed, so the caller repaints
+/// only then: an inactive host bumping a revision is a change to
+/// [`FleetState`] and, most of the time, to no visible row — and a repaint is
+/// a full console compose.
+pub(super) fn apply_changes(state: &mut ClientState, changes: Vec<FleetChange>) -> bool {
+    if changes.is_empty() {
+        return false;
     }
+    rebuild_sidebar(state)
+}
+
+/// Rebuild the model from the current fleet state and install it if it differs.
+fn rebuild_sidebar(state: &mut ClientState) -> bool {
+    let (Some(fleet), Some(shell)) = (state.fleet.as_mut(), state.shell.as_mut()) else {
+        return false;
+    };
+    // The live agent-panel preference, which the user can toggle by clicking
+    // the panel's sort label; `crate::fleet::sidebar` is pure and cannot read
+    // it for itself.
+    let sort = shell.agent_panel_sort();
+    fleet.sidebar.rebuild(&fleet.state, &fleet.collapsed, sort);
+    if shell.fleet_sidebar_matches(&fleet.sidebar, &fleet.active, fleet.pending_switch.as_ref()) {
+        return false;
+    }
+    shell.fleet_sidebar_update(
+        fleet.sidebar.clone(),
+        fleet.active.clone(),
+        fleet.pending_switch.clone(),
+    );
+    true
+}
+
+/// Keep the header's "switching…" marker in step with the console's state.
+///
+/// A switch ends when the new host's first surface arrives, which is a plain
+/// `ServerMessage` to the rest of the loop; this is where the header stops
+/// saying it is waiting. Returns whether anything changed.
+pub(super) fn sync_switching_notice(state: &mut ClientState) -> bool {
+    let Some(pending) = state
+        .fleet
+        .as_ref()
+        .map(|fleet| fleet.pending_switch.clone())
+    else {
+        return false;
+    };
+    state
+        .shell
+        .as_mut()
+        .is_some_and(|shell| shell.set_fleet_switching(pending))
+}
+
+/// Compose and present, after something that changed the console's chrome.
+pub(super) fn present(state: &mut ClientState) {
+    let Some(frame) = state
+        .shell
+        .as_mut()
+        .and_then(|shell| shell.compose(state.reported_size.0, state.reported_size.1))
+    else {
+        return;
+    };
+    state.present_frame(frame);
+}
+
+/// Handle one fleet action the shell asked the loop for.
+///
+/// Returns whether the console needs a repaint.
+pub(super) fn handle_shell_action(
+    state: &mut ClientState,
+    write_stream: &mut ServerLink,
+    endpoint_commands: &mut EndpointCommands,
+    action: FleetShellAction,
+) -> Result<bool, ClientError> {
+    match action {
+        FleetShellAction::SwitchHost { host, then_focus } => {
+            switch_host(state, write_stream, endpoint_commands, host, then_focus)
+        }
+        FleetShellAction::ToggleCollapsed(host) => {
+            let Some(fleet) = state.fleet.as_mut() else {
+                return Ok(false);
+            };
+            if !fleet.collapsed.remove(&host) {
+                fleet.collapsed.insert(host);
+            }
+            Ok(rebuild_sidebar(state))
+        }
+        // Agent order inside every group is a function of this preference, so
+        // every group's rows are stale, not just the active host's.
+        FleetShellAction::SortChanged => Ok(rebuild_sidebar(state)),
+    }
+}
+
+/// Point the console at another host.
+///
+/// The one place the active host changes. Everything that names a host moves
+/// together — the connector (which streams frames for exactly one host), the
+/// write link, the fleet state and the shell — because a half-applied switch
+/// is precisely a mis-route: frames from one machine, keystrokes to another.
+///
+/// The link is redirected *before* the shell is reset, so input typed during
+/// the switch reaches the new host, and the shell's ids are the new host's
+/// from the same moment.
+pub(super) fn switch_host(
+    state: &mut ClientState,
+    write_stream: &mut ServerLink,
+    endpoint_commands: &mut EndpointCommands,
+    host: HostId,
+    then_focus: Option<FleetFocusTarget>,
+) -> Result<bool, ClientError> {
+    let Some(fleet) = state.fleet.as_mut() else {
+        debug!(%host, "ignoring a host switch outside a fleet console");
+        return Ok(false);
+    };
+    if !switch_target_allowed(fleet, &host) {
+        return Ok(false);
+    }
+
+    // The connector decides what a host's surface is; tell it the console's
+    // current geometry before it activates the new host, so the activation
+    // resize is the size the pane area actually has.
+    let geometry = ActiveGeometry {
+        surface: state
+            .shell
+            .as_ref()
+            .map(|shell| shell.surface_size(state.reported_size.0, state.reported_size.1))
+            .unwrap_or(ClientSurfaceSize {
+                cols: state.reported_size.0.max(1),
+                rows: state.reported_size.1.max(1),
+            }),
+        cell_width_px: state.reported_cell_size.0,
+        cell_height_px: state.reported_cell_size.1,
+        pixel_mouse: state.pixel_geometry_exact,
+    };
+    let Some(fleet) = state.fleet.as_mut() else {
+        return Ok(false);
+    };
+    let changes = retarget_host(
+        fleet,
+        write_stream,
+        endpoint_commands,
+        host.clone(),
+        geometry,
+    );
+    fleet.pending_focus = then_focus;
+
+    let snapshot = fleet
+        .state
+        .host(&host)
+        .and_then(|host| host.snapshot.clone());
+    let methods = fleet
+        .state
+        .host(&host)
+        .and_then(|host| match &host.connection {
+            HostConnection::Connected { methods, .. } => Some(methods.clone()),
+            _ => None,
+        });
+    if let Some(shell) = state.shell.as_mut() {
+        shell.reset_for_host_switch();
+        shell.set_endpoint_methods(methods);
+        if let Some(snapshot) = snapshot {
+            shell.set_snapshot(snapshot);
+        }
+    }
+    let mut repaint = !changes.is_empty();
+    repaint |= rebuild_sidebar(state);
+    flush_pending_focus(state, write_stream, endpoint_commands)?;
+    Ok(repaint)
+}
+
+/// Whether this host may become the routing target at all.
+///
+/// A disabled host is listed in the sidebar (it is configuration the user can
+/// see) but `FleetState::set_active_host` refuses it, so a switch that skipped
+/// this check would move the connector and the link while the fleet state kept
+/// naming the old host — the exact split the console must never have.
+fn switch_target_allowed(fleet: &FleetClientState, host: &HostId) -> bool {
+    if fleet.active == *host {
+        debug!(%host, "the fleet console is already showing this host");
+        return false;
+    }
+    match fleet.state.host(host) {
+        Some(state) if state.spec.enabled => true,
+        Some(_) => {
+            warn!(%host, "refusing to switch to a host disabled in [fleet]");
+            false
+        }
+        None => {
+            warn!(%host, "refusing to switch to a host that is not configured");
+            false
+        }
+    }
+}
+
+/// Move every routing target to `host`, together.
+///
+/// Split out of [`switch_host`] so the routing — which host the connector
+/// streams, which host the link writes to, which host the fleet state calls
+/// active, and the endpoint lane in between — is testable against fake hosts
+/// without a terminal or a shell.
+fn retarget_host(
+    fleet: &mut FleetClientState,
+    write_stream: &mut ServerLink,
+    endpoint_commands: &mut EndpointCommands,
+    host: HostId,
+    geometry: ActiveGeometry,
+) -> Vec<FleetChange> {
+    if let Err(error) = fleet.connector.set_active_geometry(geometry) {
+        debug!(%host, %error, "could not announce the console geometry before a switch");
+    }
+    if let Err(error) = fleet.connector.set_active(Some(&host)) {
+        // Host-local: the old host may already be gone, or the new one not up
+        // yet. The connector recorded the new active host either way, so the
+        // console switches and the sidebar shows why the screen is empty.
+        debug!(%host, %error, "the fleet connector could not resize on activation");
+    }
+    let previous = std::mem::replace(&mut fleet.active, host.clone());
+    fleet.pending_switch = Some(host.clone());
+    let changes = fleet.state.set_active_host(Some(host.clone()));
+    // Redirect writes before anything else can be typed: from here every
+    // keystroke addresses the new host.
+    write_stream.set_active(host.clone());
+    // An answer from the old host is dropped by `translate`, so a request in
+    // flight would hold the single endpoint lane until its 60 s timeout.
+    endpoint_commands.reset();
+    debug!(from = %previous, to = %host, "the fleet console switched host");
+    changes
+}
+
+/// Send the focus request a switch asked for, once its host has a projection.
+///
+/// A host that was already connected has one immediately; one that is still
+/// connecting gets its focus when its first snapshot arrives.
+pub(super) fn flush_pending_focus(
+    state: &mut ClientState,
+    write_stream: &mut ServerLink,
+    endpoint_commands: &mut EndpointCommands,
+) -> Result<(), ClientError> {
+    let Some(fleet) = state.fleet.as_ref() else {
+        return Ok(());
+    };
+    if fleet.pending_focus.is_none() {
+        return Ok(());
+    }
+    // The shell's projection is the active host's by construction, but only
+    // once it has installed one: focusing before that would address ids the
+    // shell cannot resolve and the server has not announced.
+    if !state
+        .shell
+        .as_ref()
+        .is_some_and(super::shell::ClientShellState::has_snapshot)
+    {
+        return Ok(());
+    }
+    let Some(target) = state
+        .fleet
+        .as_mut()
+        .and_then(|fleet| fleet.pending_focus.take())
+    else {
+        return Ok(());
+    };
+    let Some(shell) = state.shell.as_mut() else {
+        return Ok(());
+    };
+    let outcome = shell.request_fleet_focus(&target);
+    dispatch_focus_outcome(outcome, write_stream, endpoint_commands)
+}
+
+/// Dispatch the endpoint request a focus produced.
+///
+/// Deliberately not the loop's general action dispatcher: a focus can only
+/// ever produce an endpoint request or a plain server message, and routing it
+/// through the general path from inside that path would be re-entrant.
+fn dispatch_focus_outcome(
+    outcome: super::shell::ClientShellInput,
+    write_stream: &mut ServerLink,
+    endpoint_commands: &mut EndpointCommands,
+) -> Result<(), ClientError> {
+    for action in outcome.actions {
+        match action {
+            ClientShellAction::Endpoint { boot_id, request } => {
+                endpoint_commands.enqueue(boot_id, request);
+            }
+            other => debug!(?other, "ignoring an unexpected action from a fleet focus"),
+        }
+    }
+    for request in outcome.requests {
+        super::write_to_server(write_stream, &request).map_err(ClientError::ConnectionLost)?;
+    }
+    endpoint_commands
+        .send_next(write_stream)
+        .map_err(ClientError::ConnectionLost)
 }
 
 /// The pure half of [`FleetClientState::translate`].
@@ -354,6 +654,9 @@ fn console_link(
             connector: Rc::clone(&connector),
             active,
             pending_switch: None,
+            sidebar: FleetSidebarModel::default(),
+            collapsed: HashSet::new(),
+            pending_focus: None,
         }),
     };
     Ok((
@@ -1126,6 +1429,27 @@ mod console_tests {
         )
     }
 
+    /// A minimal full surface from one host, for the translation checks.
+    fn frame(boot_id: &str) -> Box<crate::protocol::PaneSurfaceFrame> {
+        Box::new(crate::protocol::PaneSurfaceFrame {
+            boot_id: boot_id.to_string(),
+            projection_revision: 1,
+            surface_revision: 1,
+            frame: crate::protocol::FrameData {
+                cells: Vec::new(),
+                width: 0,
+                height: 0,
+                cursor: None,
+                hyperlinks: Vec::new(),
+                graphics: Vec::new(),
+            },
+            panes: Vec::new(),
+            splits: Vec::new(),
+            popup: None,
+            graphics: crate::protocol::SurfaceGraphicsScene::default(),
+        })
+    }
+
     fn pane_input(pane: &str) -> ClientMessage {
         ClientMessage::ClientShellPaneInput {
             pane_id: pane.to_string(),
@@ -1304,5 +1628,254 @@ mod console_tests {
             elapsed < Duration::from_secs(3),
             "shutdown joins the supervisors within its own bounded wait: {elapsed:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Host switching: every routing target moves, and only together.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn a_switch_moves_the_connector_the_link_and_the_fleet_state_together() {
+        let dir = scratch_dir("switch-routing");
+        let alpha = serving(&dir, "alpha");
+        let beta = serving(&dir, "beta");
+        let specs = vec![alpha.spec("alpha"), beta.spec("beta")];
+        let connector = fake_connector(&[("alpha", &alpha), ("beta", &beta)], console_options());
+        let state = FleetState::new(specs);
+        let (mut link, console) =
+            console_link(state, connector, ConsoleStderr::passthrough()).expect("console opens");
+        assert!(
+            crate::fleet::connector::test_support::wait_for(Duration::from_secs(10), || {
+                !hello_geometry(&alpha.received()).is_empty()
+                    && !hello_geometry(&beta.received()).is_empty()
+            }),
+            "both hosts connected"
+        );
+        let beta_id = HostId::new("beta").expect("host id");
+        let mut endpoint_commands = EndpointCommands::default();
+
+        let changes = {
+            let fleet = link.fleet.as_mut().expect("a console carries fleet state");
+            retarget_host(
+                fleet,
+                &mut link.link,
+                &mut endpoint_commands,
+                beta_id.clone(),
+                console_geometry(),
+            )
+        };
+
+        assert!(
+            changes
+                .iter()
+                .any(|change| matches!(change, FleetChange::ActiveHost { host: Some(host) } if *host == beta_id)),
+            "{changes:?}"
+        );
+        let fleet = link.fleet.as_ref().expect("fleet state");
+        assert_eq!(fleet.active, beta_id);
+        assert_eq!(fleet.state.active_host(), Some(&beta_id));
+        assert_eq!(fleet.pending_switch.as_ref(), Some(&beta_id));
+        assert_eq!(
+            fleet.connector.active_host(),
+            Some(beta_id.clone()),
+            "the connector streams the machine the console is showing"
+        );
+
+        // The old host is told to go back to the small inactive surface, the
+        // new one to render at the console's size.
+        assert!(
+            crate::fleet::connector::test_support::wait_for(Duration::from_secs(5), || {
+                crate::fleet::connector::test_support::resize_geometry(&alpha.received())
+                    .last()
+                    .copied()
+                    == Some(inactive())
+                    && crate::fleet::connector::test_support::resize_geometry(&beta.received())
+                        .last()
+                        .copied()
+                        == Some(console_geometry())
+            }),
+            "alpha {:?} beta {:?}",
+            crate::fleet::connector::test_support::resize_geometry(&alpha.received()),
+            crate::fleet::connector::test_support::resize_geometry(&beta.received())
+        );
+        drop(link);
+        drop(console);
+    }
+
+    #[test]
+    fn what_is_typed_after_a_switch_reaches_only_the_new_host() {
+        let dir = scratch_dir("switch-input");
+        let alpha = serving(&dir, "alpha");
+        let beta = serving(&dir, "beta");
+        let specs = vec![alpha.spec("alpha"), beta.spec("beta")];
+        let connector = fake_connector(&[("alpha", &alpha), ("beta", &beta)], console_options());
+        let state = FleetState::new(specs);
+        let (mut link, console) =
+            console_link(state, connector, ConsoleStderr::passthrough()).expect("console opens");
+        assert!(
+            crate::fleet::connector::test_support::wait_for(Duration::from_secs(10), || {
+                !hello_geometry(&alpha.received()).is_empty()
+                    && !hello_geometry(&beta.received()).is_empty()
+            }),
+            "both hosts connected"
+        );
+        link.link.write(&pane_input("before")).expect("write");
+        let mut endpoint_commands = EndpointCommands::default();
+
+        {
+            let fleet = link.fleet.as_mut().expect("fleet state");
+            retarget_host(
+                fleet,
+                &mut link.link,
+                &mut endpoint_commands,
+                HostId::new("beta").expect("host id"),
+                console_geometry(),
+            );
+        }
+        link.link.write(&pane_input("after")).expect("write");
+
+        assert!(
+            crate::fleet::connector::test_support::wait_for(Duration::from_secs(5), || {
+                pane_inputs(&beta.received()) == vec!["after".to_string()]
+            }),
+            "the new host got what was typed after the switch: {:?}",
+            beta.received()
+        );
+        assert_eq!(
+            pane_inputs(&alpha.received()),
+            vec!["before".to_string()],
+            "and the old host got nothing after it: {:?}",
+            alpha.received()
+        );
+        drop(link);
+        drop(console);
+    }
+
+    #[test]
+    fn a_switch_releases_the_endpoint_lane_the_old_host_was_holding() {
+        let dir = scratch_dir("switch-lane");
+        let alpha = serving(&dir, "alpha");
+        let beta = serving(&dir, "beta");
+        let specs = vec![alpha.spec("alpha"), beta.spec("beta")];
+        let connector = fake_connector(&[("alpha", &alpha), ("beta", &beta)], console_options());
+        let state = FleetState::new(specs);
+        let (mut link, console) =
+            console_link(state, connector, ConsoleStderr::passthrough()).expect("console opens");
+        assert!(
+            crate::fleet::connector::test_support::wait_for(Duration::from_secs(10), || {
+                !hello_geometry(&alpha.received()).is_empty()
+            }),
+            "alpha connected"
+        );
+        let mut endpoint_commands = EndpointCommands::default();
+        endpoint_commands.enqueue(
+            "boot-alpha".to_string(),
+            Box::new(crate::api::schema::Request {
+                id: "request-1".to_string(),
+                method: crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
+                    pane_id: "w1:p1".to_string(),
+                }),
+            }),
+        );
+        endpoint_commands
+            .send_next(&mut link.link)
+            .expect("the request goes to the active host");
+
+        {
+            let fleet = link.fleet.as_mut().expect("fleet state");
+            retarget_host(
+                fleet,
+                &mut link.link,
+                &mut endpoint_commands,
+                HostId::new("beta").expect("host id"),
+                console_geometry(),
+            );
+        }
+
+        // The old host's answer is dropped by `translate`, so a lane still
+        // held here would only free at its 60 s timeout — every command the
+        // user tries on the new host would silently queue behind it.
+        assert!(
+            endpoint_commands.is_idle(),
+            "the switch released the endpoint lane"
+        );
+        drop(link);
+        drop(console);
+    }
+
+    #[test]
+    fn a_disabled_or_unknown_host_is_never_a_switch_target() {
+        let dir = scratch_dir("switch-refused");
+        let alpha = serving(&dir, "alpha");
+        let beta = serving(&dir, "beta");
+        let mut disabled = beta.spec("beta");
+        disabled.enabled = false;
+        let specs = vec![alpha.spec("alpha"), disabled];
+        let connector = fake_connector_with_specs(
+            &[("alpha", &alpha), ("beta", &beta)],
+            specs.clone(),
+            console_options(),
+        );
+        let state = FleetState::new(specs);
+        let (link, console) =
+            console_link(state, connector, ConsoleStderr::passthrough()).expect("console opens");
+        let fleet = link.fleet.as_ref().expect("fleet state");
+
+        assert!(!switch_target_allowed(
+            fleet,
+            &HostId::new("beta").expect("host id")
+        ));
+        assert!(!switch_target_allowed(
+            fleet,
+            &HostId::new("ghost").expect("host id")
+        ));
+        assert!(!switch_target_allowed(
+            fleet,
+            &HostId::new("alpha").expect("host id")
+        ));
+        drop(link);
+        drop(console);
+    }
+
+    #[test]
+    fn the_old_hosts_frames_stop_reaching_the_shell_the_moment_it_is_switched_away_from() {
+        let dir = scratch_dir("switch-frames");
+        let alpha = serving(&dir, "alpha");
+        let beta = serving(&dir, "beta");
+        let specs = vec![alpha.spec("alpha"), beta.spec("beta")];
+        let connector = fake_connector(&[("alpha", &alpha), ("beta", &beta)], console_options());
+        let state = FleetState::new(specs);
+        let (mut link, console) =
+            console_link(state, connector, ConsoleStderr::passthrough()).expect("console opens");
+        let mut endpoint_commands = EndpointCommands::default();
+        {
+            let fleet = link.fleet.as_mut().expect("fleet state");
+            retarget_host(
+                fleet,
+                &mut link.link,
+                &mut endpoint_commands,
+                HostId::new("beta").expect("host id"),
+                console_geometry(),
+            );
+        }
+        let fleet = link.fleet.as_mut().expect("fleet state");
+
+        let old = fleet.translate(FleetEvent::Surface {
+            host: HostId::new("alpha").expect("host id"),
+            frame: frame("boot-alpha"),
+        });
+        let new = fleet.translate(FleetEvent::Surface {
+            host: HostId::new("beta").expect("host id"),
+            frame: frame("boot-beta"),
+        });
+
+        assert!(matches!(old, Translated::Dropped));
+        assert!(matches!(new, Translated::Server(_)));
+        assert!(
+            fleet.pending_switch.is_none(),
+            "the new host's first surface ends the switch"
+        );
+        drop(link);
+        drop(console);
     }
 }
