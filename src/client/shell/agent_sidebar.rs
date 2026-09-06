@@ -10,11 +10,11 @@ use ratatui::{
 
 use super::*;
 
-struct AgentRow {
-    pane_id: String,
-    status: crate::api::schema::AgentStatus,
-    focused: bool,
-    rows: Vec<Vec<crate::ui::ResolvedToken>>,
+pub(super) struct AgentRow {
+    pub(super) pane_id: String,
+    pub(super) status: crate::api::schema::AgentStatus,
+    pub(super) focused: bool,
+    pub(super) rows: Vec<Vec<crate::ui::ResolvedToken>>,
 }
 
 pub(super) fn ordered_agent_pane_ids(
@@ -49,16 +49,20 @@ pub(super) fn ordered_agent_pane_ids(
         .collect()
 }
 
-pub(super) fn render_agent_panel(
+/// The panel's chrome: divider, " agents", the sort label, and the body rect.
+///
+/// Split out of [`render_agent_panel`] so the Fleet console draws exactly the
+/// same header above its host groups (fork, E2 PR 5). Returns the body rect,
+/// empty when the area is too short to hold one.
+pub(super) fn render_agent_panel_header(
     buffer: &mut Buffer,
     area: Rect,
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
-    agent_scroll: &mut usize,
     hits: &mut ShellHitMap,
-) {
+) -> Rect {
     if area.height == 0 {
-        return;
+        return Rect::default();
     }
     put_text(
         buffer,
@@ -69,7 +73,7 @@ pub(super) fn render_agent_panel(
         Style::default().fg(config.palette.surface_dim),
     );
     if area.height < 2 {
-        return;
+        return Rect::default();
     }
     put_text(
         buffer,
@@ -116,7 +120,6 @@ pub(super) fn render_agent_panel(
             .add_modifier(Modifier::BOLD),
     );
 
-    let rows = agent_rows(snapshot, config);
     let body = Rect::new(
         area.x,
         area.y.saturating_add(3),
@@ -124,20 +127,44 @@ pub(super) fn render_agent_panel(
         area.height.saturating_sub(3),
     );
     hits.agent_body = body;
+    body
+}
+
+/// The panel's "nothing matched this view" line.
+pub(super) fn render_no_matching_agents(
+    buffer: &mut Buffer,
+    body: Rect,
+    snapshot: &ClientShellSnapshot,
+    config: &ClientShellConfig,
+) {
+    if body.is_empty() || snapshot.agent_view_label.is_none() {
+        return;
+    }
+    put_text(
+        buffer,
+        body.x,
+        body.y,
+        body.width,
+        " no matching agents",
+        Style::default()
+            .fg(config.palette.overlay0)
+            .add_modifier(Modifier::DIM),
+    );
+}
+
+pub(super) fn render_agent_panel(
+    buffer: &mut Buffer,
+    area: Rect,
+    snapshot: &ClientShellSnapshot,
+    config: &ClientShellConfig,
+    agent_scroll: &mut usize,
+    hits: &mut ShellHitMap,
+) {
+    let body = render_agent_panel_header(buffer, area, snapshot, config, hits);
+    let rows = agent_rows(snapshot, config);
     if body.is_empty() || rows.is_empty() {
         *agent_scroll = 0;
-        if !body.is_empty() && snapshot.agent_view_label.is_some() {
-            put_text(
-                buffer,
-                body.x,
-                body.y,
-                body.width,
-                " no matching agents",
-                Style::default()
-                    .fg(config.palette.overlay0)
-                    .add_modifier(Modifier::DIM),
-            );
-        }
+        render_no_matching_agents(buffer, body, snapshot, config);
         return;
     }
 
@@ -190,7 +217,10 @@ pub(super) fn render_agent_panel(
     }
 }
 
-fn agent_rows(snapshot: &ClientShellSnapshot, config: &ClientShellConfig) -> Vec<AgentRow> {
+pub(super) fn agent_rows(
+    snapshot: &ClientShellSnapshot,
+    config: &ClientShellConfig,
+) -> Vec<AgentRow> {
     ordered_agent_pane_ids(snapshot, config.agent_panel_sort)
         .into_iter()
         .filter_map(|pane_id| {
@@ -262,7 +292,12 @@ fn agent_rows(snapshot: &ClientShellSnapshot, config: &ClientShellConfig) -> Vec
         .collect()
 }
 
-fn render_agent_row(buffer: &mut Buffer, rect: Rect, row: &AgentRow, config: &ClientShellConfig) {
+pub(super) fn render_agent_row(
+    buffer: &mut Buffer,
+    rect: Rect,
+    row: &AgentRow,
+    config: &ClientShellConfig,
+) {
     let palette = &config.palette;
     let row_style = if row.focused {
         Style::default().bg(palette.active_row_bg)
