@@ -2726,7 +2726,7 @@ pairing_ttl_secs = 5
 "#,
         );
         let diagnostics = config.diagnostics();
-        assert_eq!(diagnostics.len(), 6, "{diagnostics:#?}");
+        assert_eq!(diagnostics.len(), 8, "{diagnostics:#?}");
         assert!(diagnostics[0].contains("gateway.bind"), "{diagnostics:?}");
         assert!(
             diagnostics[1].contains("gateway.allowed_origins[1]")
@@ -2747,10 +2747,18 @@ pairing_ttl_secs = 5
             diagnostics[4].contains("gateway.public_url") && diagnostics[4].contains("userinfo"),
             "{diagnostics:?}"
         );
-        // The two zero limits and the out-of-range ttl are folded into the
-        // remaining lines; assert on the keys so wording can change.
-        let rest = diagnostics[5..].join("\n");
-        assert!(rest.contains("pairing_ttl_secs"), "{rest}");
+        assert!(
+            diagnostics[5].contains("auth_failure_limit"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics[6].contains("auth_failure_window_secs"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics[7].contains("pairing_ttl_secs") && diagnostics[7].contains("30..=86400"),
+            "{diagnostics:?}"
+        );
 
         let config = gateway("auth_failure_limit = 0\nauth_failure_window_secs = 0\n");
         let diagnostics = config.diagnostics();

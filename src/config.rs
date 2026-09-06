@@ -22,12 +22,11 @@ pub use self::{
         IndexedKeybind, Keybinds, LiveKeybindConfig,
     },
     model::{
-        parse_gateway_origin, validated_sidebar_bounds, AgentPanelSortConfig, Config,
-        ConfigReloadReport, ConfigReloadStatus, FleetConfig, FleetHostConfig, FleetHostKind,
-        GatewayConfig, GatewayOrigin, HostCursorModeConfig, NewTerminalCwdConfig, ShellModeConfig,
-        SidebarCollapsedModeConfig, StatusIndicatorStyle, TabBarPositionConfig,
-        ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
-        UpdateChannelConfig, FLEET_LOCAL_HOST_NAME, MAX_TOAST_DELAY_SECONDS,
+        validated_sidebar_bounds, AgentPanelSortConfig, Config, ConfigReloadReport,
+        ConfigReloadStatus, FleetConfig, FleetHostConfig, FleetHostKind, HostCursorModeConfig,
+        NewTerminalCwdConfig, ShellModeConfig, SidebarCollapsedModeConfig, StatusIndicatorStyle,
+        TabBarPositionConfig, ToastClipboardPosition, ToastConfig, ToastDelivery,
+        ToastHerdrPosition, UpdateChannelConfig, FLEET_LOCAL_HOST_NAME, MAX_TOAST_DELAY_SECONDS,
     },
     sidebar::{
         AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarTokenStyle,
@@ -56,6 +55,12 @@ pub(crate) use self::{
     keybinds::CommandKeybindType,
     model::{validate_fleet_host_name, KeysConfig},
 };
+
+/// `[gateway]` itself is unconditional (an upstream-shaped build still parses
+/// and validates the section), but only `src/gateway/**` needs to name these
+/// types, so the re-exports follow the feature that compiles it.
+#[cfg(feature = "gateway")]
+pub use self::model::{parse_gateway_origin, GatewayConfig, GatewayOrigin};
 
 pub const CONFIG_PATH_ENV_VAR: &str = "HERDR_CONFIG_PATH";
 
