@@ -1197,3 +1197,329 @@ fn terminal_control_second_owner_needs_takeover() {
     let _ = first.kill();
     let _ = first.wait();
 }
+
+// ---- pairing (PR 8) ----
+
+/// A pairing URL, split into the part a test can send and the part it must
+/// never print. Nothing here ever asserts on the code itself.
+fn pair_path(url: &str) -> String {
+    let start = url
+        .find("/pair?")
+        .unwrap_or_else(|| panic!("a pairing URL contains /pair?; got {} bytes", url.len()));
+    url[start..].to_string()
+}
+
+/// `herdr gateway pair --json` in the gateway's own environment.
+fn pair_json(env: &GatewayEnv, args: &[&str]) -> serde_json::Value {
+    let mut arguments = vec!["pair", "--json"];
+    arguments.extend_from_slice(args);
+    let output = env.run_gateway(&arguments);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|err| panic!("`pair --json` printed no JSON object ({err})"))
+}
+
+fn cookie_pair(set_cookie: &str) -> String {
+    set_cookie
+        .split(';')
+        .next()
+        .expect("a cookie name=value pair")
+        .to_string()
+}
+
+/// The whole operator loop for a read device: `pair` prints a URL, opening it
+/// once mints a cookie that authorizes the API, and opening it again does not.
+#[test]
+fn pairing_url_exchanges_into_a_device_cookie() {
+    let (_home, env) = hostless_env("pair-exchange");
+    let mut gateway = Gateway::spawn_in(env.clone());
+
+    let pairing = pair_json(&env, &["--label", "test phone"]);
+    let mut keys: Vec<&str> = pairing
+        .as_object()
+        .expect("a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["expires_unix", "scope", "url"], "{pairing}");
+    assert_eq!(pairing["scope"].as_str(), Some("read"));
+    let url = pairing["url"].as_str().expect("a url").to_string();
+    // The CLI learned the ephemeral port from the running gateway's marker.
+    assert!(
+        url.starts_with(&format!("http://{}/pair?code=", gateway.addr)),
+        "the pairing URL must name the bound address"
+    );
+
+    let paired = gateway.http_get(&pair_path(&url), &[]);
+    assert_eq!(paired.status, 303, "{}", paired.body);
+    assert_eq!(paired.header("location"), Some("/"));
+    let set_cookie = paired.header("set-cookie").expect("a Set-Cookie header");
+    for attribute in [
+        "herdr_gateway_device=",
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Strict",
+        "Max-Age=31536000",
+    ] {
+        assert!(
+            set_cookie.contains(attribute),
+            "the cookie must carry {attribute}"
+        );
+    }
+    assert!(
+        !set_cookie.contains("Secure"),
+        "a plain-http gateway must not mint a Secure cookie"
+    );
+
+    let cookie = cookie_pair(set_cookie);
+    let fleet = gateway.http_get("/api/fleet", &[("Cookie", &cookie)]);
+    assert_eq!(fleet.status, 200, "{}", fleet.body);
+
+    let info = gateway.http_get("/api/gateway", &[("Cookie", &cookie)]);
+    let body = info.json();
+    assert_eq!(body["scope"].as_str(), Some("read"));
+    assert_eq!(body["via"].as_str(), Some("device"));
+    assert_eq!(body["device"]["label"].as_str(), Some("test phone"));
+    assert!(
+        body["features"]
+            .as_array()
+            .is_some_and(|features| features.iter().any(|name| name == "pairing")),
+        "{body}"
+    );
+
+    // One time only.
+    let again = gateway.http_get(&pair_path(&url), &[]);
+    assert_eq!(again.status, 403, "{}", again.body);
+    assert_eq!(again.json()["error"].as_str(), Some("pairing_invalid"));
+    assert!(again.header("set-cookie").is_none());
+
+    assert_eq!(gateway.stop(), Some(0));
+}
+
+/// The text form is what an operator actually sees: a sentence, the URL, then
+/// a QR code that fits a terminal. Only its shape is asserted; the URL itself
+/// is never printed by the test.
+#[test]
+fn pair_prints_a_url_and_a_scannable_qr_code() {
+    let (_home, env) = hostless_env("pair-text");
+    let mut gateway = Gateway::spawn_in(env.clone());
+
+    let output = env.run_gateway(&["pair"]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines[0].starts_with("Pair this device with Herdr Fleet (read scope, valid "),
+        "{:?}",
+        lines[0]
+    );
+    assert!(
+        lines[1].trim_start().starts_with("http://"),
+        "{:?}",
+        lines[1]
+    );
+    let qr: Vec<&&str> = lines[2..]
+        .iter()
+        .filter(|line| {
+            line.chars()
+                .all(|ch| " \u{2580}\u{2584}\u{2588}".contains(ch))
+        })
+        .collect();
+    assert!(qr.len() >= 20, "a QR code of {} lines", qr.len());
+    let width = qr
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        width <= 80,
+        "a QR {width} columns wide does not fit a terminal"
+    );
+
+    // `--no-qr` is the same output without those lines.
+    let plain = env.run_gateway(&["pair", "--no-qr"]);
+    let plain = String::from_utf8_lossy(&plain.stdout);
+    assert!(!plain.contains('\u{2588}'), "--no-qr still drew a QR code");
+    assert_eq!(plain.lines().count(), 3, "{}", plain.lines().count());
+
+    // A ttl outside the documented bounds is a usage error, not a short link.
+    let refused = env.run_gateway(&["pair", "--ttl-secs", "5"]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--ttl-secs"));
+
+    assert_eq!(gateway.stop(), Some(0));
+}
+
+/// Rotating a token revokes the devices it granted **and** the codes that
+/// would have granted it, while the gateway keeps running.
+#[test]
+fn pair_control_then_rotate_revokes_the_device() {
+    let (_home, env) = hostless_env("pair-rotate");
+    let mut gateway = Gateway::spawn_in(env.clone());
+
+    let pairing = pair_json(&env, &["--control"]);
+    assert_eq!(pairing["scope"].as_str(), Some("control"));
+    let url = pairing["url"].as_str().expect("a url").to_string();
+    let paired = gateway.http_get(&pair_path(&url), &[]);
+    assert_eq!(paired.status, 303, "{}", paired.body);
+    let cookie = cookie_pair(paired.header("set-cookie").expect("a Set-Cookie header"));
+    assert_eq!(
+        gateway
+            .http_get("/api/gateway", &[("Cookie", &cookie)])
+            .json()["scope"]
+            .as_str(),
+        Some("control")
+    );
+
+    // A second, unredeemed control code must not survive the rotation either.
+    let pending = pair_json(&env, &["--control"]);
+    let pending_url = pending["url"].as_str().expect("a url").to_string();
+
+    let rotate = env.run_gateway(&["rotate-token", "control"]);
+    let rotate_out = String::from_utf8_lossy(&rotate.stdout);
+    assert_eq!(
+        rotate.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&rotate.stderr)
+    );
+    assert!(
+        rotate_out.contains("rotated the control token")
+            && rotate_out.contains("1 device")
+            && rotate_out.contains("1 pending pairing code"),
+        "{rotate_out}"
+    );
+
+    // No restart happened: the running gateway refuses the cookie, the old
+    // bearer token and the code that was still outstanding.
+    let refused = gateway.http_get("/api/fleet", &[("Cookie", &cookie)]);
+    assert_eq!(refused.status, 401, "{}", refused.body);
+    let stale_bearer = gateway.http_get(
+        "/api/fleet",
+        &[("Authorization", &gateway.control_authorization())],
+    );
+    assert_eq!(stale_bearer.status, 401, "{}", stale_bearer.body);
+    let stale_code = gateway.http_get(&pair_path(&pending_url), &[]);
+    assert_eq!(stale_code.status, 403, "{}", stale_code.body);
+
+    // The token file that replaced it works at once.
+    let rotated = std::fs::read_to_string(gateway.gateway_dir().join("control.token"))
+        .expect("read the rotated control token");
+    let accepted = gateway.http_get(
+        "/api/fleet",
+        &[("Authorization", &format!("Bearer {}", rotated.trim()))],
+    );
+    assert_eq!(accepted.status, 200, "{}", accepted.body);
+    // The read scope was not touched.
+    assert_eq!(
+        gateway
+            .http_get("/api/fleet", &[("Authorization", &gateway.authorization())])
+            .status,
+        200
+    );
+
+    assert_eq!(gateway.stop(), Some(0));
+}
+
+/// `status` is the operator's "is it up, and who is paired": exit 0 and a live
+/// health probe while it runs, exit 3 once it is gone.
+#[test]
+fn gateway_status_reports_running_and_devices() {
+    let (_home, env) = hostless_env("status");
+
+    let before = env.run_gateway(&["status", "--json"]);
+    assert_eq!(before.status.code(), Some(3), "no gateway is running yet");
+    let before: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&before.stdout).trim()).expect("json");
+    assert_eq!(before["running"].as_bool(), Some(false));
+    assert!(
+        before["pid"].is_null() && before["listen"].is_null(),
+        "{before}"
+    );
+    assert_eq!(before["devices"]["read"].as_u64(), Some(0));
+
+    let mut gateway = Gateway::spawn_in(env.clone());
+
+    // One code outstanding, then one device paired from a second code.
+    let _pending = pair_json(&env, &[]);
+    let url = pair_json(&env, &["--label", "desk"])["url"]
+        .as_str()
+        .expect("a url")
+        .to_string();
+    assert_eq!(gateway.http_get(&pair_path(&url), &[]).status, 303);
+
+    let running = env.run_gateway(&["status", "--json"]);
+    assert_eq!(running.status.code(), Some(0));
+    let json: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&running.stdout).trim()).expect("json");
+    assert_eq!(json["schema"].as_str(), Some("herdr.gateway.status.v1"));
+    assert_eq!(json["running"].as_bool(), Some(true));
+    assert_eq!(json["healthy"].as_bool(), Some(true), "{json}");
+    assert_eq!(
+        json["listen"].as_str(),
+        Some(gateway.addr.to_string().as_str())
+    );
+    assert!(json["pid"].as_u64().is_some_and(|pid| pid > 0), "{json}");
+    assert_eq!(json["devices"]["read"].as_u64(), Some(1), "{json}");
+    assert_eq!(json["devices"]["control"].as_u64(), Some(0), "{json}");
+    assert_eq!(json["pairings_pending"].as_u64(), Some(1), "{json}");
+
+    let text = env.run_gateway(&["status"]);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("gateway:  running (pid "), "{text}");
+    assert!(text.contains("health:   ok"), "{text}");
+    assert!(text.contains("devices:  read 1, control 0"), "{text}");
+    assert!(text.contains("pairings: 1 pending"), "{text}");
+
+    assert_eq!(gateway.stop(), Some(0));
+
+    // A stopped gateway removes its marker; the paired device is still on file.
+    let after = env.run_gateway(&["status", "--json"]);
+    assert_eq!(after.status.code(), Some(3));
+    let after: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&after.stdout).trim()).expect("json");
+    assert_eq!(after["running"].as_bool(), Some(false));
+    assert_eq!(after["devices"]["read"].as_u64(), Some(1), "{after}");
+}
+
+/// A crash leaves `gateway.json` behind. `status` must not believe it, and
+/// `pair` must not build a URL from a port nothing is listening on.
+#[test]
+fn a_stale_runtime_marker_is_not_a_running_gateway() {
+    let (_home, env) = hostless_env("stale-marker");
+    let mut gateway = Gateway::spawn_in(env.clone());
+    let marker = gateway.gateway_dir().join("gateway.json");
+    let recorded: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker).expect("read the marker")).expect("json");
+    assert_eq!(gateway.stop(), Some(0));
+
+    // Put it back with a pid that cannot be running.
+    let stale = serde_json::json!({
+        "pid": 0,
+        "listen": recorded["listen"],
+        "started_unix": recorded["started_unix"],
+    });
+    std::fs::write(&marker, stale.to_string()).expect("write a stale marker");
+
+    let status = env.run_gateway(&["status", "--json"]);
+    assert_eq!(
+        status.status.code(),
+        Some(3),
+        "a stale marker is not running"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).expect("json");
+    assert_eq!(json["running"].as_bool(), Some(false), "{json}");
+
+    // `pair` falls back to the configured bind, which is the default port —
+    // not the ephemeral one the dead process had.
+    let pairing = pair_json(&env, &[]);
+    let url = pairing["url"].as_str().expect("a url");
+    assert!(
+        url.starts_with("http://127.0.0.1:7788/pair?code="),
+        "wrong base"
+    );
+}

@@ -5,15 +5,16 @@
 //! arm and no `gateway` entry in the command spec, so it is upstream-shaped and
 //! links none of the feature's optional dependencies.
 //!
-//! This file is the single CLI entry point for the epic: later PRs add the
-//! `pair`/`status`/`rotate-token` subcommands here rather than a second
-//! dispatch in [`crate::cli`]. Anything that is not a known subcommand word is
-//! the run path's own argument list, so `herdr gateway`, `herdr gateway --bind
-//! ADDR` and `herdr gateway --config PATH` all start a server.
+//! This file is the single CLI entry point for the epic: the
+//! `pair`/`status`/`rotate-token` subcommands dispatch here rather than from a
+//! second arm in [`crate::cli`]. Anything that is not a known subcommand word
+//! is the run path's own argument list, so `herdr gateway`, `herdr gateway
+//! --bind ADDR` and `herdr gateway --config PATH` all start a server.
 //!
-//! Exit codes: 0 for a clean stop or printed help, 1 when the gateway refuses
-//! to start (bad config, a bind the policy rejects, an untrusted token file),
-//! 2 for a usage error.
+//! Exit codes: 0 for a clean stop, a printed help or a successful command, 1
+//! when the gateway refuses (bad config, a bind the policy rejects, an
+//! untrusted token file, no address to advertise), 2 for a usage error, and 3
+//! for `status` when no gateway is running.
 
 mod assets;
 mod auth;
@@ -21,6 +22,8 @@ mod events;
 mod fleet;
 mod http;
 mod middleware;
+mod ops;
+mod pairing;
 mod paths;
 mod policy;
 mod protocol;
@@ -39,6 +42,18 @@ pub(crate) fn run_gateway_command(args: &[String]) -> std::io::Result<i32> {
             std::print!("{}", gateway_help());
             Ok(0)
         }
+        Some("pair") => {
+            crate::platform::begin_cli_output();
+            ops::pair_command(&args[1..])
+        }
+        Some("status") => {
+            crate::platform::begin_cli_output();
+            ops::status_command(&args[1..])
+        }
+        Some("rotate-token") => {
+            crate::platform::begin_cli_output();
+            ops::rotate_token_command(&args[1..])
+        }
         // Everything else is the run path's argument list. `run` reports its
         // own usage errors, so an unknown option or word still exits 2.
         _ => run::run(args),
@@ -52,6 +67,11 @@ fn gateway_help() -> String {
     help.push_str("Options:\n");
     help.push_str("  --bind ADDR         Listen on ADDR instead of the configured address\n");
     help.push_str("  --config PATH       Read configuration from PATH\n");
+    help.push('\n');
+    help.push_str("Commands:\n");
+    help.push_str("  pair                Print a one-time pairing URL and QR code for a device\n");
+    help.push_str("  status              Report the running gateway, its devices and pairings\n");
+    help.push_str("  rotate-token        Replace a scope's token and revoke what it granted\n");
     help
 }
 

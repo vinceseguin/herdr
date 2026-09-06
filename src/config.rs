@@ -60,7 +60,10 @@ pub(crate) use self::{
 /// and validates the section), but only `src/gateway/**` needs to name these
 /// types, so the re-exports follow the feature that compiles it.
 #[cfg(feature = "gateway")]
-pub use self::model::{parse_gateway_origin, GatewayConfig, GatewayOrigin};
+pub use self::model::{
+    parse_gateway_origin, GatewayConfig, GatewayOrigin, MAX_GATEWAY_PAIRING_TTL_SECS,
+    MIN_GATEWAY_PAIRING_TTL_SECS,
+};
 
 pub const CONFIG_PATH_ENV_VAR: &str = "HERDR_CONFIG_PATH";
 

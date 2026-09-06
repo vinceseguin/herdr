@@ -227,7 +227,13 @@ async fn serve_until_signal(
     let transports = std::sync::Arc::new(HostTransports::new(config));
     let state = AppState {
         fleet: fleet.handle(),
-        auth: std::sync::Arc::new(AuthState::new(tokens, devices, &config.gateway, origins)),
+        auth: std::sync::Arc::new(AuthState::new(
+            gateway_dir.to_path_buf(),
+            tokens,
+            devices,
+            &config.gateway,
+            origins,
+        )),
         info: std::sync::Arc::new(GatewayInfo::new(listen, &config.gateway)),
         transports: std::sync::Arc::clone(&transports),
     };
