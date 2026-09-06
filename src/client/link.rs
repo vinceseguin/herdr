@@ -31,6 +31,12 @@ pub(super) enum LinkWriteError {
     // Produced by the fleet link, whose only constructor lands in E2 PR 4.
     #[allow(dead_code)]
     Detached,
+    /// The active fleet host has no usable connection right now, so the
+    /// connector did not take the message. A raw write is simply dropped
+    /// (see [`FleetLink::send`]); an endpoint request cannot be, because the
+    /// connector answers only requests it accepted — the command must fail
+    /// now rather than wait for an answer that will never come.
+    HostUnavailable(String),
 }
 
 /// The client loop's write half: one local server, or one host of a fleet.
@@ -67,19 +73,31 @@ impl FleetLink {
         &self.active
     }
 
-    fn send(&self, command: HostCommand) -> Result<(), LinkWriteError> {
+    /// Hands one command to the active host, saying exactly why it could not.
+    fn deliver(&self, command: HostCommand) -> Result<(), LinkWriteError> {
         match self.connector.send(&self.active, command) {
             Ok(()) => Ok(()),
             // Host-local and transient: the supervisor reconnects, and the
             // console keeps running. E2 PR 8 makes it visible in the pane area.
             Err(error @ (HostSendError::NotConnected | HostSendError::Io(_))) => {
-                debug!(host = %self.active, %error, "dropping a write for a fleet host that is not connected");
-                Ok(())
+                Err(LinkWriteError::HostUnavailable(error.to_string()))
             }
             // A bug in this client, not a host fact: surfaced.
             Err(error @ (HostSendError::UnknownHost | HostSendError::Refused(_))) => {
                 Err(LinkWriteError::Io(io::Error::other(error.to_string())))
             }
+        }
+    }
+
+    /// A fire-and-forget write: a host that is down loses it, and that is
+    /// not the console's failure.
+    fn send(&self, command: HostCommand) -> Result<(), LinkWriteError> {
+        match self.deliver(command) {
+            Err(LinkWriteError::HostUnavailable(reason)) => {
+                debug!(host = %self.active, reason, "dropping a write for a fleet host that is not connected");
+                Ok(())
+            }
+            other => other,
         }
     }
 }
@@ -118,7 +136,9 @@ impl ServerLink {
                 },
             )
             .map_err(LinkWriteError::Io),
-            Self::Fleet(link) => link.send(HostCommand::Endpoint {
+            // `deliver`, not `send`: the caller owns a command that expects
+            // exactly one answer, and a host that did not take it must say so.
+            Self::Fleet(link) => link.deliver(HostCommand::Endpoint {
                 request_id: request_id.to_string(),
                 request,
             }),
@@ -181,6 +201,12 @@ pub(super) fn io_result(result: Result<(), LinkWriteError>) -> io::Result<()> {
         Err(LinkWriteError::Io(error)) => Err(error),
         Err(LinkWriteError::Detached) => {
             debug!("fleet console detach: no server write, the console stops");
+            Ok(())
+        }
+        // Only an endpoint request reports this, and `EndpointCommands`
+        // handles it before reaching here; a raw write already dropped it.
+        Err(LinkWriteError::HostUnavailable(reason)) => {
+            debug!(reason, "a fleet host that is not connected lost a write");
             Ok(())
         }
     }
@@ -356,6 +382,34 @@ mod tests {
         assert!(
             link.write(&pane_input("w1:p1")).is_ok(),
             "a host that is down is host-local, not a console failure"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_request_to_a_host_that_is_down_is_reported_not_dropped() {
+        let dir = scratch_dir("link-endpoint-down");
+        let silent = FakeHost::start(&dir, "silent", Behaviour::Silent);
+        let connector = fake_connector(&[("silent", &silent)], FleetConnectorOptions::default());
+        let mut link = ServerLink::Fleet(FleetLink::new(Rc::new(connector), host_id("silent")));
+
+        let error = link.write_endpoint_request(
+            "boot-silent",
+            "request-1",
+            "{\"id\":\"request-1\",\"method\":\"ping\"}".to_string(),
+        );
+
+        assert!(
+            matches!(error, Err(LinkWriteError::HostUnavailable(_))),
+            "a request the host never took must not look accepted, or its command would wait forever: {error:?}"
+        );
+        assert!(
+            io_result(link.write_endpoint_request(
+                "boot-silent",
+                "request-2",
+                "{\"id\":\"request-2\",\"method\":\"ping\"}".to_string(),
+            ))
+            .is_ok(),
+            "and it is still not a connection failure for the console"
         );
     }
 

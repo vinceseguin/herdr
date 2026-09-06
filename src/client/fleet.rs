@@ -14,7 +14,7 @@
 //! E2 PR 3 lands the seam; PR 4 constructs it (`run_fleet`), PR 5 renders the
 //! host groups, PR 7 targets notifications and PR 8 shows a reconnect notice.
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use tracing::debug;
 
@@ -51,8 +51,11 @@ pub(super) struct FleetClientState {
     /// Every host's connection and projection, merged.
     pub(super) state: FleetState,
     /// Shared with the loop's [`super::link::FleetLink`]; the receiver half is
-    /// owned by the loop through `FleetConnector::take_events`.
-    pub(super) connector: Arc<FleetConnector>,
+    /// owned by the loop through `FleetConnector::take_events`. `Rc` for the
+    /// reason `FleetLink` gives: the connector is not `Sync`, and both owners
+    /// live on the client loop's one thread. The console's exit path reclaims
+    /// it with `Rc::try_unwrap` for `shutdown` once the link is dropped.
+    pub(super) connector: Rc<FleetConnector>,
     /// The one host whose surface the shell is showing and whose ids its input
     /// addresses.
     pub(super) active: HostId,

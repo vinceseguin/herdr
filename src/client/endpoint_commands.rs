@@ -7,7 +7,7 @@ use tracing::debug;
 use crate::api::client::ApiClientError;
 use crate::api::schema::{Request, ResponseResult};
 
-use super::link::ServerLink;
+use super::link::{LinkWriteError, ServerLink};
 use super::shell::ClientShellEndpointError;
 
 const ENDPOINT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
@@ -18,6 +18,11 @@ struct InFlightCommand {
     response: Vec<u8>,
     sent_at: Instant,
     timed_out: bool,
+    /// Why the fleet host never took this request. Such a command has no
+    /// answer coming, so [`EndpointCommands::expire`] fails it on the next
+    /// tick and releases the lane. Always `None` for a single-host client,
+    /// whose write either reached the socket or lost the connection.
+    unavailable: Option<String>,
 }
 
 pub(super) struct EndpointCommandResult {
@@ -49,13 +54,29 @@ impl EndpointCommands {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         // The link decides how the request is correlated: on the wire for a
         // single host, through the connector's per-host lane for a fleet.
-        super::link::io_result(link.write_endpoint_request(&boot_id, &request_id, request))?;
+        let unavailable = match link.write_endpoint_request(&boot_id, &request_id, request) {
+            // The fleet host did not take it, so nothing will answer: the
+            // command still occupies the lane, but only until the next tick
+            // reports the failure and releases it.
+            Err(LinkWriteError::HostUnavailable(reason)) => {
+                debug!(
+                    request_id,
+                    reason, "endpoint request not accepted by the fleet host"
+                );
+                Some(reason)
+            }
+            other => {
+                super::link::io_result(other)?;
+                None
+            }
+        };
         self.in_flight = Some(InFlightCommand {
             boot_id,
             request_id,
             response: Vec::new(),
             sent_at: Instant::now(),
             timed_out: false,
+            unavailable,
         });
         Ok(())
     }
@@ -103,6 +124,19 @@ impl EndpointCommands {
     }
 
     pub(super) fn expire(&mut self, now: Instant) -> Option<EndpointCommandResult> {
+        if let Some(reason) = self.in_flight.as_mut()?.unavailable.take() {
+            // Never accepted, so unlike a timeout there is no late answer to
+            // wait for: the lane is released with the failure.
+            let command = self.in_flight.take()?;
+            return Some(EndpointCommandResult {
+                boot_id: command.boot_id,
+                request_id: command.request_id,
+                result: Err(ClientShellEndpointError {
+                    code: Some("endpoint_unavailable".into()),
+                    message: reason,
+                }),
+            });
+        }
         let command = self.in_flight.as_mut()?;
         if command.timed_out
             || now.saturating_duration_since(command.sent_at) < ENDPOINT_COMMAND_TIMEOUT
@@ -206,9 +240,53 @@ mod tests {
                 response: Vec::new(),
                 sent_at: Instant::now(),
                 timed_out: false,
+                unavailable: None,
             }),
             ..EndpointCommands::default()
         }
+    }
+
+    #[test]
+    fn a_request_the_fleet_host_never_took_fails_at_once_and_releases_the_lane() {
+        let mut commands = EndpointCommands {
+            in_flight: Some(InFlightCommand {
+                boot_id: "boot-a".into(),
+                request_id: "request-a".into(),
+                response: Vec::new(),
+                sent_at: Instant::now(),
+                timed_out: false,
+                unavailable: Some("fleet host is not connected".into()),
+            }),
+            ..EndpointCommands::default()
+        };
+
+        let failed = commands
+            .expire(Instant::now())
+            .expect("an unaccepted request fails on the next tick, not after the timeout");
+
+        assert_eq!(failed.boot_id, "boot-a");
+        assert_eq!(failed.request_id, "request-a");
+        assert!(matches!(
+            failed.result,
+            Err(ClientShellEndpointError { code: Some(code), message })
+                if code == "endpoint_unavailable" && message == "fleet host is not connected"
+        ));
+        assert!(
+            commands.in_flight.is_none(),
+            "no answer can come, so the lane is released rather than kept for one"
+        );
+        assert!(commands.expire(Instant::now()).is_none());
+    }
+
+    #[test]
+    fn a_sent_request_is_not_touched_by_the_unavailable_path() {
+        let mut commands = commands_with_in_flight();
+
+        assert!(
+            commands.expire(Instant::now()).is_none(),
+            "a request the host took waits for its answer or the timeout"
+        );
+        assert!(commands.in_flight.is_some());
     }
 
     #[test]
@@ -449,6 +527,63 @@ mod fleet_tests {
             }),
             "the active host received the request: {:?}",
             alpha.received()
+        );
+    }
+
+    /// A request to a host that is down is not silently parked in the lane:
+    /// the connector never answers requests it did not accept, so the next
+    /// tick fails the command and the lane is free for the next one.
+    #[test]
+    fn send_next_to_a_host_that_is_down_fails_the_command_instead_of_stalling_the_lane() {
+        let dir = scratch_dir("endpoint-commands-fleet-down");
+        // Accepts the connection and never answers the hello: connected at the
+        // transport level, never usable, so the connector reports NotConnected.
+        let silent = FakeHost::start(&dir, "silent", Behaviour::Silent);
+        let connector = fake_connector(&[("silent", &silent)], FleetConnectorOptions::default());
+        let mut link = ServerLink::Fleet(FleetLink::new(
+            Rc::new(connector),
+            HostId::new("silent").expect("valid host id"),
+        ));
+
+        let mut commands = EndpointCommands::default();
+        commands.enqueue(
+            "boot-silent".into(),
+            Box::new(Request {
+                id: "request-1".into(),
+                method: Method::Ping(PingParams::default()),
+            }),
+        );
+        commands
+            .send_next(&mut link)
+            .expect("a host that is down is not a console failure");
+
+        let failed = commands
+            .expire(std::time::Instant::now())
+            .expect("the unaccepted request fails on the next tick");
+        assert_eq!(failed.request_id, "request-1");
+        assert!(matches!(
+            failed.result,
+            Err(ClientShellEndpointError { code: Some(code), .. }) if code == "endpoint_unavailable"
+        ));
+        assert!(commands.in_flight.is_none(), "the lane is released");
+
+        commands.enqueue(
+            "boot-silent".into(),
+            Box::new(Request {
+                id: "request-2".into(),
+                method: Method::Ping(PingParams::default()),
+            }),
+        );
+        commands
+            .send_next(&mut link)
+            .expect("the next request is attempted");
+        assert_eq!(
+            commands
+                .in_flight
+                .as_ref()
+                .map(|command| command.request_id.clone()),
+            Some("request-2".to_string()),
+            "the lane took the next request rather than staying blocked on the first"
         );
     }
 }
