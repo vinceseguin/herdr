@@ -234,19 +234,39 @@ impl TokenStore {
     /// put on a phone must not change without them asking.
     pub fn load_or_create(dir: &Path) -> io::Result<Self> {
         paths::create_private_dir(dir)?;
-        Ok(Self {
-            read: load_or_create_token(dir, TokenScope::Read)?,
-            control: load_or_create_token(dir, TokenScope::Control)?,
-        })
+        Self::from_digests(
+            dir,
+            load_or_create_token(dir, TokenScope::Read)?,
+            load_or_create_token(dir, TokenScope::Control)?,
+        )
     }
 
     /// Load both token files without creating anything.
     pub fn load(dir: &Path) -> io::Result<Self> {
         paths::verify_private_dir(dir)?;
-        Ok(Self {
-            read: read_token(&dir.join(READ_TOKEN_FILE))?,
-            control: read_token(&dir.join(CONTROL_TOKEN_FILE))?,
-        })
+        Self::from_digests(
+            dir,
+            read_token(&dir.join(READ_TOKEN_FILE))?,
+            read_token(&dir.join(CONTROL_TOKEN_FILE))?,
+        )
+    }
+
+    /// Two identical token files would make the read token a control token
+    /// (`verify_bearer` checks control first); refuse them rather than let a
+    /// copy-paste silently widen a scope.
+    fn from_digests(dir: &Path, read: TokenDigest, control: TokenDigest) -> io::Result<Self> {
+        if read.ct_eq(&control) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} and {} hold the same token, so the read token would grant control; \
+                     delete one of them to regenerate it",
+                    dir.join(READ_TOKEN_FILE).display(),
+                    dir.join(CONTROL_TOKEN_FILE).display()
+                ),
+            ));
+        }
+        Ok(Self { read, control })
     }
 
     /// The scope a presented bearer token proves, or `None`.
@@ -569,6 +589,10 @@ impl PairingStore {
     /// Success and expiry delete the file. A wrong secret does not: an
     /// attacker who can guess ids must not be able to delete a code the user
     /// is about to use, and must not learn that the id existed.
+    ///
+    /// The file lookup is not constant-time (a missing id fails at `open`, a
+    /// present one after a read and a digest), which is acceptable only
+    /// because ids are 256 random bits: there is nothing to enumerate.
     pub fn consume(&self, code_text: &str, now_unix: u64) -> Result<PairingCode, PairingError> {
         let (id, secret) = split_code(code_text).ok_or(PairingError::Invalid)?;
         let path = self.code_path(id);
@@ -579,19 +603,17 @@ impl PairingStore {
             }
             Err(err) => return Err(PairingError::Io(err.to_string())),
         };
-        let code: PairingCode = match serde_json::from_slice(&bytes) {
-            Ok(code) => code,
-            Err(_) => {
-                // A file we wrote that no longer parses is unusable; remove it
-                // so it cannot accumulate, and say nothing about its contents.
-                let _ = std::fs::remove_file(&path);
-                return Err(PairingError::NotFound);
-            }
+        let stored = serde_json::from_slice::<PairingCode>(&bytes)
+            .ok()
+            .and_then(|code| code.digest().map(|digest| (code, digest)));
+        let Some((code, stored)) = stored else {
+            // A file we wrote that no longer parses (or carries a digest we
+            // cannot read) is unusable; remove it so it cannot accumulate, and
+            // say nothing about its contents.
+            let _ = std::fs::remove_file(&path);
+            return Err(PairingError::NotFound);
         };
 
-        let stored = code
-            .digest()
-            .ok_or_else(|| PairingError::Io("stored pairing digest is malformed".to_string()))?;
         if !TokenDigest::of(secret.as_bytes()).ct_eq(&stored) {
             return Err(PairingError::NotFound);
         }
@@ -599,12 +621,14 @@ impl PairingStore {
             let _ = std::fs::remove_file(&path);
             return Err(PairingError::Expired);
         }
-        if let Err(err) = std::fs::remove_file(&path) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(code),
+            // Someone redeemed it between our read and our delete: it is theirs.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Err(PairingError::NotFound),
             // Refusing here is what makes the code one-time: if we cannot
             // delete it, we must not hand out a device for it.
-            return Err(PairingError::Io(err.to_string()));
+            Err(err) => Err(PairingError::Io(err.to_string())),
         }
-        Ok(code)
     }
 
     /// Delete every expired code, returning how many were removed.
@@ -683,6 +707,15 @@ impl AuthLimiter {
         }
     }
 
+    /// The limiter `[gateway]` configures, with the documented defaults in
+    /// place of any value the config diagnostics rejected.
+    pub fn from_config(config: &crate::config::GatewayConfig) -> Self {
+        Self::new(
+            config.effective_auth_failure_limit(),
+            config.effective_auth_failure_window(),
+        )
+    }
+
     /// `Ok(())` when `peer` may attempt again, `Err(retry_after)` when it is
     /// blocked for that long.
     pub fn check(&mut self, peer: IpAddr, now: Instant) -> Result<(), Duration> {
@@ -722,8 +755,14 @@ impl AuthLimiter {
         self.peers.len()
     }
 
-    /// Drop expired peers, or failing that the peer whose last failure is
-    /// oldest — the one closest to expiring anyway.
+    /// Drop expired peers, or failing that one peer: an unblocked one before
+    /// any blocked one, and among those the peer whose last failure is oldest
+    /// (the one closest to expiring anyway).
+    ///
+    /// Preferring unblocked peers means a flood of fresh addresses cannot
+    /// lift an existing block until it has earned `MAX_TRACKED_PEERS` blocks
+    /// of its own; it is a cost, not a guarantee — an attacker with unlimited
+    /// addresses never needs the evicted one back.
     fn evict_one(&mut self, now: Instant) {
         let window = self.window;
         self.peers.retain(|_, failures| {
@@ -733,10 +772,14 @@ impl AuthLimiter {
         if self.peers.len() < MAX_TRACKED_PEERS {
             return;
         }
+        let limit = self.limit;
         let victim = self
             .peers
             .iter()
-            .min_by_key(|(_, failures)| failures.last().copied())
+            .min_by_key(|(_, failures)| {
+                let blocked = failures.len() as u32 >= limit;
+                (blocked, failures.last().copied())
+            })
             .map(|(peer, _)| *peer);
         if let Some(peer) = victim {
             self.peers.remove(&peer);
@@ -883,6 +926,27 @@ mod tests {
     }
 
     #[test]
+    fn identical_token_files_are_refused() {
+        let dir = temp_dir("identical");
+        TokenStore::load_or_create(&dir).expect("create");
+        let read = token_text(&dir, TokenScope::Read);
+        paths::write_private_file(&dir.join(CONTROL_TOKEN_FILE), read.as_bytes())
+            .expect("copy the read token over the control token");
+        let err = TokenStore::load(&dir).expect_err("identical tokens must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("read.token") && err.to_string().contains("control.token"),
+            "{err}"
+        );
+        assert!(
+            !err.to_string().contains(&read),
+            "the error must not print the token"
+        );
+        TokenStore::load_or_create(&dir).expect_err("load_or_create refuses them too");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn rotate_changes_only_the_named_scope() {
         let dir = temp_dir("rotate");
         TokenStore::load_or_create(&dir).expect("create");
@@ -953,6 +1017,49 @@ mod tests {
     }
 
     #[test]
+    fn a_pairing_id_can_only_ever_be_sixty_four_hex_characters() {
+        let secret = "a".repeat(SECRET_HEX_LEN);
+        let hex_63 = "b".repeat(SECRET_HEX_LEN - 1);
+        for id in [
+            "..",
+            ".",
+            "",
+            "/",
+            "\\",
+            "../../etc/passwd",
+            "/etc/passwd",
+            "C:\\Windows\\win.ini",
+            "..\\..\\x",
+            &format!("{hex_63}/"),
+            &format!("/{hex_63}"),
+            &format!("{hex_63}\\"),
+            &format!("{hex_63}\u{0}"),
+            &"\u{ff10}".repeat(SECRET_HEX_LEN), // fullwidth digits
+            &"\u{0430}".repeat(SECRET_HEX_LEN), // cyrillic a
+            &"g".repeat(SECRET_HEX_LEN),
+            &"a".repeat(SECRET_HEX_LEN + 1),
+        ] {
+            assert_eq!(
+                split_code(&format!("{id}.{secret}")),
+                None,
+                "{id:?} must not become a file name"
+            );
+        }
+        // What survives is exactly [0-9a-fA-F]{64}, which cannot leave the
+        // pairings directory.
+        let store = PairingStore::new(Path::new("/tmp/herdr-gateway-test"));
+        let text = format!("{secret}.{secret}");
+        let (id, _) = split_code(&text).expect("hex id");
+        let path = store.code_path(id);
+        assert!(path.starts_with(store.dir()), "{}", path.display());
+        assert_eq!(path.parent(), Some(store.dir()));
+        assert!(path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == format!("{secret}.json")));
+    }
+
+    #[test]
     fn a_pairing_code_is_redeemable_exactly_once() {
         let dir = temp_dir("pairing");
         let store = PairingStore::new(&dir);
@@ -997,10 +1104,32 @@ mod tests {
             store.dir().join(format!("{}.json", record.id)).exists(),
             "a wrong secret must not delete a valid code"
         );
+        // Neither does a wrong secret on an already-expired code: expiry is
+        // only revealed to someone holding the secret.
+        assert_eq!(
+            store.consume(&format!("{id}.{}", "0".repeat(64)), 5_000),
+            Err(PairingError::NotFound)
+        );
+        assert!(store.dir().join(format!("{}.json", record.id)).exists());
 
         // Expiry reports itself and removes the file.
         assert_eq!(store.consume(&code, 1_600), Err(PairingError::Expired));
         assert!(!store.dir().join(format!("{}.json", record.id)).exists());
+
+        // A file that no longer parses is removed and reads as not found.
+        let (code, record) = store.create(TokenScope::Read, 600, 1_000).expect("create");
+        let path = store.dir().join(format!("{}.json", record.id));
+        paths::write_private_file(&path, b"{ not json").expect("corrupt");
+        assert_eq!(store.consume(&code, 1_100), Err(PairingError::NotFound));
+        assert!(!path.exists(), "a corrupt code is swept on contact");
+        let (code, record) = store.create(TokenScope::Read, 600, 1_000).expect("create");
+        let path = store.dir().join(format!("{}.json", record.id));
+        let mut tampered = record.clone();
+        tampered.secret_sha256 = "zz".to_string();
+        paths::write_private_file(&path, &serde_json::to_vec(&tampered).expect("json"))
+            .expect("tamper");
+        assert_eq!(store.consume(&code, 1_100), Err(PairingError::NotFound));
+        assert!(!path.exists());
 
         // Sweeping removes stale codes.
         let (_, stale) = store.create(TokenScope::Read, 30, 1_000).expect("create");
@@ -1053,6 +1182,58 @@ mod tests {
             .check(peer, start + Duration::from_secs(30))
             .is_err());
         assert!(limiter.check(peer, start + Duration::from_secs(61)).is_ok());
+    }
+
+    #[test]
+    fn the_limiter_takes_its_numbers_from_the_config_with_defaults_for_bad_values() {
+        let config: crate::config::GatewayConfig =
+            toml::from_str("auth_failure_limit = 2\nauth_failure_window_secs = 10\n")
+                .expect("parses");
+        let mut limiter = AuthLimiter::from_config(&config);
+        let peer: IpAddr = "192.0.2.1".parse().expect("ip");
+        let start = Instant::now();
+        limiter.record_failure(peer, start);
+        assert!(limiter.check(peer, start).is_ok());
+        limiter.record_failure(peer, start);
+        assert_eq!(limiter.check(peer, start), Err(Duration::from_secs(10)));
+        assert!(limiter.check(peer, start + Duration::from_secs(10)).is_ok());
+
+        let config: crate::config::GatewayConfig =
+            toml::from_str("auth_failure_limit = 0\nauth_failure_window_secs = 0\n")
+                .expect("parses");
+        let mut limiter = AuthLimiter::from_config(&config);
+        for _ in 0..5 {
+            limiter.record_failure(peer, start);
+        }
+        assert_eq!(
+            limiter.check(peer, start),
+            Err(Duration::from_secs(60)),
+            "zero values fall back to the documented defaults, never to 'no limit'"
+        );
+    }
+
+    #[test]
+    fn a_flood_of_new_peers_evicts_unblocked_peers_before_blocked_ones() {
+        let mut limiter = AuthLimiter::new(2, Duration::from_secs(60));
+        let start = Instant::now();
+        let blocked: IpAddr = "192.0.2.5".parse().expect("ip");
+        limiter.record_failure(blocked, start);
+        limiter.record_failure(blocked, start);
+        assert!(limiter.check(blocked, start).is_err());
+
+        // Every later peer is newer than the blocked one, so a last-failure
+        // policy alone would evict the block first.
+        for index in 1..=(MAX_TRACKED_PEERS + 8) {
+            let peer = IpAddr::from(std::net::Ipv6Addr::from(index as u128));
+            limiter.record_failure(peer, start + Duration::from_millis(index as u64));
+        }
+        assert!(limiter.tracked_peers() <= MAX_TRACKED_PEERS);
+        assert!(
+            limiter
+                .check(blocked, start + Duration::from_secs(1))
+                .is_err(),
+            "the blocked peer must survive a flood of one-failure peers"
+        );
     }
 
     #[test]

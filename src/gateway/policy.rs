@@ -72,13 +72,18 @@ pub struct OriginAllowlist {
 }
 
 impl OriginAllowlist {
-    /// Build the allowlist for a bind address.
+    /// Build the allowlist for the address the gateway actually bound.
     ///
     /// It is `[gateway] allowed_origins`, plus `public_url` when set, plus —
-    /// **only for a loopback bind** — the origins that bind serves itself, so
-    /// `http://127.0.0.1:<port>` works out of the box without the user
-    /// configuring their own address. A non-loopback bind gets no implicit
-    /// origins: it already refused to start without configured ones.
+    /// **only for a loopback bind** — the origins that bind serves itself
+    /// (`http://127.0.0.1:<port>`, `http://localhost:<port>`,
+    /// `http://[::1]:<port>` and the bound IP itself), so a local browser works
+    /// out of the box without the user configuring their own address. A
+    /// non-loopback bind gets no implicit origins: it already refused to start
+    /// without configured ones.
+    ///
+    /// Pass the address after binding, not the requested one: a `--bind
+    /// 127.0.0.1:0` only knows its port once the listener exists.
     pub fn for_bind(bind: SocketAddr, config: &GatewayConfig) -> Self {
         let mut origins: Vec<GatewayOrigin> = Vec::new();
         let mut push = |origin: GatewayOrigin| {
@@ -96,12 +101,17 @@ impl OriginAllowlist {
             push(origin);
         }
         if is_loopback(bind.ip()) {
-            for host in ["127.0.0.1", "localhost", "[::1]"] {
-                push(GatewayOrigin {
-                    scheme: "http".to_string(),
-                    host: host.to_string(),
-                    port: Some(bind.port()),
-                });
+            // Through the parser, so the scheme's default port folds away the
+            // same way it does for a browser's `Origin` header.
+            let own = format!("http://{bind}");
+            for value in ["127.0.0.1", "localhost", "[::1]"]
+                .iter()
+                .map(|host| format!("http://{host}:{}", bind.port()))
+                .chain(std::iter::once(own))
+            {
+                if let Ok(origin) = parse_gateway_origin(&value) {
+                    push(origin);
+                }
             }
         }
 
@@ -218,6 +228,30 @@ mod tests {
             !allowlist.allows("http://localhost"),
             "a missing port is not the bound port"
         );
+        assert!(
+            !allowlist.allows("http://127.0.0.53:7788"),
+            "another loopback address is not the bound one"
+        );
+        assert_eq!(allowlist.origins().len(), 3, "{:?}", allowlist.origins());
+    }
+
+    #[test]
+    fn a_loopback_bind_allows_its_own_address_and_default_port() {
+        let allowlist =
+            OriginAllowlist::for_bind(addr("127.0.0.53:7788"), &GatewayConfig::default());
+        assert!(allowlist.allows("http://127.0.0.53:7788"));
+        assert!(allowlist.allows("http://127.0.0.1:7788"));
+        assert!(!allowlist.allows("http://127.0.0.54:7788"));
+
+        // On port 80 a browser sends `http://localhost`, never `:80`.
+        let allowlist = OriginAllowlist::for_bind(addr("127.0.0.1:80"), &GatewayConfig::default());
+        assert!(allowlist.allows("http://localhost"));
+        assert!(allowlist.allows("http://localhost:80"));
+        assert!(!allowlist.allows("https://localhost"));
+
+        let allowlist = OriginAllowlist::for_bind(addr("[::1]:7788"), &GatewayConfig::default());
+        assert!(allowlist.allows("http://[::1]:7788"));
+        assert!(allowlist.allows("http://[0:0:0:0:0:0:0:1]:7788"));
     }
 
     #[test]
@@ -240,9 +274,16 @@ mod tests {
             "https://fleet.example.ts.net/app",
             "https://evil.fleet.example.ts.net",
             "https://fleet.example.ts.net.evil.test",
-            "https://fleet.example.ts.net:443",
+            "https://fleet.example.ts.net:8443",
+            "https://fleet.example.ts.net:80",
+            "http://fleet.example.ts.net",
+            "http://fleet.example.ts.net:443",
+            "https://fleet.example.ts.net.",
             "file://fleet.example.ts.net",
             "https://user@fleet.example.ts.net",
+            "https://fleet.example.ts.net\u{0}",
+            "https://fleet.example.ts.net ",
+            " https://fleet.example.ts.net",
             "fleet.example.ts.net",
         ] {
             assert!(
@@ -250,6 +291,10 @@ mod tests {
                 "{candidate:?} must not be allowed"
             );
         }
+        // The scheme's default port is the same origin, exactly as a browser
+        // (which never sends `:443` for https) sees it.
+        assert!(allowlist.allows("https://fleet.example.ts.net:443"));
+        assert!(allowlist.allows("HTTPS://FLEET.EXAMPLE.TS.NET"));
     }
 
     #[test]

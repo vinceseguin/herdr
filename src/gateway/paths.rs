@@ -21,9 +21,10 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 /// Mode of `<config>/gateway/` and `<config>/gateway/pairings/`.
 #[cfg(unix)]
@@ -58,16 +59,19 @@ pub fn pairings_dir(gateway_dir: &Path) -> PathBuf {
 /// Create `path` (and its parents) as a private directory, or verify that an
 /// existing one is private.
 ///
-/// An existing directory owned by another uid, or readable by group or other,
-/// is refused rather than fixed: a directory someone else can write is not one
-/// we can make safe by chmod'ing it.
+/// A new directory is created `0700` in one step, never created open and
+/// chmod'ed afterwards. An existing directory we own is tightened to `0700`
+/// (a wider mode only exposes file names; the files inside are `0600`). An
+/// existing directory owned by another uid, or anything that is not a
+/// directory, is refused rather than fixed: a directory someone else can write
+/// is not one we can make safe by chmod'ing it.
 pub fn create_private_dir(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
     }
-    match fs::create_dir(path) {
+    match private_dir_builder().create(path) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
         Err(err) => return Err(err),
@@ -76,11 +80,30 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
     verify_private_dir(path)
 }
 
+/// A builder that creates the directory already `0700` (unix), so it is never
+/// open for even a moment before being tightened.
+#[cfg(unix)]
+fn private_dir_builder() -> fs::DirBuilder {
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(DIRECTORY_MODE);
+    builder
+}
+
+#[cfg(not(unix))]
+fn private_dir_builder() -> fs::DirBuilder {
+    fs::DirBuilder::new()
+}
+
 #[cfg(unix)]
 fn set_private_dir_mode(path: &Path) -> io::Result<()> {
     // Only tighten a directory we own; `verify_private_dir` refuses the rest.
+    // `set_permissions` follows symlinks, so a symlink (which is never a
+    // directory here) is left alone and refused by the verification instead.
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_dir() && metadata.uid() == effective_uid() {
+    if metadata.file_type().is_dir()
+        && metadata.uid() == effective_uid()
+        && metadata.mode() & 0o777 != DIRECTORY_MODE
+    {
         fs::set_permissions(path, fs::Permissions::from_mode(DIRECTORY_MODE))?;
     }
     Ok(())
@@ -167,11 +190,17 @@ fn verify_private_metadata(path: &Path, metadata: &fs::Metadata) -> io::Result<(
     Ok(())
 }
 
+/// Per-process counter so two threads writing the same file never share a
+/// temporary name (one would otherwise delete the other's in-progress file).
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 /// Write `bytes` to `path` as a private file, atomically.
 ///
-/// The temporary file is created `0600` in the destination directory (so the
-/// rename never crosses a filesystem and the secret is never briefly
-/// world-readable), synced, then renamed over the target.
+/// The temporary file is created `0600` (and `O_EXCL`, so a planted symlink
+/// or leftover is never opened) in the destination directory — which
+/// [`create_private_dir`] has just verified is ours and `0700` — so the rename
+/// never crosses a filesystem and the secret is never briefly readable by
+/// anyone else. It is synced, then renamed over the target.
 pub fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()
@@ -182,9 +211,13 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let temp = parent.join(format!(".{file_name}.tmp.{}", std::process::id()));
-    // A leftover temp file from a crashed run must not be reused: it could be
-    // a symlink someone else planted.
+    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(
+        ".{file_name}.tmp.{}.{sequence}",
+        std::process::id()
+    ));
+    // A leftover temp file from a crashed run with a recycled pid must not be
+    // reused: `create_new` below refuses to open it, and it could be a symlink.
     match fs::remove_file(&temp) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -333,6 +366,73 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
         let err = verify_private_file(&link).expect_err("symlink must be refused");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_private_file_never_follows_a_symlink() {
+        let dir = temp_dir("readlink");
+        create_private_dir(&dir).expect("create");
+        let target = dir.join("target");
+        write_private_file(&target, b"value\n").expect("write");
+        let link = dir.join("read.token");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let err = read_private_file(&link).expect_err("a symlink must not be read through");
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "a symlink is refused, not treated as absent (which would regenerate over it): {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wider_directory_we_own_is_tightened_on_create() {
+        let dir = temp_dir("tighten");
+        fs::create_dir_all(&dir).expect("create");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod");
+        create_private_dir(&dir).expect("an owned 0755 directory is tightened");
+        let mode = fs::symlink_metadata(&dir).expect("metadata").mode() & 0o777;
+        assert_eq!(mode, DIRECTORY_MODE, "mode {mode:o}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_where_the_directory_should_be_is_refused() {
+        let dir = temp_dir("notdir");
+        fs::create_dir_all(&dir).expect("create");
+        let path = dir.join("gateway");
+        fs::write(&path, b"").expect("file");
+        let err = create_private_dir(&path).expect_err("a file is not a private directory");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_writes_to_one_file_all_succeed() {
+        let dir = temp_dir("concurrent");
+        let path = dir.join("devices.json");
+        create_private_dir(&dir).expect("create");
+        let threads: Vec<_> = (0..8u8)
+            .map(|index| {
+                let path = path.clone();
+                std::thread::spawn(move || write_private_file(&path, &[index; 16]))
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("join").expect("every writer succeeds");
+        }
+        let bytes = read_private_file(&path).expect("read");
+        assert_eq!(bytes.len(), 16);
+        assert!(bytes.iter().all(|byte| *byte == bytes[0]), "torn write");
+        let leftovers = fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(leftovers, 0, "temp files left behind");
         let _ = fs::remove_dir_all(&dir);
     }
 
