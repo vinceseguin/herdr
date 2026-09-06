@@ -1867,6 +1867,63 @@ modes, the `stty size` line, the exit lines. Paste no token.
   gateway.json}` — note `<config>` follows `XDG_CONFIG_HOME`, **not**
   `--config`, because `config_dir()` and `config_path()` are separate in
   herdr; say so in `docs/fork/gateway.md`.
+- **The `fable` review pass changed the auth layer in five ways; all five are
+  now the contract.**
+  - *Only a **presented** credential that fails counts against the limiter.*
+    `verify()` returns `Verification::{Verified, Rejected, Absent,
+    CrossSiteCookie}` and only `Rejected` calls `record_failure`. A
+    credential-less request cannot brute-force anything, and counting it was a
+    live foot-gun: five `<img src="http://127.0.0.1:7788/api/fleet">` tags on
+    any web page locked the operator's own address out for the window — and
+    because the limiter runs *before* the credential check, a correct token
+    was then refused too. The app shell's own unauthenticated
+    `GET /api/gateway` did the same on every load.
+  - *A device cookie is refused on a cross-site request that carries no
+    `Origin`.* Browsers omit `Origin` on `<img>`, forms and navigations, so
+    the origin step never sees them; `Sec-Fetch-Site: cross-site|same-site`
+    with no `Origin` and a cookie credential is `403 origin_not_allowed`
+    before the digest compare, and is not counted. Bearer requests are
+    unaffected and an allowed `Origin` still vouches. **PR 8 must still set
+    `SameSite=Strict; HttpOnly; Path=/`** (plus `Secure` per
+    `requires_secure_cookies`) for browsers that predate `Sec-Fetch-Site`.
+  - *`Origin` fails closed.* `origin_header()` reads `get_all(ORIGIN)`: more
+    than one `Origin` header, or a value that is not visible ASCII, is `403`.
+    Before this, a second `Origin` header was ignored and an unreadable one
+    was read as "no Origin" — probed live at `Origin: <own>` + `Origin:
+    https://evil.example` + a valid bearer = 200.
+  - *Every path decision is made on `middleware::normalized_path`* (percent-
+    decoded, empty/`.` segments dropped, `..` resolved, never escaping the
+    root), used by the auth layer **and** by `assets::serve`. Axum does not
+    fold `/api%2ffleet`, `//api/fleet` or `/x/../api/fleet` today — measured —
+    so nothing reaches a handler; normalizing anyway means a future router
+    that *does* fold them cannot turn a "public" answer into a bypass, and an
+    `/api/…` spelling answers JSON rather than the HTML shell an API client
+    could not tell from a real reply.
+  - *Graceful shutdown drains for at most `SHUTDOWN_DRAIN = 5 s`.*
+    `axum::serve(...).with_graceful_shutdown` waits forever on a connection
+    that sent half a request line, so `SIGTERM` would never complete, a
+    supervisor would `SIGKILL`, and `gateway.json` would be left stale.
+    `serve_with_drain` takes the bound so a test can use 200 ms.
+    `WithGracefulShutdown` is `IntoFuture`, not `Future` — call
+    `.into_future()` before pinning it.
+- **Accepted risks, recorded rather than fixed** (PR 10 documents them):
+  1. **No header-read/idle timeout.** `axum::serve` has none, so a slowloris
+     client can hold connections open; closing it needs `hyper-util`'s http1
+     builder as a direct dependency, which is outside the epic's budget. The
+     loopback default and E5's `tailscale serve` in front are the mitigation.
+  2. **Behind a proxy every peer is one address.** With `tailscale serve`,
+     all clients arrive from `127.0.0.1`, so one client's five bad tokens
+     block every client for the window. `X-Forwarded-For` is not trusted
+     (there is no proxy configuration to trust it against).
+  3. **`allowed_origins` is an allowlist, not CORS.** No CORS headers are
+     sent, so a page served from a *different* allowed origin cannot call
+     `/api/*` (its preflight `OPTIONS` is a non-`GET` on an `/api/` path →
+     401). The app must be same-origin: embedded, or behind `public_url`.
+  4. **`touch_device` persists while holding the devices mutex** (at most once
+     a minute, on `spawn_blocking`), so a concurrent `verify_cookie` waits for
+     that one write.
+  5. **`gateway.json` can be stale** after a crash, and two gateways sharing a
+     config directory overwrite and then remove each other's marker.
 - **Real-server evidence recorded** (fleet lab, 2 sessions, gateway on
   `127.0.0.1:7788`): `/health` 200 `{"ok":true}`; `/api/fleet` 401
   `{"error":"unauthorized"}` bare and 200 with the read token, body
