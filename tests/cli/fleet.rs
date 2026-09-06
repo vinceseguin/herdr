@@ -308,3 +308,116 @@ fn fleet_usage_errors_exit_two() {
 
     cleanup_test_base(&base);
 }
+
+/// `[fleet] include_machines` is the fork's opt-in bridge from the machines
+/// `herdr machine add` saved to the fleet's host list. The catalog lives under
+/// `XDG_STATE_HOME`, so this test points that at a throwaway directory and
+/// never reads the developer's own `~/.local/state/herdr*`.
+#[test]
+fn fleet_status_includes_saved_machines_when_enabled() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let state_home = base.join("state");
+
+    let alpha = spawn_named_server(&config_home, &runtime_dir, "alpha");
+    wait_for_socket(
+        &named_client_socket(&config_home, "alpha"),
+        Duration::from_secs(15),
+    );
+
+    const PROFILE: &str = "0123456789abcdef0123456789abcdef";
+    let catalog_dir = state_home.join(app_dir_name()).join("client");
+    fs::create_dir_all(&catalog_dir).unwrap();
+    // Nothing listens on port 1, so the machine is reported unavailable
+    // without this test needing an sshd.
+    let catalog = |label: &str| {
+        format!(
+            r#"{{"version":1,"selected_profile":null,"ssh":[{{"id":"{PROFILE}","label":"{label}","target":"ssh://127.0.0.1:1","session":"lab-1","enabled":true}}]}}"#
+        )
+    };
+    fs::write(catalog_dir.join("endpoints.json"), catalog("lab ssh")).unwrap();
+
+    const ONE_LOCAL_HOST: &str = r#"
+[fleet]
+include_local = false
+include_machines = true
+
+[[fleet.hosts]]
+name = "alpha"
+kind = "local"
+session = "alpha"
+"#;
+    write_config(&config_home, ONE_LOCAL_HOST);
+
+    let output = run_named_cli_with_env(
+        &config_home,
+        &runtime_dir,
+        &["fleet", "status", "--json", "--timeout-ms", "15000"],
+        &[("XDG_STATE_HOME", state_home.as_path())],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an unreachable machine is data, not a failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let hosts = report["hosts"].as_array().expect("hosts array");
+    assert_eq!(hosts.len(), 2, "saved machine is missing: {report}");
+    assert_eq!(hosts[0]["id"], "alpha");
+    assert_eq!(hosts[0]["kind"], "local");
+    // "lab ssh" is not a valid host name, so the label folds to a slug.
+    assert_eq!(hosts[1]["id"], "lab-ssh");
+    assert_eq!(hosts[1]["kind"], "ssh");
+    assert_eq!(hosts[1]["target"], "ssh://127.0.0.1:1");
+    assert_eq!(hosts[1]["session"], "lab-1");
+    assert_ne!(
+        hosts[1]["connection"]["state"], "connected",
+        "nothing listens on port 1: {report}"
+    );
+
+    // A machine whose derived id is already a `[[fleet.hosts]]` name is a
+    // configuration error, all-or-nothing like every other `[fleet]` problem.
+    fs::write(catalog_dir.join("endpoints.json"), catalog("alpha")).unwrap();
+    let output = run_named_cli_with_env(
+        &config_home,
+        &runtime_dir,
+        &["fleet", "status", "--json", "--timeout-ms", "15000"],
+        &[("XDG_STATE_HOME", state_home.as_path())],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a colliding machine id must exit 1: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("duplicate saved machine host name")
+            && stderr.contains(&format!("herdr machine rename {PROFILE} --label")),
+        "the diagnostic must name the machine and its fix: {stderr}"
+    );
+
+    // Opting out ignores the very same catalog.
+    write_config(
+        &config_home,
+        &ONE_LOCAL_HOST.replace("include_machines = true", "include_machines = false"),
+    );
+    let report = {
+        let output = run_named_cli_with_env(
+            &config_home,
+            &runtime_dir,
+            &["fleet", "status", "--json", "--timeout-ms", "15000"],
+            &[("XDG_STATE_HOME", state_home.as_path())],
+        );
+        assert_eq!(output.status.code(), Some(0));
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let hosts = report["hosts"].as_array().expect("hosts array");
+    assert_eq!(hosts.len(), 1, "the opt-in must really be opt-in: {report}");
+    assert_eq!(hosts[0]["id"], "alpha");
+
+    drop(alpha);
+    cleanup_test_base(&base);
+}

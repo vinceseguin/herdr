@@ -34,6 +34,8 @@ The fleet is configured in the normal `config.toml`
 # Hosts aggregated by `herdr fleet status` and the fork's gateway.
 # This machine's default session is always host "local" unless disabled.
 # include_local = true
+# Also aggregate every machine saved by `herdr machine add` as an ssh host.
+# include_machines = false
 #
 # [[fleet.hosts]]
 # name = "workbox"        # display name and id prefix (workbox/w1:p1)
@@ -48,6 +50,7 @@ The fleet is configured in the normal `config.toml`
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `fleet.include_local` | bool | `true` | Add this machine's **default** session as the host `local`, first in the list. |
+| `fleet.include_machines` | bool | `false` | Also add every machine saved by `herdr machine add` as an ssh host, after the `[[fleet.hosts]]` entries. See [Saved machines as hosts](#saved-machines-as-hosts). |
 | `fleet.hosts[].name` | string | — (required) | Host id and display name. Session-name rules: `[A-Za-z0-9._-]`, 1–64 bytes, never `/`, never `.`/`..`. It is the `host` half of every `host/w1:p1` id. |
 | `fleet.hosts[].kind` | `"ssh"` \| `"local"` | `"ssh"` | How the fleet reaches the host. |
 | `fleet.hosts[].target` | string | — | SSH destination: an alias from your `~/.ssh/config`, `user@host`, or `ssh://host:2222`. **Required** for `kind = "ssh"`, and rejected for `kind = "local"`. |
@@ -85,6 +88,84 @@ enabled = false
 configuration error — set `include_local = false` if you want to configure that
 host yourself, or rename yours.
 
+### Saved machines as hosts
+
+`herdr machine add <ssh-target> --label <label>` installs Herdr on a machine,
+starts its server and saves the profile in the client's endpoint catalog
+(`$XDG_STATE_HOME/herdr/client/endpoints.json`, `herdr-dev/` for a debug
+build). Those machines are exactly the fleet's precondition — a reachable herdr
+server — so `include_machines = true` adopts every one of them as an ssh host
+instead of making you copy each target into `[[fleet.hosts]]`:
+
+```toml
+[fleet]
+include_local = false
+include_machines = true
+
+[[fleet.hosts]]
+name = "scratch"
+kind = "local"
+session = "scratch"
+```
+
+```console
+$ herdr machine list
+0123…  Lab SSH  lab.example  lab-1  enabled
+
+$ herdr fleet status
+HOST     KIND   STATE
+scratch  local  connected
+lab-ssh  ssh    connected
+```
+
+The switch lives in `[fleet]`, not `[gateway]`, so `herdr fleet status` and the
+gateway always report the same fleet. It is **off by default**: an existing
+config keeps exactly the hosts it names.
+
+**Host id.** A saved machine has a free-form label; a fleet host id is the
+`host` half of every `host/w1:p1` reference. The derivation is frozen:
+
+1. the label verbatim when it is already a valid host name (`workbox` →
+   `workbox`, case included — `Workbox` stays `Workbox`);
+2. otherwise the label lowercased with every run of characters outside
+   `[A-Za-z0-9._-]` folded to a single `-`, leading and trailing runs dropped
+   (`My Laptop (home)` → `my-laptop-home`, `Lab SSH` → `lab-ssh`).
+
+The machine's ssh target, explicit session and enabled flag are carried
+through unchanged, so a disabled machine is a disabled host (`unavailable:
+host disabled`) exactly like `[[fleet.hosts]] enabled = false`. `kind` is
+always `ssh`; the report shape (`herdr.fleet.status.v1`) gains no field, so
+nothing downstream can tell a machine host from a configured one.
+
+**Diagnostics.** Machines are validated with the same all-or-nothing rule as
+`[[fleet.hosts]]`, because a label that quietly re-points a host id would send
+a terminal to the wrong machine:
+
+- the label derives no valid host name (`///`, or a fold longer than 64 bytes)
+- the derived id is the reserved `local`
+- the derived id is already a `[[fleet.hosts]]` name
+- two machines derive the same id (one diagnostic naming both)
+- the saved ssh target or session is malformed
+
+Each diagnostic names the machine's label and profile id and the command that
+fixes it — `herdr machine rename <profile-id> --label <name>` — and, like every
+`[fleet]` problem, means no host resolves at all:
+
+```console
+$ herdr fleet status
+duplicate saved machine host name: machine "Scratch" (0123456789abcdef0123456789abcdef) derives the fleet host id "scratch", which is already a [fleet] host name; rename it with: herdr machine rename 0123456789abcdef0123456789abcdef --label <name>; ignoring [fleet] hosts
+$ echo $?
+1
+```
+
+An unreadable catalog is one diagnostic (`saved machines unavailable: …`); a
+**missing** catalog is not an error at all — `include_machines = true` before
+the first `herdr machine add` simply adds nothing.
+
+> There is no `[[fleet.machines]]` id override. A machine you cannot rename is
+> the escape hatch's only use case, and it does not exist yet; rename the
+> machine or add it to `[[fleet.hosts]]` by hand instead.
+
 ### Validation
 
 `[fleet]` is validated without touching the network or the filesystem, and every
@@ -104,6 +185,8 @@ live `herdr server reload-config` produces. The rules:
   silently dropping it would attach you to a same-named local session instead of
   the machine you named
 - a `session` that is not a valid session name
+- with `include_machines = true`, any of the saved-machine problems listed
+  under [Saved machines as hosts](#saved-machines-as-hosts)
 
 Validation is all-or-nothing: **any** diagnostic, including one on a host with
 `enabled = false`, means no host specs are resolved. `herdr fleet status` then
@@ -599,6 +682,8 @@ worked around: the fix is on the host, which needs no fork code.
 | Module | Purity | What it owns |
 | --- | --- | --- |
 | `hosts.rs` | pure | `HostId` (`HostId::LOCAL` = `"local"`), `HostKind`, `HostSpec`, `resolve_hosts` — the only place `[fleet]` becomes specs. |
+| `machines.rs` | pure | `MachineProfile`, `machine_host_id`, `machine_host_specs` — the frozen label → host-id derivation and its diagnostics. |
+| `hosts_source.rs` | runtime | `hosts_for_config(&Config)` — `resolve_hosts` plus the saved machines when `include_machines` is on. The **only** module under `src/fleet/` that names `crate::client`. |
 | `refs.rs` | pure | `FleetPaneRef`, `FleetTabRef`, `FleetWorkspaceRef`; `Display`/`FromStr`/serde as `host/w1:p1`. |
 | `state.rs` | pure | `FleetState`, `HostState`, `HostConnection`, `HostEvent`, `MergedAgent`, `AgentRollup`, `FleetChange`, `Backoff`. |
 | `report.rs` | pure | `FleetStatusReport`, `HostReport`, `ConnectionReport`, `WorkspaceReport`, `AgentReport`, `render_text`. |
@@ -608,7 +693,11 @@ worked around: the fix is on the host, which needs no fork code.
 | `connector.rs` | runtime | `FleetConnector`, `FleetEvent`, `HostCommand`, `FleetConnectorOptions`, `INACTIVE_SURFACE`; one supervisor thread per host. |
 | `oneshot.rs` | runtime | `FleetSession`, `collect_status`, `watch` — driving all of it from a blocking caller. |
 
-The four pure modules import only `std`, `serde`, each other, `[fleet]`'s
+Every consumer resolves its host list through `hosts_source::hosts_for_config`,
+never `hosts::resolve_hosts` directly, so `herdr fleet status` and the gateway
+can never disagree about which machines are in the fleet.
+
+The five pure modules import only `std`, `serde`, each other, `[fleet]`'s
 config types, `crate::api::schema::AgentStatus` and `crate::protocol` data
 types. A unit test in `src/fleet/mod.rs` fails the build if any of them grows a
 `use` of `tokio`, `ratatui`, `interprocess`, `crate::ipc`, `crate::remote` or
@@ -699,3 +788,33 @@ Both labs live in [`docs/fork/README.md`](./README.md): the
 [fleet lab](./README.md#fleet-lab) gives you N local hosts, and the
 [SSH lab](./README.md#ssh-lab) makes one of them reachable as a real ssh host,
 with no root and no contact with your `~/.ssh`.
+
+To exercise `include_machines` against the SSH lab, write the catalog under the
+lab's own `XDG_STATE_HOME` so your real
+`~/.local/state/herdr*/client/endpoints.json` is never touched:
+
+```bash
+bash scripts/fork/fleet-lab.sh up 2 && eval "$(bash scripts/fork/fleet-lab.sh env)"
+bash scripts/fork/ssh-lab.sh up     && eval "$(bash scripts/fork/ssh-lab.sh env)"
+H="env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH -u HERDR_ENV target/debug/herdr"
+
+export XDG_STATE_HOME="$HERDR_FLEET_LAB_ROOT/state"
+mkdir -p "$XDG_STATE_HOME/herdr-dev/client"
+ID=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+printf '{"version":1,"selected_profile":null,"ssh":[{"id":"%s","label":"Lab SSH","target":"herdr-ssh-lab","session":"lab-1","enabled":true}]}\n' "$ID" \
+  > "$XDG_STATE_HOME/herdr-dev/client/endpoints.json"
+chmod 600 "$XDG_STATE_HOME/herdr-dev/client/endpoints.json"
+
+cat >> "$XDG_CONFIG_HOME/herdr-dev/config.toml" <<'EOF'
+[fleet]
+include_local = false
+include_machines = true
+[[fleet.hosts]]
+name = "lab-2"
+kind = "local"
+session = "lab-2"
+EOF
+
+HOME=$HERDR_SSH_LAB_HOME $H fleet status     # lab-2 (local) + lab-ssh (ssh, from "Lab SSH")
+bash scripts/fork/ssh-lab.sh down; bash scripts/fork/fleet-lab.sh down
+```

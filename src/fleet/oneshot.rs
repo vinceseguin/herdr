@@ -15,7 +15,8 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::config::Config;
 use crate::fleet::connector::{FleetConnector, FleetConnectorOptions, FleetEvent};
-use crate::fleet::hosts::{resolve_hosts, HostSpec};
+use crate::fleet::hosts::HostSpec;
+use crate::fleet::hosts_source::hosts_for_config;
 use crate::fleet::report::FleetStatusReport;
 use crate::fleet::state::{FleetChange, FleetState, HostConnection, HostState};
 
@@ -29,12 +30,13 @@ pub struct FleetSession {
 }
 
 impl FleetSession {
-    /// Resolve `[fleet]` and open every enabled host.
+    /// Resolve `[fleet]` (and the saved machines, when opted in) and open
+    /// every enabled host.
     ///
     /// `Err` carries the config diagnostics: an invalid `[fleet]` section is a
     /// user error the caller reports and exits on, not a host failure.
     pub fn start(config: &Config) -> Result<Self, Vec<String>> {
-        let specs = resolve_hosts(&config.fleet)?;
+        let specs = hosts_for_config(config)?;
         Ok(Self::with_specs(
             specs,
             FleetConnectorOptions::for_config(config),

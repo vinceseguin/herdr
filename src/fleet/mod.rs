@@ -6,11 +6,13 @@
 //! changes the wire protocol or the endpoint contract.
 //!
 //! Layering: [`hosts`] turns `[fleet]` configuration into typed host specs,
+//! [`machines`] does the same for the machines saved by `herdr machine add`,
 //! [`refs`] gives every server-side id a host-qualified form, [`state`] merges
 //! the hosts' snapshots into one ordered view and [`report`] serializes that
-//! view. Those four are pure (no sockets, no async, no ratatui). On top of
-//! them, [`transport`] opens one host, [`handshake`] speaks endpoint
-//! generation 1, [`endpoint_lane`] correlates one host's requests,
+//! view. Those five are pure (no sockets, no async, no ratatui). On top of
+//! them, [`hosts_source`] reads the saved-machine catalog so every consumer
+//! resolves the same fleet, [`transport`] opens one host, [`handshake`] speaks
+//! endpoint generation 1, [`endpoint_lane`] correlates one host's requests,
 //! [`connector`] runs a supervisor thread per host and merges their events,
 //! and [`oneshot`] drives all of it from a plain blocking caller.
 
@@ -24,6 +26,8 @@ pub mod connector;
 pub mod endpoint_lane;
 pub mod handshake;
 pub mod hosts;
+pub mod hosts_source;
+pub mod machines;
 pub mod oneshot;
 pub mod refs;
 pub mod report;
@@ -35,8 +39,9 @@ mod tests {
     /// Modules that must stay pure data, and the paths that would end that.
     /// Precedent: `scripts/test_ui_hot_path_architecture.py` guards the render
     /// hot path the same way.
-    const PURE_MODULES: [(&str, &str); 4] = [
+    const PURE_MODULES: [(&str, &str); 5] = [
         ("hosts.rs", include_str!("hosts.rs")),
+        ("machines.rs", include_str!("machines.rs")),
         ("refs.rs", include_str!("refs.rs")),
         ("report.rs", include_str!("report.rs")),
         ("state.rs", include_str!("state.rs")),

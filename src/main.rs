@@ -407,6 +407,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Hosts aggregated by `herdr fleet status` and the fork's gateway.
 # This machine's default session is always host "local" unless disabled.
 # include_local = true
+# Also aggregate every machine saved by `herdr machine add` as an ssh host.
+# include_machines = false
 #
 # [[fleet.hosts]]
 # name = "workbox"        # display name and id prefix (workbox/w1:p1)
