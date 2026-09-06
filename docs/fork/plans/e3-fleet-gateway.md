@@ -671,7 +671,7 @@ exactly these E1 contracts (verified in the code):
 | 4 | feat(gateway): herdr gateway serves health, fleet report and embedded assets over http | B · HTTP | 2, 3 | ✅ |
 | 5 | feat(gateway): websocket fleet event stream | C · Streams | 4 | ✅ |
 | 6 | feat(gateway): websocket terminal observe stream over per-host transports | C · Streams | 4 | ✅ |
-| 7 | feat(gateway): terminal control mode gated by the control scope | C · Streams | 6 | ⬜ |
+| 7 | feat(gateway): terminal control mode gated by the control scope | C · Streams | 6 | ✅ |
 | 8 | feat(gateway): pairing urls with qr codes, device cookies, status and token rotation | D · Ops | 4 | ⬜ |
 | 9 | feat(fleet): opt-in hosts from saved machine profiles | D · Ops | 3 | ✅ |
 | 10 | docs: gateway guide, systemd unit, adr e3 review, roadmap drift | E · Docs | 5, 7, 8, 9 | ⬜ |
@@ -2581,6 +2581,97 @@ Evidence: the pane greps (lab-1 ≥ 1, lab-2 0), the `forbidden`/`busy`/
   `require(principal, Control)` plus `HostConnection::Connected.methods`.
 - `busy`/`takeover`/`taken_over` semantics are the server's; E4 shows
   "take over" on `busy` and a banner on `taken_over`.
+- PR 10's `docs/fork/gateway.md` must document control mode, the `busy` /
+  `taken_over` / `released` vocabulary and the takeover flow; PR 8 has to decide
+  what `rotate-token` does to a *live* control session (today: nothing, the
+  scope is fixed at the handshake).
+
+**Landed** (merged; gate `EXIT=0` for both `ci` and `ci-no-default`)
+
+- **The control vocabulary, frozen.** `terminal.open {mode:"control", cols,
+  rows, takeover?}` needs a `control` credential; the gateway sends
+  `ControlTerminal { target, takeover }` where an observer sends
+  `ObserveTerminal { target }`. In control mode `terminal.input {text|bytes}`,
+  `terminal.resize`, `terminal.scroll` and `terminal.release` are all admitted;
+  an observer's input is still `forbidden` and its scroll still `unsupported`.
+  One new error code, **`busy`** — the *pane's* single attach slot is held by
+  another client — which is **not** `host_busy` (the gateway's own per-ssh-host
+  transport slot). `terminal.closed` gained two stable reasons:
+  **`taken_over`** for the evicted controller and **`released`** for the
+  client's own `terminal.release`, in both modes.
+- **The scope gate is the session's, not the route's.**
+  `SessionPolicy::new(mode, scope)` returns `Option<Self>` and refuses the
+  `(Control, Read)` row, so a read credential cannot hold a control session at
+  all — `admit` (still re-run on every message, still default-deny) is the
+  second line of defence, not the only one. The route still requires only
+  `Read`, as PR 6 left it.
+- **`terminal.ready` is deferred until the host confirms the attach.** A herdr
+  server answers an accepted observe/attach with a full redraw and a refused one
+  with a `ServerShutdown`, so `await_attach` waits for the first event
+  (`ATTACH_TIMEOUT = 10 s`, after which the session proceeds anyway) and the
+  client hears either `terminal.ready` + that frame, or only the error. Without
+  it a second controller got `terminal.ready` and *then* `busy`, and E4 would
+  have had to un-draw a terminal. The order a client sees on the success path is
+  unchanged, so PR 6's contract holds; `await_attach` also selects on the
+  transports' stop latch, because a 10 s wait would otherwise outlive
+  `HostTransports::shutdown`'s `RELEASE_WAIT = 3 s`.
+- **A `terminal.release` right after `terminal.input` used to lose the
+  keystroke.** `TerminalSession::drop` half-closes the write side — that is what
+  makes a host drop an abandoned session — but it ran while the writer thread
+  still had queued commands, so the `Input` write failed on an already-shut
+  socket. Caught against a real lab, not by a unit test.
+  `TerminalSession::drain()` (bounded by `WRITER_DRAIN_TIMEOUT = 2 s`, kept
+  under `RELEASE_WAIT`) now drops the command sender and waits for the writer on
+  **every** exit path before the socket is torn down.
+- **`classify_shutdown_reason` is anchored, not `contains`.** A pane id may
+  contain spaces, and the server echoes the client's own target back in
+  `"terminal session <mode> failed: terminal target <target> not found"` — so a
+  pane named `terminal attach taken over` turned its own *pane not found* into
+  `terminal.closed {reason:"taken_over"}`, and one named after the busy wording
+  into a `busy` a client would retry forever. Every interpolating wording puts
+  the target in the middle and ends in fixed text, so they are matched by prefix
+  **and** suffix; the takeover reason (which interpolates nothing) is matched
+  whole. Verified live: `/api/terminal/lab-1/terminal%20attach%20taken%20over`
+  answers `pane_not_found`.
+- **A controller's `terminal.resize` never carries the browser's pixel cell
+  geometry.** PR 7 is what makes a resize a *real* PTY resize, and the CLI's
+  JSON vocabulary passes `cell_width_px`/`cell_height_px` through — so a control
+  client could have set the pixel cell size the pane reports to every other
+  client of that host. The forwarded `Resize` is rebuilt with zeros, matching
+  the terminal hello. `protocol::check_geometry`'s 1024 ceiling applies to a
+  controller's resize exactly as to `terminal.open`.
+- **`busy` closes 1013, not 1000** (the plan said 1000). It is the same
+  retryable condition as `host_busy`, one layer down, and E4 switches on the
+  JSON `code`; giving the two different close codes would have been the drift.
+- **Deferred, with reasons.** (a) A scope refusal is **not** counted by the
+  auth failure limiter as the plan asked: the credential authenticated
+  correctly, `src/gateway/middleware.rs`'s limiter is keyed to *failed
+  authentication* by peer IP, and counting an authorization refusal there would
+  let a legitimate read client lock itself out. (b) The client socket is not
+  read during `await_attach` (≤ 10 s), so a browser that vanishes mid-attach
+  holds the pane's attach slot until the host answers or the timeout fires;
+  buffering pre-`ready` client messages would risk the very lost-keystroke
+  failure `drain()` exists for. (c) Scope is fixed at the handshake, so
+  rotating a token does not end a live control session — PR 8's call.
+- **Real-server evidence** (fleet lab `lab-1`/`lab-2` under
+  `HERDR_FLEET_LAB_ROOT=/tmp/herdr-fleet-lab-e3-pr7`, gateway on
+  `127.0.0.1:7797`): a control session on `lab-1/w1:p1` answered
+  `terminal.ready` with `mode:"control"` and `ref:"lab-1/w1:p1"`, delivered a
+  2233-byte full frame, landed `echo E3-PR7-FINAL-lab-1` in that pane
+  (`grep -c` = 1) and **nothing** in `lab-2`'s (`grep -c` = 0), then
+  `terminal.closed {reason:"released"}` + close 1000; a `read` bearer asking for
+  control got `{"code":"forbidden","message":"terminal mode control needs the
+  control scope"}` + close 1008 with `grep -c` = 0 on the pane; a second
+  controller without `takeover` got `{"code":"busy"}` + close 1013 while the
+  first was unaffected, and with `takeover:true` the new client got
+  `terminal.ready` + a frame while the first got
+  `{"type":"terminal.closed","reason":"taken_over"}` + close 1000; a controller
+  that opened a shell pane at 60×20 read back `stty size` = `20 60`, an observer
+  at 100×40 left it at `20 60`, and a mid-stream `terminal.resize {100,30}`
+  moved the real pty to `30 100`; `terminal.resize {cols:65535}` was
+  `bad_request` and the socket survived; `SIGTERM` exited 0 with zero
+  non-`gateway` stderr lines, and the log carries `mode`, `takeover` and
+  `credential="bearer"` but never input bytes.
 
 ### PR 8 — feat(gateway): pairing urls with qr codes, device cookies, status and token rotation · deps: 4
 
