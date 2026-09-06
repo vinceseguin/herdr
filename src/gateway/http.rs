@@ -19,7 +19,7 @@ use axum::Router;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::gateway::auth::TokenScope;
+use crate::gateway::auth::{Credential, TokenScope};
 use crate::gateway::middleware::{require, Authed};
 use crate::gateway::server::AppState;
 
@@ -56,17 +56,47 @@ async fn gateway_info(State(state): State<AppState>, Authed(principal): Authed) 
         return error.into_response();
     }
     let info = &state.info;
-    json_response(
-        StatusCode::OK,
-        &json!({
-            "schema": GATEWAY_INFO_SCHEMA,
-            "client_version": info.client_version,
-            "scope": principal.scope.as_str(),
-            "loopback": info.loopback,
-            "public_url": info.public_url,
-            "features": info.features,
-        }),
-    )
+    let mut body = json!({
+        "schema": GATEWAY_INFO_SCHEMA,
+        "client_version": info.client_version,
+        "scope": principal.scope.as_str(),
+        "via": credential_name(&principal.via),
+        "loopback": info.loopback,
+        "public_url": info.public_url,
+        "features": info.features,
+    });
+    // A paired browser is told which device it is, so a settings screen can
+    // name the entry the operator would revoke. A bearer client gets no
+    // `device` field at all rather than a null one.
+    if let Credential::Device { id } = &principal.via {
+        if let Some(device) = device_summary(&state, id) {
+            body["device"] = device;
+        }
+    }
+    json_response(StatusCode::OK, &body)
+}
+
+/// How a principal proved itself, in the neutral vocabulary the API uses.
+fn credential_name(credential: &Credential) -> &'static str {
+    match credential {
+        Credential::Bearer => "bearer",
+        Credential::Device { .. } => "device",
+    }
+}
+
+/// `{"id", "label"}` for the calling device, or `None` when it has been
+/// revoked between the credential check and this lookup.
+fn device_summary(state: &AppState, id: &str) -> Option<serde_json::Value> {
+    let devices = state
+        .auth
+        .devices
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    devices
+        .devices()
+        .iter()
+        .find(|record| record.id == id)
+        .map(|record| json!({ "id": record.id, "label": record.label }))
 }
 
 /// The fleet, in exactly the shape `herdr fleet status --json` prints.
@@ -175,17 +205,13 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, "not_found")
     }
 
-    // PR 6 (`terminal.error` bodies naming a host) and PR 8 (pairing failures)
-    // are the first callers outside these tests.
-    #[allow(dead_code)]
     pub(crate) fn with_message(mut self, message: impl Into<String>) -> Self {
         self.message = Some(message.into());
         self
     }
 
-    // Accessors for tests and for PR 6/7, which decide what to write on a
-    // WebSocket from the error a shared helper produced.
-    #[allow(dead_code)]
+    /// The stable machine-readable half of the error, for the routes that log
+    /// what they refused and for the tests.
     pub(crate) fn code(&self) -> &'static str {
         self.code
     }

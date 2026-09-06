@@ -27,6 +27,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::{Choice, ConstantTimeEq};
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 use super::paths::{self, CONTROL_TOKEN_FILE, DEVICES_FILE, READ_TOKEN_FILE};
 
 /// Bytes of randomness behind every token, device secret and pairing secret.
@@ -73,10 +76,10 @@ impl TokenScope {
     }
 
     /// Both scopes, control first so a presented secret is checked against the
-    /// stronger one before the weaker one.
-    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
-    // caller; until then only this module's tests reach it.
-    #[allow(dead_code)]
+    /// stronger one before the weaker one. The commands that report per-scope
+    /// counts name the two scopes explicitly, so this is the tests' way to
+    /// cover both without repeating them.
+    #[cfg(test)]
     pub fn all() -> [TokenScope; 2] {
         [TokenScope::Control, TokenScope::Read]
     }
@@ -111,9 +114,6 @@ impl TokenDigest {
     }
 
     /// Lowercase hex, for the records that persist a digest.
-    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
-    // caller; until then only this module's tests reach it.
-    #[allow(dead_code)]
     pub fn to_hex(self) -> String {
         let mut out = String::with_capacity(64);
         for byte in self.0 {
@@ -213,15 +213,55 @@ impl Principal {
     }
 }
 
+/// What a private file looks like from the outside, so a holder can tell that
+/// it was replaced without reading it again.
+///
+/// [`paths::write_private_file`] renames a freshly created file over its
+/// target, so on unix the inode alone is already decisive; the length and the
+/// modification time cover the platforms that have no inode. Comparing a stamp
+/// is two `stat`s, which is what makes a per-request freshness check cheap
+/// enough to be unconditional.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+/// The stamp of `path`, or `None` when there is no regular file there.
+fn stamp_of(path: &Path) -> Option<FileStamp> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    Some(FileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    })
+}
+
 /// The two bearer tokens, as digests.
 ///
 /// The secrets themselves are read once at load time to digest them and are
 /// not kept; only `herdr gateway pair` ever needs the plain value again, and
 /// it reads the file.
+///
+/// A store remembers where it was loaded from and what the two files looked
+/// like, so [`TokenStore::refresh`] can pick up a `herdr gateway rotate-token`
+/// that happened in another process. Rotation is a revocation, and a
+/// revocation that only takes effect after a restart is not one.
 #[derive(Debug, Clone)]
 pub struct TokenStore {
+    dir: PathBuf,
     read: TokenDigest,
     control: TokenDigest,
+    /// Stamps of the `read` and `control` files, in that order, taken
+    /// **before** the digests were read: a file replaced during the read is
+    /// then reloaded on the next refresh rather than missed forever.
+    stamps: [Option<FileStamp>; 2],
 }
 
 impl TokenStore {
@@ -242,22 +282,59 @@ impl TokenStore {
     }
 
     /// Load both token files without creating anything.
-    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
-    // caller; until then only this module's tests reach it.
-    #[allow(dead_code)]
     pub fn load(dir: &Path) -> io::Result<Self> {
         paths::verify_private_dir(dir)?;
         Self::from_digests(
             dir,
-            read_token(&dir.join(READ_TOKEN_FILE))?,
-            read_token(&dir.join(CONTROL_TOKEN_FILE))?,
+            read_token_stamped(&dir.join(READ_TOKEN_FILE))?,
+            read_token_stamped(&dir.join(CONTROL_TOKEN_FILE))?,
         )
+    }
+
+    /// Reload both files when either has been replaced since they were read.
+    ///
+    /// Called before every bearer comparison, so a token rotated by
+    /// `herdr gateway rotate-token` in another process stops working on the
+    /// next request rather than at the next restart. The common case is two
+    /// `stat` calls and no allocation.
+    ///
+    /// A store that cannot be reloaded keeps the digests it already has: a
+    /// token file that momentarily cannot be read must not lock every client
+    /// out, and the process that wrote it reports the same error to the
+    /// operator. The stamp is still recorded, so one broken file is logged
+    /// once rather than on every request, and any *further* change is retried.
+    pub fn refresh(&mut self) {
+        let stamps = [
+            stamp_of(&self.dir.join(READ_TOKEN_FILE)),
+            stamp_of(&self.dir.join(CONTROL_TOKEN_FILE)),
+        ];
+        if stamps == self.stamps {
+            return;
+        }
+        match Self::load(&self.dir) {
+            Ok(reloaded) => {
+                tracing::info!(target: "gateway", "reloaded the gateway token store after it changed on disk");
+                *self = reloaded;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "gateway",
+                    error = %error,
+                    "could not reload the gateway token store; the tokens already in memory stay in force"
+                );
+                self.stamps = stamps;
+            }
+        }
     }
 
     /// Two identical token files would make the read token a control token
     /// (`verify_bearer` checks control first); refuse them rather than let a
     /// copy-paste silently widen a scope.
-    fn from_digests(dir: &Path, read: TokenDigest, control: TokenDigest) -> io::Result<Self> {
+    fn from_digests(
+        dir: &Path,
+        (read, read_stamp): (TokenDigest, Option<FileStamp>),
+        (control, control_stamp): (TokenDigest, Option<FileStamp>),
+    ) -> io::Result<Self> {
         if read.ct_eq(&control) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -269,7 +346,12 @@ impl TokenStore {
                 ),
             ));
         }
-        Ok(Self { read, control })
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            read,
+            control,
+            stamps: [read_stamp, control_stamp],
+        })
     }
 
     /// The scope a presented bearer token proves, or `None`.
@@ -298,21 +380,16 @@ impl TokenStore {
     /// Replace one scope's token file with a fresh secret.
     ///
     /// The caller is responsible for revoking that scope's devices
-    /// ([`DeviceStore::revoke_scope`]) and for reloading the store.
-    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
-    // caller; until then only this module's tests reach it.
-    #[allow(dead_code)]
+    /// ([`DeviceStore::revoke_scope`]) and its outstanding pairing codes
+    /// ([`PairingStore::revoke_scope`]), and for reloading the store.
     pub fn rotate(dir: &Path, scope: TokenScope) -> io::Result<()> {
         paths::create_private_dir(dir)?;
         let secret = random_secret_hex()?;
         paths::write_private_file(&dir.join(scope.token_file_name()), secret.as_bytes())
     }
 
-    /// The digest of one scope's token, for tests and for PR 8's rotation
-    /// check that the file really changed.
-    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
-    // caller; until then only this module's tests reach it.
-    #[allow(dead_code)]
+    /// The digest of one scope's token, so `rotate-token` can check that the
+    /// file really changed.
     pub fn digest(&self, scope: TokenScope) -> TokenDigest {
         match scope {
             TokenScope::Read => self.read,
@@ -321,17 +398,27 @@ impl TokenStore {
     }
 }
 
-fn load_or_create_token(dir: &Path, scope: TokenScope) -> io::Result<TokenDigest> {
+fn load_or_create_token(
+    dir: &Path,
+    scope: TokenScope,
+) -> io::Result<(TokenDigest, Option<FileStamp>)> {
     let path = dir.join(scope.token_file_name());
-    match read_token(&path) {
-        Ok(digest) => Ok(digest),
+    match read_token_stamped(&path) {
+        Ok(loaded) => Ok(loaded),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             let secret = random_secret_hex()?;
             paths::write_private_file(&path, secret.as_bytes())?;
-            Ok(TokenDigest::of(secret.as_bytes()))
+            Ok((TokenDigest::of(secret.as_bytes()), stamp_of(&path)))
         }
         Err(err) => Err(err),
     }
+}
+
+/// [`read_token`] with the stamp taken **before** the read, so a file replaced
+/// while it is being read leaves a stale stamp and is reloaded next time.
+fn read_token_stamped(path: &Path) -> io::Result<(TokenDigest, Option<FileStamp>)> {
+    let stamp = stamp_of(path);
+    Ok((read_token(path)?, stamp))
 }
 
 fn read_token(path: &Path) -> io::Result<TokenDigest> {
@@ -380,10 +467,17 @@ struct DeviceFile {
 }
 
 /// `devices.json`: the devices that exchanged a pairing code for a cookie.
+///
+/// Like [`TokenStore`], a store remembers what the file looked like when it
+/// was read so [`DeviceStore::refresh`] can pick up a revocation performed by
+/// another process — `herdr gateway rotate-token` writes this file too, and a
+/// gateway that kept a stale copy would both keep honouring a revoked cookie
+/// and write the revoked records back the next time it recorded activity.
 #[derive(Debug)]
 pub struct DeviceStore {
     path: PathBuf,
     devices: Vec<DeviceRecord>,
+    stamp: Option<FileStamp>,
 }
 
 impl DeviceStore {
@@ -393,7 +487,12 @@ impl DeviceStore {
     /// every paired device would look like a bug to the user and would let a
     /// truncated write become a revocation.
     pub fn load(dir: &Path) -> io::Result<Self> {
-        let path = dir.join(DEVICES_FILE);
+        Self::load_file(dir.join(DEVICES_FILE))
+    }
+
+    fn load_file(path: PathBuf) -> io::Result<Self> {
+        // Before the read, for the same reason as the token stamps.
+        let stamp = stamp_of(&path);
         let devices = match paths::read_private_file(&path) {
             Ok(bytes) => {
                 let file: DeviceFile = serde_json::from_slice(&bytes).map_err(|err| {
@@ -407,12 +506,44 @@ impl DeviceStore {
             Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(err) => return Err(err),
         };
-        Ok(Self { path, devices })
+        Ok(Self {
+            path,
+            devices,
+            stamp,
+        })
     }
 
-    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
-    // caller; until then only this module's tests reach it.
-    #[allow(dead_code)]
+    /// Reload the file when it has been replaced since it was read, returning
+    /// whether the records in memory were replaced.
+    ///
+    /// Called before a cookie is verified and before activity is recorded, so
+    /// a `rotate-token` in another process revokes cookies here at once — and
+    /// so this process never persists records that a revocation removed. A
+    /// caller that was about to write its own copy back must not do so once
+    /// this returns `true`: the copy it holds is the one that was replaced.
+    pub fn refresh(&mut self) -> bool {
+        let stamp = stamp_of(&self.path);
+        if stamp == self.stamp {
+            return false;
+        }
+        match Self::load_file(self.path.clone()) {
+            Ok(reloaded) => {
+                tracing::info!(target: "gateway", "reloaded the paired devices after the file changed on disk");
+                *self = reloaded;
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "gateway",
+                    error = %error,
+                    "could not reload the paired devices; the records already in memory stay in force"
+                );
+                self.stamp = stamp;
+                false
+            }
+        }
+    }
+
     pub fn devices(&self) -> &[DeviceRecord] {
         &self.devices
     }
@@ -444,9 +575,6 @@ impl DeviceStore {
 
     /// Mint a device: returns the cookie value `<id>.<secret>`, which the
     /// caller hands to the browser once and cannot recover afterwards.
-    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
-    // caller; until then only this module's tests reach it.
-    #[allow(dead_code)]
     pub fn insert(&mut self, scope: TokenScope, label: &str, now_unix: u64) -> io::Result<String> {
         let id = random_secret_hex()?;
         let secret = random_secret_hex()?;
@@ -465,9 +593,6 @@ impl DeviceStore {
     /// Forget every device of `scope`, returning how many were removed. Called
     /// by `rotate-token`: rotating a token must not leave cookies behind that
     /// still carry the scope it granted.
-    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
-    // caller; until then only this module's tests reach it.
-    #[allow(dead_code)]
     pub fn revoke_scope(&mut self, scope: TokenScope) -> io::Result<usize> {
         let before = self.devices.len();
         self.devices.retain(|record| record.scope != scope);
@@ -479,8 +604,8 @@ impl DeviceStore {
     }
 
     /// Forget one device by id, returning whether it existed.
-    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
-    // caller; until then only this module's tests reach it.
+    // Reached by this module's tests today; the operator-facing revoke-device
+    // command that consumes it belongs to the fleet UI, not to E3.
     #[allow(dead_code)]
     pub fn revoke_id(&mut self, id: &str) -> io::Result<bool> {
         let before = self.devices.len();
@@ -504,12 +629,19 @@ impl DeviceStore {
         false
     }
 
-    pub fn persist(&self) -> io::Result<()> {
+    pub fn persist(&mut self) -> io::Result<()> {
         let file = DeviceFile {
             devices: self.devices.clone(),
         };
         let json = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
-        paths::write_private_file(&self.path, &json)
+        paths::write_private_file(&self.path, &json)?;
+        // Deliberately *not* stamped from the file that is there now: another
+        // process may have replaced it between our rename and that `stat`, and
+        // adopting its stamp would hide the change from every later refresh.
+        // Forgetting the stamp costs one re-read on the next refresh and can
+        // never miss a revocation.
+        self.stamp = None;
+        Ok(())
     }
 }
 
@@ -521,9 +653,6 @@ impl DeviceRecord {
 
 /// Keep a device label printable and bounded; it is user input that ends up in
 /// a JSON file and in `herdr gateway status`.
-// PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first caller;
-// until then only this module's tests reach it.
-#[allow(dead_code)]
 fn sanitize_label(label: &str) -> String {
     label
         .chars()
@@ -536,21 +665,20 @@ fn sanitize_label(label: &str) -> String {
 
 /// One outstanding pairing code, as stored in `pairings/<id>.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-// PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first caller;
-// until then only this module's tests reach it.
-#[allow(dead_code)]
 pub struct PairingCode {
     pub id: String,
     pub secret_sha256: String,
     pub scope: TokenScope,
     pub expires_unix: u64,
+    /// What the operator called the device they are about to pair. It travels
+    /// with the code because the device record is created when the code is
+    /// redeemed, on a machine the operator is not typing at.
+    #[serde(default)]
+    pub label: String,
 }
 
 /// Why a pairing code was not accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
-// PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first caller;
-// until then only this module's tests reach it.
-#[allow(dead_code)]
 pub enum PairingError {
     /// No such code — including a real id presented with the wrong secret, so
     /// guessing an id teaches nothing.
@@ -577,16 +705,10 @@ impl std::fmt::Display for PairingError {
 
 /// `pairings/`: one `0600` file per outstanding `herdr gateway pair` code.
 #[derive(Debug)]
-// PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first caller;
-// until then only this module's tests reach it.
-#[allow(dead_code)]
 pub struct PairingStore {
     dir: PathBuf,
 }
 
-// PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first caller;
-// until then only this module's tests reach it.
-#[allow(dead_code)]
 impl PairingStore {
     pub fn new(gateway_dir: &Path) -> Self {
         Self {
@@ -594,6 +716,9 @@ impl PairingStore {
         }
     }
 
+    /// Where the codes live. The commands reach the store through this type
+    /// rather than the directory, so this is the tests' window onto the layout.
+    #[cfg(test)]
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -603,9 +728,18 @@ impl PairingStore {
     pub fn create(
         &self,
         scope: TokenScope,
+        label: &str,
         ttl_secs: u64,
         now_unix: u64,
     ) -> io::Result<(String, PairingCode)> {
+        // The gateway directory first: `create_private_dir` creates missing
+        // *parents* with the process umask, so a `herdr gateway pair` run
+        // before the daemon ever started would otherwise leave
+        // `<config>/gateway/` world-readable until the next startup tightened
+        // it. The codes inside are `0600` either way; the file names are not.
+        if let Some(parent) = self.dir.parent() {
+            paths::create_private_dir(parent)?;
+        }
         paths::create_private_dir(&self.dir)?;
         let id = random_secret_hex()?;
         let secret = random_secret_hex()?;
@@ -614,6 +748,7 @@ impl PairingStore {
             secret_sha256: TokenDigest::of(secret.as_bytes()).to_hex(),
             scope,
             expires_unix: now_unix.saturating_add(ttl_secs),
+            label: sanitize_label(label),
         };
         let json = serde_json::to_vec(&code).map_err(io::Error::other)?;
         paths::write_private_file(&self.code_path(&id), &json)?;
@@ -669,23 +804,55 @@ impl PairingStore {
 
     /// Delete every expired code, returning how many were removed.
     pub fn sweep_expired(&self, now_unix: u64) -> io::Result<usize> {
+        // An unparseable leftover is swept too: it can never be redeemed.
+        self.remove_matching(|code| code.is_none_or(|code| now_unix >= code.expires_unix))
+    }
+
+    /// Delete every outstanding code of one scope, returning how many were
+    /// removed.
+    ///
+    /// `rotate-token` calls it: a pending pairing URL for the scope being
+    /// rotated would otherwise still mint a device with the scope the operator
+    /// just revoked, which is the one thing rotation exists to prevent.
+    pub fn revoke_scope(&self, scope: TokenScope) -> io::Result<usize> {
+        self.remove_matching(|code| code.is_some_and(|code| code.scope == scope))
+    }
+
+    /// How many codes are outstanding and still redeemable. Reads only; the
+    /// caller sweeps first when it wants the expired ones gone.
+    pub fn pending(&self, now_unix: u64) -> io::Result<usize> {
+        let mut pending = 0;
+        for (_, code) in self.entries()? {
+            if code.is_some_and(|code| now_unix < code.expires_unix) {
+                pending += 1;
+            }
+        }
+        Ok(pending)
+    }
+
+    /// Every file in the store with the code it holds, or `None` when it does
+    /// not parse as one. A directory that does not exist is an empty store.
+    fn entries(&self) -> io::Result<Vec<(PathBuf, Option<PairingCode>)>> {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(err),
         };
-        let mut removed = 0;
+        let mut codes = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             let Ok(bytes) = paths::read_private_file(&path) else {
                 continue;
             };
-            let expired = match serde_json::from_slice::<PairingCode>(&bytes) {
-                Ok(code) => now_unix >= code.expires_unix,
-                // Unparseable leftovers are swept too.
-                Err(_) => true,
-            };
-            if expired && std::fs::remove_file(&path).is_ok() {
+            codes.push((path, serde_json::from_slice::<PairingCode>(&bytes).ok()));
+        }
+        Ok(codes)
+    }
+
+    fn remove_matching(&self, matches: impl Fn(Option<&PairingCode>) -> bool) -> io::Result<usize> {
+        let mut removed = 0;
+        for (path, code) in self.entries()? {
+            if matches(code.as_ref()) && std::fs::remove_file(&path).is_ok() {
                 removed += 1;
             }
         }
@@ -697,7 +864,6 @@ impl PairingStore {
     }
 }
 
-#[allow(dead_code)] // PR 8; see `PairingStore`.
 impl PairingCode {
     fn digest(&self) -> Option<TokenDigest> {
         TokenDigest::from_hex(&self.secret_sha256)
@@ -709,9 +875,6 @@ impl PairingCode {
 ///
 /// The id becomes a file name, so this is also the path-traversal guard: `.`,
 /// `..`, `/` and `\` cannot survive the hex check.
-// PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first caller;
-// until then only this module's tests reach it.
-#[allow(dead_code)]
 fn split_code(code_text: &str) -> Option<(&str, &str)> {
     let (id, secret) = code_text.split_once('.')?;
     if !is_secret_hex(id) || !is_secret_hex(secret) {
@@ -720,9 +883,6 @@ fn split_code(code_text: &str) -> Option<(&str, &str)> {
     Some((id, secret))
 }
 
-// PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first caller;
-// until then only this module's tests reach it.
-#[allow(dead_code)]
 fn is_secret_hex(value: &str) -> bool {
     value.len() == SECRET_HEX_LEN && value.bytes().all(|byte| hex_value(byte).is_some())
 }
@@ -793,9 +953,10 @@ impl AuthLimiter {
         }
     }
 
-    /// Peers currently tracked. Exposed for tests and for PR 4's metrics.
-    // Read by this module's tests and by PR 8's `herdr gateway status`.
-    #[allow(dead_code)]
+    /// Peers currently tracked. Exposed for this module's tests; a running
+    /// gateway never reports it (`herdr gateway status` reads files, not the
+    /// daemon's memory).
+    #[cfg(test)]
     pub fn tracked_peers(&self) -> usize {
         self.peers.len()
     }
@@ -1061,6 +1222,59 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// `rotate-token` revokes from another process while the gateway still
+    /// holds the old records in memory. A refresh must see that, and a store
+    /// that has been refreshed must never write the revoked records back.
+    #[test]
+    fn a_revocation_by_another_process_survives_this_one_persisting() {
+        let dir = temp_dir("devices-refresh");
+        paths::create_private_dir(&dir).expect("dir");
+        let mut running = DeviceStore::load(&dir).expect("empty store");
+        let cookie = running
+            .insert(TokenScope::Read, "phone", 100)
+            .expect("insert");
+        assert!(running.verify_cookie(&cookie).is_some());
+        // Settle the stamp: a store re-reads once after its own write, and
+        // then stops until something else touches the file.
+        assert!(running.refresh(), "a store re-reads the file it just wrote");
+        assert!(!running.refresh(), "an unchanged file is not reloaded");
+
+        // The other process: load, revoke, write.
+        let mut rotating = DeviceStore::load(&dir).expect("load");
+        assert_eq!(rotating.revoke_scope(TokenScope::Read).expect("revoke"), 1);
+
+        // The running gateway notices, and reports that its copy was replaced
+        // so a caller holding a pending write knows to drop it.
+        assert!(
+            running.refresh(),
+            "the file changed, so it must be reloaded"
+        );
+        assert!(running.devices().is_empty());
+        assert!(running.verify_cookie(&cookie).is_none());
+
+        // Persisting now cannot resurrect the revoked device.
+        running.persist().expect("persist");
+        let reloaded = DeviceStore::load(&dir).expect("reload");
+        assert!(reloaded.devices().is_empty());
+        assert!(reloaded.verify_cookie(&cookie).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `herdr gateway pair` can run before the daemon ever has, so it is the
+    /// first thing that may create `<config>/gateway/`. It must not create it
+    /// with the process umask.
+    #[test]
+    fn creating_a_code_leaves_the_whole_gateway_directory_private() {
+        let dir = temp_dir("pairing-parent");
+        let store = PairingStore::new(&dir);
+        store
+            .create(TokenScope::Read, "", 600, 1_000)
+            .expect("create");
+        paths::verify_private_dir(&dir).expect("the gateway directory is private");
+        paths::verify_private_dir(store.dir()).expect("the pairings directory is private");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_pairing_id_can_only_ever_be_sixty_four_hex_characters() {
         let secret = "a".repeat(SECRET_HEX_LEN);
@@ -1109,7 +1323,7 @@ mod tests {
         let dir = temp_dir("pairing");
         let store = PairingStore::new(&dir);
         let (code, record) = store
-            .create(TokenScope::Control, 600, 1_000)
+            .create(TokenScope::Control, "", 600, 1_000)
             .expect("create");
         assert_eq!(record.scope, TokenScope::Control);
         assert_eq!(record.expires_unix, 1_600);
@@ -1139,7 +1353,9 @@ mod tests {
         );
 
         // A wrong secret looks exactly like a missing code and keeps the file.
-        let (code, record) = store.create(TokenScope::Read, 600, 1_000).expect("create");
+        let (code, record) = store
+            .create(TokenScope::Read, "", 600, 1_000)
+            .expect("create");
         let (id, _) = code.split_once('.').expect("split");
         assert_eq!(
             store.consume(&format!("{id}.{}", "0".repeat(64)), 1_100),
@@ -1162,12 +1378,16 @@ mod tests {
         assert!(!store.dir().join(format!("{}.json", record.id)).exists());
 
         // A file that no longer parses is removed and reads as not found.
-        let (code, record) = store.create(TokenScope::Read, 600, 1_000).expect("create");
+        let (code, record) = store
+            .create(TokenScope::Read, "", 600, 1_000)
+            .expect("create");
         let path = store.dir().join(format!("{}.json", record.id));
         paths::write_private_file(&path, b"{ not json").expect("corrupt");
         assert_eq!(store.consume(&code, 1_100), Err(PairingError::NotFound));
         assert!(!path.exists(), "a corrupt code is swept on contact");
-        let (code, record) = store.create(TokenScope::Read, 600, 1_000).expect("create");
+        let (code, record) = store
+            .create(TokenScope::Read, "", 600, 1_000)
+            .expect("create");
         let path = store.dir().join(format!("{}.json", record.id));
         let mut tampered = record.clone();
         tampered.secret_sha256 = "zz".to_string();
@@ -1177,8 +1397,12 @@ mod tests {
         assert!(!path.exists());
 
         // Sweeping removes stale codes.
-        let (_, stale) = store.create(TokenScope::Read, 30, 1_000).expect("create");
-        let (_, fresh) = store.create(TokenScope::Read, 600, 1_000).expect("create");
+        let (_, stale) = store
+            .create(TokenScope::Read, "", 30, 1_000)
+            .expect("create");
+        let (_, fresh) = store
+            .create(TokenScope::Read, "", 600, 1_000)
+            .expect("create");
         assert_eq!(store.sweep_expired(1_100).expect("sweep"), 1);
         assert!(!store.dir().join(format!("{}.json", stale.id)).exists());
         assert!(store.dir().join(format!("{}.json", fresh.id)).exists());

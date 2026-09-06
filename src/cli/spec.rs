@@ -158,6 +158,32 @@ fn gateway_command() -> Command {
         .about("Serve the fleet over HTTP and WebSocket")
         .arg(option("bind", "ADDR").help("Listen on ADDR instead of the configured address"))
         .arg(option("config", "PATH").help("Read configuration from PATH"))
+        .subcommand(
+            Command::new("pair")
+                .about("Print a one-time pairing URL and QR code for a device")
+                .arg(flag("control").help("Pair the device with the control scope"))
+                .arg(option("ttl-secs", "SECS").help("Seconds the link stays valid (30..=86400)"))
+                .arg(option("label", "TEXT").help("Name the paired device in `gateway status`"))
+                .arg(flag("no-qr").help("Print only the URL, without a QR code"))
+                .arg(flag("invert").help("Invert the QR code for a dark terminal background"))
+                .arg(json_flag().help("Print the URL, scope and expiry as JSON")),
+        )
+        .subcommand(
+            Command::new("status")
+                .about("Report the running gateway, its devices and pairings")
+                .arg(json_flag().help("Print the report as JSON")),
+        )
+        .subcommand(
+            Command::new("rotate-token")
+                .about("Replace a scope's token and revoke what it granted")
+                .arg(
+                    Arg::new("scope")
+                        .value_name("SCOPE")
+                        .required(true)
+                        .value_parser(["read", "control"])
+                        .help("Which token to replace"),
+                ),
+        )
 }
 
 fn config_command() -> Command {
@@ -1142,6 +1168,25 @@ mod tests {
         assert!(super::write_requested_help(&args, &mut output, || {}).unwrap());
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Usage: herdr gateway"), "{output}");
+
+        // The operator subcommands are advertised, so completion offers them
+        // and `herdr gateway pair --help` renders clap's help rather than
+        // reaching the command itself.
+        for name in ["pair", "status", "rotate-token"] {
+            let subcommand = command_path(&cmd, &["gateway", name]);
+            assert!(
+                subcommand.get_about().is_some(),
+                "{name} has no description"
+            );
+        }
+        for option in ["control", "ttl-secs", "label", "no-qr", "invert", "json"] {
+            assert!(
+                command_path(&cmd, &["gateway", "pair"])
+                    .get_arguments()
+                    .any(|arg| arg.get_id() == option),
+                "missing --{option} on `gateway pair`"
+            );
+        }
     }
 
     #[cfg(not(feature = "gateway"))]

@@ -136,18 +136,17 @@ impl OriginAllowlist {
         self.origins.is_empty()
     }
 
-    /// The allowed origins, for `GET /api/gateway` and `herdr gateway status`.
-    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
-    // caller; until then only this module's tests reach it.
-    #[allow(dead_code)]
+    /// The allowed origins. Nothing the gateway serves reports them — a
+    /// browser learns it is refused from the `origin_not_allowed` answer, and
+    /// `herdr gateway status` reads files rather than the daemon's memory — so
+    /// this is the tests' window into what `for_bind` decided.
+    #[cfg(test)]
     pub fn origins(&self) -> &[GatewayOrigin] {
         &self.origins
     }
 
     /// Whether device cookies minted for this gateway must be `Secure`: true
     /// when the advertised public origin is https.
-    // PR 8 mints the device cookie this decides the `Secure` flag of.
-    #[allow(dead_code)]
     pub fn requires_secure_cookies(config: &GatewayConfig) -> bool {
         parse_gateway_origin(&config.public_url).is_ok_and(|origin| origin.scheme == "https")
     }

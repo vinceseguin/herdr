@@ -316,7 +316,12 @@ fn verify(auth: &AuthState, request: &Request, origin_present: bool) -> Verifica
         let Some(presented) = bearer_token(&value) else {
             return Verification::Rejected;
         };
-        return match auth.tokens.verify_bearer(presented) {
+        let mut tokens = auth.tokens.lock().unwrap_or_else(|err| err.into_inner());
+        // A `rotate-token` in another process must be in force by the next
+        // request, not by the next restart: two `stat`s, and a read only when
+        // a file was actually replaced.
+        tokens.refresh();
+        return match tokens.verify_bearer(presented) {
             Some(scope) => Verification::Verified(Principal::bearer(scope)),
             None => Verification::Rejected,
         };
@@ -330,7 +335,10 @@ fn verify(auth: &AuthState, request: &Request, origin_present: bool) -> Verifica
     if !origin_present && is_cross_site(request) {
         return Verification::CrossSiteCookie;
     }
-    let devices = auth.devices.lock().unwrap_or_else(|err| err.into_inner());
+    let mut devices = auth.devices.lock().unwrap_or_else(|err| err.into_inner());
+    // Same reason as the tokens above: `rotate-token` revokes this scope's
+    // devices from another process.
+    devices.refresh();
     match devices.verify_cookie(&value) {
         Some((scope, id)) => Verification::Verified(Principal::device(scope, id)),
         None => Verification::Rejected,
@@ -439,6 +447,10 @@ fn touch_device(state: &AppState, id: &str) {
     let now_unix = unix_now();
     let should_persist = {
         let mut devices = auth.devices.lock().unwrap_or_else(|err| err.into_inner());
+        // Never write back a set of records another process has already
+        // rewritten: refresh first, so a device revoked between the cookie
+        // check and this write stays revoked.
+        devices.refresh();
         if !devices.touch(id, now_unix) {
             return;
         }
@@ -457,7 +469,13 @@ fn touch_device(state: &AppState, id: &str) {
         return;
     }
     tokio::task::spawn_blocking(move || {
-        let devices = auth.devices.lock().unwrap_or_else(|err| err.into_inner());
+        let mut devices = auth.devices.lock().unwrap_or_else(|err| err.into_inner());
+        // The file can have been rewritten — a `rotate-token` revocation —
+        // while this task waited for the blocking pool. Writing the copy this
+        // process holds would put the records that revocation removed back.
+        if devices.refresh() {
+            return;
+        }
         if let Err(error) = devices.persist() {
             tracing::warn!(target: "gateway", error = %error, "could not record device activity");
         }

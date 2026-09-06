@@ -24,7 +24,7 @@ use crate::gateway::auth::{AuthLimiter, DeviceStore, TokenStore};
 use crate::gateway::fleet::FleetHandle;
 use crate::gateway::policy::OriginAllowlist;
 use crate::gateway::transports::HostTransports;
-use crate::gateway::{assets, events, http, middleware, terminal};
+use crate::gateway::{assets, events, http, middleware, pairing, terminal};
 
 /// Largest request body the gateway accepts.
 ///
@@ -65,31 +65,46 @@ pub(crate) struct AppState {
 /// is a few statements of pure data work, none is held across an `.await`, and
 /// the one write to disk runs on the blocking pool.
 pub(crate) struct AuthState {
-    /// Bearer token digests. Immutable for the life of the process: PR 8's
-    /// `rotate-token` rewrites the files and the operator restarts, which is
-    /// also what makes rotation an unambiguous revocation.
-    pub(crate) tokens: TokenStore,
+    /// Bearer token digests.
+    ///
+    /// Behind a mutex, and re-read when the files change, because
+    /// `herdr gateway rotate-token` runs in a **different process**: a
+    /// rotation that only took effect at the next restart would not be the
+    /// revocation the command promises. The freshness check is two `stat`s on
+    /// the requests that actually present a bearer token.
+    pub(crate) tokens: Mutex<TokenStore>,
     pub(crate) devices: Mutex<DeviceStore>,
     pub(crate) limiter: Mutex<AuthLimiter>,
     pub(crate) origins: OriginAllowlist,
     /// When a device `last_seen` was last written, so the middleware can
     /// debounce that write.
     pub(crate) devices_persisted_at: Mutex<Option<Instant>>,
+    /// `<config>/gateway/`, so the pairing exchange can reach the code store
+    /// the CLI wrote into. Resolved once at startup: a handler must never
+    /// depend on the process's current directory or environment.
+    pub(crate) gateway_dir: std::path::PathBuf,
+    /// Whether a minted device cookie carries `Secure`, from
+    /// `[gateway] public_url`. A request that arrived through a loopback proxy
+    /// saying `X-Forwarded-Proto: https` sets it too.
+    pub(crate) secure_cookies: bool,
 }
 
 impl AuthState {
     pub(crate) fn new(
+        gateway_dir: std::path::PathBuf,
         tokens: TokenStore,
         devices: DeviceStore,
         config: &GatewayConfig,
         origins: OriginAllowlist,
     ) -> Self {
         Self {
-            tokens,
+            tokens: Mutex::new(tokens),
             devices: Mutex::new(devices),
             limiter: Mutex::new(AuthLimiter::from_config(config)),
             origins,
             devices_persisted_at: Mutex::new(None),
+            gateway_dir,
+            secure_cookies: OriginAllowlist::requires_secure_cookies(config),
         }
     }
 }
@@ -109,10 +124,8 @@ pub(crate) struct GatewayInfo {
 
 impl GatewayInfo {
     /// The features this build serves.
-    ///
-    /// PR 8 appends `"pairing"`.
     pub(crate) fn features() -> Vec<&'static str> {
-        vec!["fleet", "events", "terminal"]
+        vec!["fleet", "events", "terminal", "pairing"]
     }
 
     pub(crate) fn new(bind: SocketAddr, config: &GatewayConfig) -> Self {
@@ -135,6 +148,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .merge(http::routes())
         .merge(events::routes())
         .merge(terminal::routes())
+        .merge(pairing::routes())
         .fallback(assets::serve)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -254,7 +268,13 @@ pub(crate) fn shutdown_signal() -> impl Future<Output = ()> + Send + 'static {
     }
 }
 
+// Not an `async fn`, for the reason on the unix arm above: the caller relies
+// on this returning before it announces its address, and an `async fn` would
+// do the registration on the first poll instead. `clippy::manual_async_fn`
+// cannot see that difference here, because this arm has nothing to register
+// eagerly — it must simply keep the same shape as the unix one.
 #[cfg(not(unix))]
+#[allow(clippy::manual_async_fn)]
 pub(crate) fn shutdown_signal() -> impl Future<Output = ()> + Send + 'static {
     async {
         if let Err(error) = tokio::signal::ctrl_c().await {
@@ -344,7 +364,13 @@ pub(crate) mod tests {
             let origins = OriginAllowlist::for_bind(addr, &config.gateway);
             let state = AppState {
                 fleet: fleet.handle(),
-                auth: Arc::new(AuthState::new(tokens, devices, &config.gateway, origins)),
+                auth: Arc::new(AuthState::new(
+                    dir.clone(),
+                    tokens,
+                    devices,
+                    &config.gateway,
+                    origins,
+                )),
                 info: Arc::new(GatewayInfo::new(addr, &config.gateway)),
                 transports: Arc::new(HostTransports::new(&config)),
             };
