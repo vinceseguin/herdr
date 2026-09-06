@@ -9,11 +9,11 @@
 //! exposes `routes() -> Router<AppState>` and is merged in, so the auth layer
 //! and the body limit apply to it without that PR touching this function.
 
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::DefaultBodyLimit;
 use axum::Router;
@@ -31,6 +31,15 @@ use crate::gateway::{assets, http, middleware};
 /// body-carrying route inherits a bound rather than choosing one, and so a
 /// client cannot make the process buffer more than this.
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+
+/// How long a stopping gateway waits for in-flight connections before it
+/// drops them.
+///
+/// Graceful shutdown alone waits for every open connection, and a client that
+/// opened one and never finished its request would hold the process — and the
+/// fleet supervisors behind it — until a supervisor lost patience and killed
+/// it. A bound turns that into a warning and a clean exit.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 /// Everything a handler needs, and nothing more.
 #[derive(Clone)]
@@ -133,12 +142,56 @@ pub(crate) async fn serve<F>(listener: TcpListener, state: AppState, shutdown: F
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(
+    serve_with_drain(listener, state, shutdown, SHUTDOWN_DRAIN).await
+}
+
+/// [`serve`] with an explicit drain bound, so a test does not wait five
+/// seconds to see it hold.
+async fn serve_with_drain<F>(
+    listener: TcpListener,
+    state: AppState,
+    shutdown: F,
+    drain: Duration,
+) -> io::Result<()>
+where
+    F: Send + Future<Output = ()> + 'static,
+{
+    let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel::<()>();
+    let graceful = async move {
+        shutdown.await;
+        let _ = stopping_tx.send(());
+    };
+    // `into_future()` because `WithGracefulShutdown` is `IntoFuture`, not
+    // `Future`: it only becomes pollable — and only then spawns the task that
+    // watches the signal — once it is converted.
+    let server = axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown)
-    .await
+    .with_graceful_shutdown(graceful)
+    .into_future();
+    tokio::pin!(server);
+
+    let deadline = async move {
+        // An `Err` means the graceful future was dropped without firing,
+        // which only happens once the server has already returned.
+        if stopping_rx.await.is_ok() {
+            tokio::time::sleep(drain).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        outcome = &mut server => outcome,
+        () = deadline => {
+            tracing::warn!(
+                target: "gateway",
+                drain_secs = drain.as_secs_f64(),
+                "connections were still open after the drain period; dropping them"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// A future that resolves on `SIGINT` (Ctrl-C) or `SIGTERM` (what systemd and
@@ -209,8 +262,9 @@ pub(crate) mod tests {
     use std::time::Duration;
 
     use crate::config::Config;
-    use crate::gateway::auth::TokenScope;
+    use crate::gateway::auth::{unix_now, TokenScope};
     use crate::gateway::fleet::FleetRuntime;
+    use crate::gateway::middleware::DEVICE_COOKIE_NAME;
 
     /// A router on a real loopback port, with real tokens in a throwaway
     /// directory and an empty fleet.
@@ -224,6 +278,9 @@ pub(crate) mod tests {
         pub(crate) dir: std::path::PathBuf,
         pub(crate) read_token: String,
         pub(crate) control_token: String,
+        /// A `read`-scope device cookie value (`<id>.<secret>`), when the
+        /// server was started with one paired.
+        pub(crate) device_cookie: Option<String>,
         stop: Option<tokio::sync::oneshot::Sender<()>>,
         served: Option<tokio::task::JoinHandle<()>>,
         fleet: Option<FleetRuntime>,
@@ -231,10 +288,21 @@ pub(crate) mod tests {
 
     impl TestServer {
         pub(crate) async fn start(name: &str) -> Self {
-            Self::start_with(name, GatewayConfig::default()).await
+            Self::start_with(name, GatewayConfig::default(), false, SHUTDOWN_DRAIN).await
         }
 
-        pub(crate) async fn start_with(name: &str, gateway: GatewayConfig) -> Self {
+        /// A server with one `read`-scope device already paired, as PR 8's
+        /// exchange would leave it.
+        pub(crate) async fn start_paired(name: &str) -> Self {
+            Self::start_with(name, GatewayConfig::default(), true, SHUTDOWN_DRAIN).await
+        }
+
+        pub(crate) async fn start_with(
+            name: &str,
+            gateway: GatewayConfig,
+            pair_device: bool,
+            drain: Duration,
+        ) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "herdr-gateway-server-{}-{name}-{:?}",
                 std::process::id(),
@@ -245,7 +313,12 @@ pub(crate) mod tests {
             let read_token = std::fs::read_to_string(dir.join("read.token")).expect("read token");
             let control_token =
                 std::fs::read_to_string(dir.join("control.token")).expect("control token");
-            let devices = DeviceStore::load(&dir).expect("device store");
+            let mut devices = DeviceStore::load(&dir).expect("device store");
+            let device_cookie = pair_device.then(|| {
+                devices
+                    .insert(TokenScope::Read, "test phone", unix_now())
+                    .expect("pair a device")
+            });
 
             // An empty fleet: no host is configured, so the runtime starts no
             // supervisor, opens no socket and still exercises the real
@@ -265,9 +338,14 @@ pub(crate) mod tests {
             };
             let (stop, stopped) = tokio::sync::oneshot::channel();
             let served = tokio::spawn(async move {
-                let _ = serve(listener, state, async {
-                    let _ = stopped.await;
-                })
+                let _ = serve_with_drain(
+                    listener,
+                    state,
+                    async {
+                        let _ = stopped.await;
+                    },
+                    drain,
+                )
                 .await;
             });
 
@@ -276,6 +354,7 @@ pub(crate) mod tests {
                 dir,
                 read_token,
                 control_token,
+                device_cookie,
                 stop: Some(stop),
                 served: Some(served),
                 fleet: Some(fleet),
@@ -362,6 +441,13 @@ pub(crate) mod tests {
 
     fn bearer(token: &str) -> String {
         format!("Bearer {}", token.trim())
+    }
+
+    fn device_cookie(server: &TestServer) -> String {
+        format!(
+            "{DEVICE_COOKIE_NAME}={}",
+            server.device_cookie.as_deref().expect("a paired device")
+        )
     }
 
     #[tokio::test]
@@ -589,7 +675,8 @@ pub(crate) mod tests {
             allowed_origins: vec!["https://fleet.example".to_string()],
             ..GatewayConfig::default()
         };
-        let server = TestServer::start_with("configured-origin", gateway).await;
+        let server =
+            TestServer::start_with("configured-origin", gateway, false, SHUTDOWN_DRAIN).await;
         let token = bearer(&server.read_token);
 
         let allowed = server
@@ -615,6 +702,243 @@ pub(crate) mod tests {
         assert_eq!(refused.status, 403, "{}", refused.body);
 
         server.shutdown().await;
+    }
+
+    /// A request with no credential at all is refused but is not a guess: a
+    /// page can point five `<img>` tags at the gateway with no `Origin` and
+    /// no header of its choosing, and that must not lock the operator's own
+    /// address out.
+    #[tokio::test]
+    async fn credential_less_requests_do_not_feed_the_limiter() {
+        let server = TestServer::start("no-credential").await;
+        for _ in 0..8 {
+            let response = server.get("/api/fleet", &[]).await;
+            assert_eq!(response.status, 401, "{}", response.body);
+        }
+        let response = server
+            .get(
+                "/api/fleet",
+                &[("Authorization", &bearer(&server.read_token))],
+            )
+            .await;
+        assert_eq!(response.status, 200, "{}", response.body);
+
+        // A presented-and-wrong credential of either kind still counts.
+        for _ in 0..5 {
+            let _ = server
+                .get(
+                    "/api/fleet",
+                    &[("Cookie", "herdr_gateway_device=nope.nope")],
+                )
+                .await;
+        }
+        let blocked = server
+            .get(
+                "/api/fleet",
+                &[("Authorization", &bearer(&server.read_token))],
+            )
+            .await;
+        assert_eq!(blocked.status, 429, "{}", blocked.body);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_paired_device_cookie_authenticates_with_read_scope() {
+        let server = TestServer::start_paired("cookie").await;
+        let cookie = device_cookie(&server);
+
+        for headers in [
+            vec![("Cookie", cookie.as_str())],
+            vec![
+                ("Cookie", cookie.as_str()),
+                ("Sec-Fetch-Site", "same-origin"),
+            ],
+            vec![("Cookie", cookie.as_str()), ("Sec-Fetch-Site", "none")],
+        ] {
+            let response = server.get("/api/gateway", &headers).await;
+            assert_eq!(response.status, 200, "{headers:?}: {}", response.body);
+            assert_eq!(response.json()["scope"].as_str(), Some("read"));
+        }
+
+        // The same cookie with a wrong secret is an ordinary failure.
+        let wrong = format!("{DEVICE_COOKIE_NAME}=nope.nope");
+        let response = server.get("/api/gateway", &[("Cookie", &wrong)]).await;
+        assert_eq!(response.status, 401, "{}", response.body);
+        server.shutdown().await;
+    }
+
+    /// A page on another site can make the browser send the operator's cookie
+    /// without an `Origin` (an `<img>`, a form, a link). The browser marks
+    /// those requests, and the cookie is refused on them before it is
+    /// compared — and, like an origin refusal, without feeding the limiter.
+    #[tokio::test]
+    async fn a_device_cookie_is_refused_on_a_cross_site_request_without_an_origin() {
+        let server = TestServer::start_paired("cookie-cross-site").await;
+        let cookie = device_cookie(&server);
+
+        for site in ["cross-site", "same-site"] {
+            for _ in 0..4 {
+                let response = server
+                    .get(
+                        "/api/gateway",
+                        &[("Cookie", &cookie), ("Sec-Fetch-Site", site)],
+                    )
+                    .await;
+                assert_eq!(response.status, 403, "{site}: {}", response.body);
+                assert_eq!(
+                    response.json()["error"].as_str(),
+                    Some("origin_not_allowed"),
+                    "{site}"
+                );
+            }
+        }
+
+        // An allowed Origin vouches for the page, whatever the site relation.
+        let own = format!("http://{}", server.addr);
+        let response = server
+            .get(
+                "/api/gateway",
+                &[
+                    ("Cookie", &cookie),
+                    ("Origin", &own),
+                    ("Sec-Fetch-Site", "cross-site"),
+                ],
+            )
+            .await;
+        assert_eq!(response.status, 200, "{}", response.body);
+
+        // A bearer token is not a browser-managed credential and is unaffected.
+        let response = server
+            .get(
+                "/api/gateway",
+                &[
+                    ("Authorization", &bearer(&server.read_token)),
+                    ("Sec-Fetch-Site", "cross-site"),
+                ],
+            )
+            .await;
+        assert_eq!(response.status, 200, "{}", response.body);
+
+        // Eight refusals above, and the peer is not locked out.
+        let response = server.get("/api/gateway", &[("Cookie", &cookie)]).await;
+        assert_eq!(response.status, 200, "{}", response.body);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn two_origin_headers_are_refused_even_when_one_is_allowed() {
+        let server = TestServer::start("two-origins").await;
+        let own = format!("http://{}", server.addr);
+        let response = server
+            .get(
+                "/api/fleet",
+                &[
+                    ("Authorization", &bearer(&server.read_token)),
+                    ("Origin", &own),
+                    ("Origin", "https://evil.example"),
+                ],
+            )
+            .await;
+        assert_eq!(response.status, 403, "{}", response.body);
+        assert_eq!(
+            response.json()["error"].as_str(),
+            Some("origin_not_allowed")
+        );
+        server.shutdown().await;
+    }
+
+    /// Axum does not fold percent-encoded or dotted spellings before routing
+    /// — probed, not assumed — so a spelling never reaches an API handler on
+    /// its own. The auth layer normalizes anyway, so no spelling of an API
+    /// path can be classified public either, and none of them answers with
+    /// the HTML shell an API client could not tell from a real reply.
+    #[tokio::test]
+    async fn non_canonical_api_spellings_never_reach_an_api_handler() {
+        let server = TestServer::start("spellings").await;
+        for path in [
+            "/api/fleet",
+            "//api/fleet",
+            "/./api/fleet",
+            "/health/../api/fleet",
+            "/api%2Ffleet",
+            "/api%2ffleet",
+            "/api/./fleet",
+            "/api/x/../fleet",
+            "/api/fleet/",
+            "/api/fleet;x",
+            "/api/nope",
+        ] {
+            let response = server.get(path, &[]).await;
+            assert_eq!(response.status, 401, "{path}: {}", response.body);
+            assert_eq!(
+                response.json()["error"].as_str(),
+                Some("unauthorized"),
+                "{path}"
+            );
+            assert!(!response.body.contains("herdr.fleet.status"), "{path}");
+        }
+
+        // Case is not folded: HTTP paths are case-sensitive and so is the
+        // router, so this is one of the app's own routes, not the API.
+        let response = server.get("/API/fleet", &[]).await;
+        assert_eq!(response.status, 200, "{}", response.body);
+        assert_eq!(
+            response.header("content-type"),
+            Some("text/html; charset=utf-8")
+        );
+
+        // With a credential, only the canonical spelling produces a report;
+        // the rest are an honest JSON 404, never the shell.
+        let token = bearer(&server.read_token);
+        for path in ["//api/fleet", "/api%2Ffleet", "/api/fleet/"] {
+            let response = server.get(path, &[("Authorization", &token)]).await;
+            assert_eq!(response.status, 404, "{path}: {}", response.body);
+            assert_eq!(
+                response.json()["error"].as_str(),
+                Some("not_found"),
+                "{path}"
+            );
+        }
+        let response = server.get("/api/fleet", &[("Authorization", &token)]).await;
+        assert_eq!(response.status, 200, "{}", response.body);
+        assert_eq!(
+            response.json()["schema"].as_str(),
+            Some(crate::fleet::report::FLEET_STATUS_SCHEMA)
+        );
+
+        server.shutdown().await;
+    }
+
+    /// A connection that never finishes its request must not hold a stopping
+    /// gateway open for good.
+    #[tokio::test]
+    async fn shutdown_drops_a_stalled_connection_after_the_drain_period() {
+        let server = TestServer::start_with(
+            "drain",
+            GatewayConfig::default(),
+            false,
+            Duration::from_millis(200),
+        )
+        .await;
+        let addr = server.addr;
+        let stalled = tokio::task::spawn_blocking(move || {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            stream
+                .write_all(b"GET /health HTT")
+                .expect("write a partial request");
+            stream
+        })
+        .await
+        .expect("the stalled client");
+
+        let started = Instant::now();
+        server.shutdown().await;
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "shutdown took {:?}",
+            started.elapsed()
+        );
+        drop(stalled);
     }
 
     #[tokio::test]

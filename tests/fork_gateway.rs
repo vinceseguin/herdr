@@ -350,17 +350,17 @@ fn bad_credentials_are_refused_and_then_rate_limited() {
     let with_query = gateway.http_get(&format!("/api/fleet?token={}", gateway.read_token()), &[]);
     assert_eq!(with_query.status, 401, "{}", with_query.body);
 
-    // The unauthenticated request above was already one failure, so four more
-    // reach the configured limit of five.
+    // The request above presented nothing, so it is not a guess and does not
+    // count; five presented-and-wrong tokens reach the configured limit.
     let mut statuses = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..5 {
         statuses.push(
             gateway
                 .http_get("/api/fleet", &[("Authorization", "Bearer 00")])
                 .status,
         );
     }
-    assert_eq!(statuses, vec![401, 401, 401, 401], "{statuses:?}");
+    assert_eq!(statuses, vec![401, 401, 401, 401, 401], "{statuses:?}");
 
     // Even a valid token is refused while the peer is blocked, and `/health`
     // is not.

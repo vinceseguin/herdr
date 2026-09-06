@@ -19,11 +19,35 @@
 //!    compared against anything.
 //! 4. **Credential.** A `Authorization: Bearer <token>` first, then the
 //!    `herdr_gateway_device` cookie PR 8 mints. Both compare digests in
-//!    constant time. A miss records a failure and answers `401`.
+//!    constant time. A credential that was presented and proved nothing
+//!    records a failure and answers `401`; a request that presented **no**
+//!    credential answers `401` without recording one. Only a guess counts:
+//!    a page cannot attach a header to an `<img>` or a form it points at the
+//!    gateway, but it can make the browser send those requests — with no
+//!    `Origin` — five times, and counting them would let any web site lock
+//!    the operator's own address out.
+//!
+//! The cookie has one more gate. A browser that sends no `Origin` still says
+//! where a request came from in `Sec-Fetch-Site`; a device cookie on a
+//! request marked `cross-site` or `same-site` is a page on another site
+//! riding the operator's browser (an `<img>`, a form, a link), so it is
+//! refused before the cookie is compared and is not counted either. The
+//! cookie PR 8 mints must also be `SameSite=Strict` and `HttpOnly`, which
+//! closes the same door in browsers that predate `Sec-Fetch-Site`.
 //!
 //! What the layer never does: read a token from the query string or from any
 //! header a page can set cross-origin (which is why only `Authorization` and
 //! `Cookie` are consulted), log a credential, or say *why* a credential failed.
+//!
+//! Every path decision here is made on the **normalized** path
+//! ([`normalized_path`]), never on the raw request target: `/api%2ffleet`,
+//! `//api/fleet` and `/x/../api/fleet` must all be treated as `/api/fleet`.
+//! Today axum's router does not fold them together — measured, not assumed —
+//! so none of them reaches a handler; deciding on the raw path anyway would
+//! mean a future router that *does* fold them turns this layer's "public"
+//! answer into an authentication bypass. Normalizing here can only ever demand
+//! a credential for more paths than the router serves, which is the safe
+//! direction to be wrong in.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -93,12 +117,25 @@ pub(crate) async fn authenticate(
     next: Next,
 ) -> Response {
     let auth = Arc::clone(&state.auth);
-    let path = request.uri().path().to_string();
+    let path = normalized_path(request.uri().path());
     let peer_ip = peer.ip();
 
     // 1. Origin.
-    if let Some(origin) = header_str(&request, header::ORIGIN) {
-        if !auth.origins.allows(&origin) {
+    let origin = match origin_header(&request) {
+        Ok(origin) => origin,
+        Err(reason) => {
+            tracing::warn!(
+                target: "gateway",
+                peer = %peer_ip,
+                path = %path,
+                reason,
+                "refusing a request whose Origin header cannot be trusted"
+            );
+            return ApiError::origin_not_allowed().into_response();
+        }
+    };
+    if let Some(origin) = &origin {
+        if !auth.origins.allows(origin) {
             tracing::warn!(
                 target: "gateway",
                 peer = %peer_ip,
@@ -129,15 +166,38 @@ pub(crate) async fn authenticate(
     }
 
     // 4. Credential.
-    let Some(principal) = verify(&auth, &request) else {
-        record_failure(&auth, peer_ip, now);
-        tracing::warn!(
-            target: "gateway",
-            peer = %peer_ip,
-            path = %path,
-            "refusing a request with no valid credential"
-        );
-        return ApiError::unauthorized().into_response();
+    let principal = match verify(&auth, &request, origin.is_some()) {
+        Verification::Verified(principal) => principal,
+        Verification::Rejected => {
+            record_failure(&auth, peer_ip, now);
+            tracing::warn!(
+                target: "gateway",
+                peer = %peer_ip,
+                path = %path,
+                "refusing a request whose credential did not verify"
+            );
+            return ApiError::unauthorized().into_response();
+        }
+        Verification::Absent => {
+            // Not a guess, so not a failure: the app shell itself asks
+            // `/api/gateway` without a credential on every load.
+            tracing::debug!(
+                target: "gateway",
+                peer = %peer_ip,
+                path = %path,
+                "refusing a request with no credential"
+            );
+            return ApiError::unauthorized().into_response();
+        }
+        Verification::CrossSiteCookie => {
+            tracing::warn!(
+                target: "gateway",
+                peer = %peer_ip,
+                path = %path,
+                "refusing a device cookie on a cross-site request that carries no Origin"
+            );
+            return ApiError::origin_not_allowed().into_response();
+        }
     };
 
     if let Credential::Device { id } = &principal.via {
@@ -154,7 +214,7 @@ pub(crate) async fn authenticate(
     next.run(request).await
 }
 
-/// Whether a path is served without a principal.
+/// Whether a path is served without a principal. Takes a [`normalized_path`].
 ///
 /// `/health` is liveness for a supervisor. Everything else public is the
 /// embedded app itself — a `GET`/`HEAD` outside `/api/`, which is how PR 8's
@@ -170,22 +230,149 @@ fn is_public(path: &str, method: &Method) -> bool {
     matches!(*method, Method::GET | Method::HEAD)
 }
 
+/// A request path with percent-escapes decoded, empty and `.` segments
+/// dropped, and `..` segments resolved.
+///
+/// Pure, one bounded allocation per request, and it never touches the
+/// filesystem — this is a string decision, not a lookup. A `..` that would
+/// escape the root is dropped rather than kept, so the result always starts at
+/// `/`. An escape that decodes to bytes that are not UTF-8 leaves the path
+/// exactly as written: it cannot match a route either way, and guessing at it
+/// would invent a second spelling of the same path.
+pub(crate) fn normalized_path(path: &str) -> String {
+    let decoded = percent_decode(path);
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in decoded.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    let mut normalized = String::with_capacity(decoded.len() + 1);
+    for segment in segments {
+        normalized.push('/');
+        normalized.push_str(segment);
+    }
+    if normalized.is_empty() {
+        normalized.push('/');
+    }
+    normalized
+}
+
+/// Decode `%XX` escapes, leaving anything that is not a well-formed escape —
+/// or that does not decode to UTF-8 — exactly as it was written.
+fn percent_decode(path: &str) -> String {
+    if !path.contains('%') {
+        return path.to_string();
+    }
+    let bytes = path.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let high = (bytes[index + 1] as char).to_digit(16);
+            let low = (bytes[index + 2] as char).to_digit(16);
+            if let (Some(high), Some(low)) = (high, low) {
+                out.push((high * 16 + low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| path.to_string())
+}
+
+/// What looking at a request's credentials decided.
+enum Verification {
+    /// A credential verified.
+    Verified(Principal),
+    /// A credential was presented and proved nothing: a guess, counted
+    /// against the peer.
+    Rejected,
+    /// Neither an `Authorization` header nor the device cookie: refused, but
+    /// nothing was guessed.
+    Absent,
+    /// A device cookie on a request the browser marked as coming from another
+    /// site while carrying no `Origin`: refused before the cookie is
+    /// compared, and not counted.
+    CrossSiteCookie,
+}
+
 /// The credential a request proves, if any.
 ///
 /// Bearer first, then the device cookie: a request that presents a bad bearer
 /// token is not silently upgraded by a cookie it also happens to carry, which
-/// would make a failed token look like a success in the logs.
-fn verify(auth: &AuthState, request: &Request) -> Option<Principal> {
+/// would make a failed token look like a success in the logs. `origin_present`
+/// says whether step 1 already vouched for the page behind a browser request;
+/// without it, the cookie is only honoured when `Sec-Fetch-Site` does not say
+/// the request came from another site.
+fn verify(auth: &AuthState, request: &Request, origin_present: bool) -> Verification {
     if let Some(value) = header_str(request, header::AUTHORIZATION) {
-        let presented = bearer_token(&value)?;
-        return auth.tokens.verify_bearer(presented).map(Principal::bearer);
+        let Some(presented) = bearer_token(&value) else {
+            return Verification::Rejected;
+        };
+        return match auth.tokens.verify_bearer(presented) {
+            Some(scope) => Verification::Verified(Principal::bearer(scope)),
+            None => Verification::Rejected,
+        };
     }
-    let cookie = header_str(request, header::COOKIE)?;
-    let value = cookie_value(&cookie, DEVICE_COOKIE_NAME)?;
+    let Some(cookie) = header_str(request, header::COOKIE) else {
+        return Verification::Absent;
+    };
+    let Some(value) = cookie_value(&cookie, DEVICE_COOKIE_NAME) else {
+        return Verification::Absent;
+    };
+    if !origin_present && is_cross_site(request) {
+        return Verification::CrossSiteCookie;
+    }
     let devices = auth.devices.lock().unwrap_or_else(|err| err.into_inner());
-    devices
-        .verify_cookie(&value)
-        .map(|(scope, id)| Principal::device(scope, id))
+    match devices.verify_cookie(&value) {
+        Some((scope, id)) => Verification::Verified(Principal::device(scope, id)),
+        None => Verification::Rejected,
+    }
+}
+
+/// Whether the browser says this request was made by a page on another site.
+///
+/// `Sec-Fetch-Site` is set by the browser and cannot be set by a page. Only
+/// `same-origin` and `none` (a URL the user typed, a bookmark) are the
+/// operator's own doing; `same-site` is refused along with `cross-site`
+/// because a sibling host on the operator's domain is not the gateway. A
+/// request without the header (curl, an old browser) is not marked either
+/// way and is decided by its credential alone.
+fn is_cross_site(request: &Request) -> bool {
+    request
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|site| {
+            let site = site.trim();
+            site.eq_ignore_ascii_case("cross-site") || site.eq_ignore_ascii_case("same-site")
+        })
+}
+
+/// The one `Origin` header, or `Ok(None)` when there is none.
+///
+/// A browser sends at most one. Two of them, or one that is not readable
+/// ASCII, is not something to pick the friendliest value out of: it is an
+/// `Err`, and the request is refused as if the origin were foreign.
+fn origin_header(request: &Request) -> Result<Option<String>, &'static str> {
+    let mut values = request.headers().get_all(header::ORIGIN).iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err("more than one Origin header");
+    }
+    first
+        .to_str()
+        .map(|value| Some(value.to_string()))
+        .map_err(|_| "Origin header is not visible ASCII")
 }
 
 /// The token from an `Authorization` header, or `None` for any other scheme.
@@ -305,6 +492,48 @@ mod tests {
         assert!(!is_public("/api/", &Method::GET));
     }
 
+    /// Every spelling of the fleet route normalizes to the one path the layer
+    /// decides on, so none of them can be classified public.
+    #[test]
+    fn encoded_and_dotted_spellings_of_an_api_path_are_never_public() {
+        for spelling in [
+            "/api%2ffleet",
+            "/api%2Ffleet",
+            "//api/fleet",
+            "/./api/fleet",
+            "/x/../api/fleet",
+            "/api/./fleet",
+            "/api/x/../fleet",
+            "/%61pi/fleet",
+        ] {
+            let normalized = normalized_path(spelling);
+            assert_eq!(normalized, "/api/fleet", "spelling: {spelling}");
+            assert!(
+                !is_public(&normalized, &Method::GET),
+                "spelling: {spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalization_keeps_ordinary_paths_and_cannot_escape_the_root() {
+        assert_eq!(normalized_path("/"), "/");
+        assert_eq!(normalized_path(""), "/");
+        assert_eq!(normalized_path("/index.html"), "/index.html");
+        assert_eq!(normalized_path("/a/b/c"), "/a/b/c");
+        assert_eq!(normalized_path("/a/b/"), "/a/b");
+        // A `..` past the root is dropped, never kept.
+        assert_eq!(normalized_path("/../../etc/passwd"), "/etc/passwd");
+        assert_eq!(normalized_path("/.."), "/");
+        // A malformed escape is left alone rather than guessed at.
+        assert_eq!(normalized_path("/a%zz"), "/a%zz");
+        assert_eq!(normalized_path("/a%2"), "/a%2");
+        // An escape that is not UTF-8 leaves the whole path as written.
+        assert_eq!(normalized_path("/a%ff"), "/a%ff");
+        // A space stays a space; it does not become a separator.
+        assert_eq!(normalized_path("/api/fleet%20"), "/api/fleet ");
+    }
+
     #[test]
     fn bearer_tokens_are_taken_verbatim_after_a_case_insensitive_scheme() {
         assert_eq!(bearer_token("Bearer abc"), Some("abc"));
@@ -333,6 +562,56 @@ mod tests {
             cookie_value("xherdr_gateway_device=nope", DEVICE_COOKIE_NAME),
             None
         );
+    }
+
+    fn request_with(headers: &[(&str, &str)]) -> Request {
+        let mut builder = Request::builder().uri("/api/fleet");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(axum::body::Body::empty()).expect("request")
+    }
+
+    #[test]
+    fn only_the_browser_marking_another_site_counts_as_cross_site() {
+        assert!(is_cross_site(&request_with(&[(
+            "Sec-Fetch-Site",
+            "cross-site"
+        )])));
+        assert!(is_cross_site(&request_with(&[(
+            "Sec-Fetch-Site",
+            "same-site"
+        )])));
+        assert!(is_cross_site(&request_with(&[(
+            "Sec-Fetch-Site",
+            "Cross-Site"
+        )])));
+        assert!(!is_cross_site(&request_with(&[(
+            "Sec-Fetch-Site",
+            "same-origin"
+        )])));
+        assert!(!is_cross_site(&request_with(&[("Sec-Fetch-Site", "none")])));
+        assert!(!is_cross_site(&request_with(&[])));
+    }
+
+    #[test]
+    fn a_single_readable_origin_is_the_only_acceptable_shape() {
+        assert_eq!(origin_header(&request_with(&[])), Ok(None));
+        assert_eq!(
+            origin_header(&request_with(&[("Origin", "https://fleet.example")])),
+            Ok(Some("https://fleet.example".to_string()))
+        );
+        assert!(origin_header(&request_with(&[
+            ("Origin", "https://fleet.example"),
+            ("Origin", "https://evil.example"),
+        ]))
+        .is_err());
+        let mut request = request_with(&[]);
+        request.headers_mut().insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_bytes(b"https://\xffevil.example").expect("opaque"),
+        );
+        assert!(origin_header(&request).is_err());
     }
 
     #[test]

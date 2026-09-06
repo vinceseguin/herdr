@@ -23,6 +23,7 @@ use axum::http::{header, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 
 use crate::gateway::http::ApiError;
+use crate::gateway::middleware::normalized_path;
 
 /// One file compiled into the binary.
 pub(crate) struct EmbeddedAsset {
@@ -107,7 +108,11 @@ fn find(path: &str) -> Option<&'static EmbeddedAsset> {
 /// the HTML shell: an API client that gets a login page instead of JSON has no
 /// way to tell a routing mistake from a real answer.
 pub(crate) async fn serve(method: Method, uri: Uri) -> Response {
-    let path = uri.path();
+    // The same normalized path the auth layer decided on, so `/api%2ffleet`
+    // and `//api/fleet` are answered as the API paths they are rather than
+    // handed the HTML shell.
+    let path = normalized_path(uri.path());
+    let path = path.as_str();
     if path.starts_with("/api/") || path == "/api" {
         return ApiError::not_found().into_response();
     }

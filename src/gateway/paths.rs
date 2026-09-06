@@ -42,8 +42,10 @@ pub const PAIRINGS_DIR: &str = "pairings";
 pub const RUNTIME_FILE: &str = "gateway.json";
 
 /// `<config>/gateway/`, where `<config>` is herdr's own config directory, so
-/// `--config`/`HERDR_CONFIG_PATH` and `XDG_CONFIG_HOME` move the token store
-/// with everything else.
+/// `XDG_CONFIG_HOME` moves the token store with everything else. `--config`
+/// (`HERDR_CONFIG_PATH`) relocates only the config *file*, as it does for the
+/// rest of herdr; the store stays in the config directory, and `herdr gateway
+/// pair`/`status` (PR 8) must resolve it the same way.
 pub fn gateway_dir() -> PathBuf {
     crate::config::config_dir().join("gateway")
 }
