@@ -56,6 +56,12 @@ pub(crate) use self::{
     model::{validate_fleet_host_name, KeysConfig},
 };
 
+/// `[gateway]` itself is unconditional (an upstream-shaped build still parses
+/// and validates the section), but only `src/gateway/**` needs to name these
+/// types, so the re-exports follow the feature that compiles it.
+#[cfg(feature = "gateway")]
+pub use self::model::{parse_gateway_origin, GatewayConfig, GatewayOrigin};
+
 pub const CONFIG_PATH_ENV_VAR: &str = "HERDR_CONFIG_PATH";
 
 pub(crate) fn is_keybinding_config_diagnostic(diagnostic: &str) -> bool {
@@ -127,6 +133,7 @@ impl Config {
             .chain(self.invalid_sidebar_bounds_diagnostic())
             .chain(self.invalid_headless_size_diagnostic())
             .chain(self.fleet.diagnostics())
+            .chain(self.gateway.diagnostics())
             .collect()
     }
 

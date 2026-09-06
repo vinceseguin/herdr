@@ -321,6 +321,7 @@ pub struct Config {
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
     pub fleet: FleetConfig,
+    pub gateway: GatewayConfig,
 }
 
 #[derive(Debug)]
@@ -1151,6 +1152,324 @@ pub(crate) fn validate_fleet_host_target(target: &str) -> Result<(), String> {
         return Err("ssh target must not contain whitespace or control characters".to_string());
     }
     Ok(())
+}
+
+/// `[gateway]` — the fork's HTTP/WebSocket gateway (`herdr gateway`).
+///
+/// The section is unconditional: an upstream-shaped `--no-default-features`
+/// build still parses and validates it (pure data, no optional dependency)
+/// instead of reporting `[gateway]` as an unknown top-level key.
+///
+/// Field names are the user-facing contract: add fields, never rename them.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct GatewayConfig {
+    /// Listen address. Loopback by default; any other address also requires
+    /// `allowed_origins`. Default: "127.0.0.1:7788".
+    pub bind: String,
+    /// Browser origins allowed to call the API, as `scheme://host[:port]`.
+    /// Required for a non-loopback bind. Default: empty.
+    pub allowed_origins: Vec<String>,
+    /// Origin that pairing URLs and QR codes advertise. Implicitly allowed;
+    /// an `https` scheme marks device cookies `Secure`. Default: empty.
+    pub public_url: String,
+    /// Failed authentications from one peer address before it is refused for
+    /// the rest of the window. Default: 5.
+    pub auth_failure_limit: u32,
+    /// Length of the failed-authentication window, in seconds. Default: 60.
+    pub auth_failure_window_secs: u64,
+    /// How long a pairing URL from `herdr gateway pair` stays valid, in
+    /// seconds. Default: 600.
+    pub pairing_ttl_secs: u64,
+}
+
+/// Default listen address, used when `[gateway] bind` is absent or invalid.
+pub const DEFAULT_GATEWAY_BIND: &str = "127.0.0.1:7788";
+/// [`DEFAULT_GATEWAY_BIND`] as an address, so the fallback needs no parse.
+// Consumed by `herdr gateway` (E3 PR 4) through `effective_bind_addr`; until
+// then only tests read it.
+#[allow(dead_code)]
+pub const DEFAULT_GATEWAY_BIND_ADDR: std::net::SocketAddr = std::net::SocketAddr::V4(
+    std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 7788),
+);
+/// Inclusive bounds for `[gateway] pairing_ttl_secs` (30 s to 24 h).
+pub const MIN_GATEWAY_PAIRING_TTL_SECS: u64 = 30;
+pub const MAX_GATEWAY_PAIRING_TTL_SECS: u64 = 86_400;
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            bind: DEFAULT_GATEWAY_BIND.to_string(),
+            allowed_origins: Vec::new(),
+            public_url: String::new(),
+            auth_failure_limit: 5,
+            auth_failure_window_secs: 60,
+            pairing_ttl_secs: 600,
+        }
+    }
+}
+
+impl GatewayConfig {
+    /// Validate `[gateway]` without touching the network or the filesystem.
+    ///
+    /// Every problem is reported. A bad value is a diagnostic, not a parse
+    /// failure, so one typo never drops the rest of the section; the gateway
+    /// falls back to the documented default for that key. Refusing to listen
+    /// at all (a non-loopback bind without origins) is a run-time decision in
+    /// `gateway::policy::BindPolicy`, not a config diagnostic, because a
+    /// `--bind` flag can still make the same config valid.
+    pub fn diagnostics(&self) -> Vec<String> {
+        let defaults = Self::default();
+        let mut diagnostics = Vec::new();
+
+        if self.bind_addr().is_none() {
+            diagnostics.push(format!(
+                "invalid gateway bind: gateway.bind = {:?}; expected ADDRESS:PORT (for example {DEFAULT_GATEWAY_BIND}); using {DEFAULT_GATEWAY_BIND}",
+                self.bind
+            ));
+        }
+
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for (index, origin) in self.allowed_origins.iter().enumerate() {
+            match parse_gateway_origin(origin) {
+                Err(reason) => diagnostics.push(format!(
+                    "invalid gateway origin: gateway.allowed_origins[{index}] = {origin:?}; {reason}; ignoring this origin"
+                )),
+                Ok(parsed) => {
+                    // Two spellings of the same origin (case, or a repeat) are
+                    // reported so the allowlist reads as what it enforces.
+                    let normalized = parsed.to_header_value();
+                    if !seen.insert(normalized.clone()) {
+                        diagnostics.push(format!(
+                            "duplicate gateway origin: gateway.allowed_origins[{index}] = {origin:?} repeats {normalized:?}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        if !self.public_url.is_empty() {
+            if let Err(reason) = parse_gateway_origin(&self.public_url) {
+                diagnostics.push(format!(
+                    "invalid gateway public url: gateway.public_url = {:?}; {reason}; ignoring it",
+                    self.public_url
+                ));
+            }
+        }
+
+        if self.auth_failure_limit == 0 {
+            diagnostics.push(format!(
+                "invalid gateway auth failure limit: gateway.auth_failure_limit = 0 would refuse every request; using {}",
+                defaults.auth_failure_limit
+            ));
+        }
+        if self.auth_failure_window_secs == 0 {
+            diagnostics.push(format!(
+                "invalid gateway auth failure window: gateway.auth_failure_window_secs = 0 disables rate limiting; using {}",
+                defaults.auth_failure_window_secs
+            ));
+        }
+        if !(MIN_GATEWAY_PAIRING_TTL_SECS..=MAX_GATEWAY_PAIRING_TTL_SECS)
+            .contains(&self.pairing_ttl_secs)
+        {
+            diagnostics.push(format!(
+                "invalid gateway pairing ttl: gateway.pairing_ttl_secs = {}; expected {MIN_GATEWAY_PAIRING_TTL_SECS}..={MAX_GATEWAY_PAIRING_TTL_SECS}; using {}",
+                self.pairing_ttl_secs, defaults.pairing_ttl_secs
+            ));
+        }
+
+        diagnostics
+    }
+
+    /// The configured listen address, or `None` when `bind` does not parse.
+    pub fn bind_addr(&self) -> Option<std::net::SocketAddr> {
+        self.bind.parse().ok()
+    }
+
+    /// The listen address the gateway uses: `bind`, or the default the
+    /// diagnostic promises when `bind` does not parse.
+    // Consumed by E3 PR 4 (`herdr gateway` startup); until then only tests call it.
+    #[allow(dead_code)]
+    pub fn effective_bind_addr(&self) -> std::net::SocketAddr {
+        self.bind_addr().unwrap_or(DEFAULT_GATEWAY_BIND_ADDR)
+    }
+
+    /// `auth_failure_limit`, or the default when it is 0.
+    // Consumed by E3 PR 4 (`AuthLimiter::from_config`, gateway builds only); until then only tests call it.
+    #[allow(dead_code)]
+    pub fn effective_auth_failure_limit(&self) -> u32 {
+        if self.auth_failure_limit == 0 {
+            Self::default().auth_failure_limit
+        } else {
+            self.auth_failure_limit
+        }
+    }
+
+    /// `auth_failure_window_secs` as a duration, or the default when it is 0.
+    // Consumed by E3 PR 4 (`AuthLimiter::from_config`, gateway builds only); until then only tests call it.
+    #[allow(dead_code)]
+    pub fn effective_auth_failure_window(&self) -> std::time::Duration {
+        let secs = if self.auth_failure_window_secs == 0 {
+            Self::default().auth_failure_window_secs
+        } else {
+            self.auth_failure_window_secs
+        };
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// `pairing_ttl_secs`, or the default when it is out of bounds.
+    // Consumed by E3 PR 8 (`herdr gateway pair`); until then only tests call it.
+    #[allow(dead_code)]
+    pub fn effective_pairing_ttl_secs(&self) -> u64 {
+        if (MIN_GATEWAY_PAIRING_TTL_SECS..=MAX_GATEWAY_PAIRING_TTL_SECS)
+            .contains(&self.pairing_ttl_secs)
+        {
+            self.pairing_ttl_secs
+        } else {
+            Self::default().pairing_ttl_secs
+        }
+    }
+}
+
+/// One browser origin: `scheme://host[:port]` and nothing else.
+///
+/// The canonical parser lives here rather than in `src/gateway/policy.rs`
+/// because `[gateway]` is unconditional while the gateway module is behind a
+/// cargo feature: a single parser means a `--no-default-features` build
+/// reports exactly the origins a gateway build would refuse.
+///
+/// Two origins are equal when their fields are: the parser normalizes them
+/// the way a browser serializes an `Origin` header (RFC 6454 §6.1), so a
+/// configured `HTTPS://Fleet.Example:443` matches the `https://fleet.example`
+/// a browser actually sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayOrigin {
+    /// Lowercase scheme, `http` or `https`.
+    pub scheme: String,
+    /// Lowercase ASCII host: a name, an IPv4 literal, or a bracketed IPv6
+    /// literal in its canonical compressed form.
+    pub host: String,
+    /// Explicit non-default port. `None` when the origin uses the scheme's
+    /// default (`80` for http, `443` for https), which browsers omit.
+    pub port: Option<u16>,
+}
+
+impl GatewayOrigin {
+    /// Serialize back to the `scheme://host[:port]` form browsers send.
+    pub fn to_header_value(&self) -> String {
+        match self.port {
+            Some(port) => format!("{}://{}:{port}", self.scheme, self.host),
+            None => format!("{}://{}", self.scheme, self.host),
+        }
+    }
+}
+
+/// Parse a `scheme://host[:port]` origin, rejecting everything else.
+///
+/// Rejected on purpose: schemes other than http/https, userinfo, a path (even
+/// a bare trailing `/`), a query, a fragment, an empty or non-ASCII host, a
+/// port of 0, and `null`. A browser never sends any of them in an `Origin`
+/// header, so accepting them would only widen the allowlist.
+pub fn parse_gateway_origin(value: &str) -> Result<GatewayOrigin, String> {
+    if value.is_empty() {
+        return Err("origin cannot be empty".to_string());
+    }
+    if !value.is_ascii() {
+        return Err(
+            "origin must be ASCII; write an internationalized host in its punycode form"
+                .to_string(),
+        );
+    }
+    if value
+        .chars()
+        .any(|ch| ch.is_ascii_whitespace() || ch.is_ascii_control())
+    {
+        return Err("origin must not contain whitespace or control characters".to_string());
+    }
+
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return Err("expected scheme://host[:port]".to_string());
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!(
+            "unsupported scheme {scheme:?}; expected http or https"
+        ));
+    }
+    if rest.contains('/') {
+        return Err("origin must not contain a path".to_string());
+    }
+    if rest.contains('?') || rest.contains('#') {
+        return Err("origin must not contain a query or fragment".to_string());
+    }
+    if rest.contains('@') {
+        return Err("origin must not contain userinfo".to_string());
+    }
+
+    let (host, port) = split_origin_host_port(rest)?;
+    if host.is_empty() {
+        return Err("origin host cannot be empty".to_string());
+    }
+    // Browsers omit the scheme's default port when serializing an origin, so
+    // `https://x:443` and `https://x` are the same origin and must compare
+    // equal; anything else is compared port-exact.
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let port = port.filter(|port| *port != default_port);
+
+    Ok(GatewayOrigin {
+        scheme,
+        host: host.to_ascii_lowercase(),
+        port,
+    })
+}
+
+/// Split `host[:port]`, honouring the `[..]` brackets of an IPv6 literal.
+///
+/// A bracketed literal comes back in its canonical compressed spelling
+/// (`[0:0:0:0:0:0:0:1]` → `[::1]`), which is what browsers send.
+fn split_origin_host_port(rest: &str) -> Result<(String, Option<u16>), String> {
+    if let Some(after_bracket) = rest.strip_prefix('[') {
+        let Some((inside, tail)) = after_bracket.split_once(']') else {
+            return Err("unterminated IPv6 literal; expected [address]".to_string());
+        };
+        let Ok(address) = inside.parse::<std::net::Ipv6Addr>() else {
+            return Err(format!("invalid IPv6 literal {inside:?}"));
+        };
+        let port = parse_origin_port(tail)?;
+        // Keep the brackets: they are part of the host as browsers send it.
+        return Ok((format!("[{address}]"), port));
+    }
+
+    match rest.split_once(':') {
+        Some((host, port)) => {
+            if host.contains(':') || port.contains(':') {
+                return Err("IPv6 literals must be bracketed, as [::1]".to_string());
+            }
+            Ok((host.to_string(), parse_origin_port(&format!(":{port}"))?))
+        }
+        None => Ok((rest.to_string(), None)),
+    }
+}
+
+fn parse_origin_port(tail: &str) -> Result<Option<u16>, String> {
+    if tail.is_empty() {
+        return Ok(None);
+    }
+    let Some(digits) = tail.strip_prefix(':') else {
+        return Err("expected scheme://host[:port]".to_string());
+    };
+    if digits.is_empty() {
+        return Err("origin port cannot be empty".to_string());
+    }
+    // `u16::from_str` accepts a leading `+`; a port is digits only.
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("invalid origin port {digits:?}"));
+    }
+    match digits.parse::<u16>() {
+        Ok(0) => Err("origin port cannot be 0".to_string()),
+        Ok(port) => Ok(Some(port)),
+        Err(_) => Err(format!("invalid origin port {digits:?}")),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2434,5 +2753,248 @@ target = "workbox"
         );
         assert_eq!(config.collect_diagnostics(), config.fleet.diagnostics());
         assert!(Config::default().collect_diagnostics().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod gateway_tests {
+    use super::*;
+
+    fn gateway(toml: &str) -> GatewayConfig {
+        toml::from_str(toml).expect("gateway section parses")
+    }
+
+    #[test]
+    fn defaults_are_loopback_and_clean() {
+        let config = GatewayConfig::default();
+        assert_eq!(config.bind, "127.0.0.1:7788");
+        assert_eq!(
+            config.bind_addr().map(|addr| addr.port()),
+            Some(7788),
+            "the default bind must parse"
+        );
+        assert!(config.allowed_origins.is_empty());
+        assert!(config.public_url.is_empty());
+        assert_eq!(config.auth_failure_limit, 5);
+        assert_eq!(config.auth_failure_window_secs, 60);
+        assert_eq!(config.pairing_ttl_secs, 600);
+        assert!(
+            config.diagnostics().is_empty(),
+            "{:?}",
+            config.diagnostics()
+        );
+        assert!(
+            Config::default().gateway.diagnostics().is_empty(),
+            "an absent [gateway] section is valid"
+        );
+    }
+
+    #[test]
+    fn every_bad_value_is_reported_once() {
+        let config = gateway(
+            r#"
+bind = "127.0.0.1"
+allowed_origins = ["https://ok.test", "http://x/path", "https://ok.test", "ftp://x.test"]
+public_url = "https://user@x.test"
+auth_failure_limit = 0
+auth_failure_window_secs = 0
+pairing_ttl_secs = 5
+"#,
+        );
+        let diagnostics = config.diagnostics();
+        assert_eq!(diagnostics.len(), 8, "{diagnostics:#?}");
+        assert!(diagnostics[0].contains("gateway.bind"), "{diagnostics:?}");
+        assert!(
+            diagnostics[1].contains("gateway.allowed_origins[1]")
+                && diagnostics[1].contains("path"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics[2].contains("gateway.allowed_origins[2]")
+                && diagnostics[2].contains("duplicate"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics[3].contains("gateway.allowed_origins[3]")
+                && diagnostics[3].contains("scheme"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics[4].contains("gateway.public_url") && diagnostics[4].contains("userinfo"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics[5].contains("auth_failure_limit"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics[6].contains("auth_failure_window_secs"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics[7].contains("pairing_ttl_secs") && diagnostics[7].contains("30..=86400"),
+            "{diagnostics:?}"
+        );
+
+        let config = gateway("auth_failure_limit = 0\nauth_failure_window_secs = 0\n");
+        let diagnostics = config.diagnostics();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("auth_failure_limit"));
+        assert!(diagnostics[1].contains("auth_failure_window_secs"));
+    }
+
+    #[test]
+    fn the_pairing_ttl_has_documented_bounds() {
+        assert!(gateway("pairing_ttl_secs = 30").diagnostics().is_empty());
+        assert!(gateway("pairing_ttl_secs = 86400").diagnostics().is_empty());
+        assert_eq!(gateway("pairing_ttl_secs = 29").diagnostics().len(), 1);
+        assert_eq!(gateway("pairing_ttl_secs = 86401").diagnostics().len(), 1);
+        assert_eq!(gateway("pairing_ttl_secs = 0").diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn gateway_diagnostics_reach_collect_diagnostics() {
+        let config: Config = toml::from_str("[gateway]\nbind = \"nope\"\n").expect("config parses");
+        let diagnostics = config.collect_diagnostics();
+        assert_eq!(diagnostics, config.gateway.diagnostics());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn effective_values_fall_back_to_the_documented_defaults() {
+        assert_eq!(DEFAULT_GATEWAY_BIND_ADDR.to_string(), DEFAULT_GATEWAY_BIND);
+        let defaults = GatewayConfig::default();
+        assert_eq!(defaults.effective_bind_addr(), DEFAULT_GATEWAY_BIND_ADDR);
+        assert_eq!(defaults.effective_auth_failure_limit(), 5);
+        assert_eq!(
+            defaults.effective_auth_failure_window(),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(defaults.effective_pairing_ttl_secs(), 600);
+
+        let bad = gateway(
+            "bind = \"nope\"\nauth_failure_limit = 0\nauth_failure_window_secs = 0\npairing_ttl_secs = 1\n",
+        );
+        assert_eq!(bad.diagnostics().len(), 4, "{:?}", bad.diagnostics());
+        assert_eq!(bad.effective_bind_addr(), DEFAULT_GATEWAY_BIND_ADDR);
+        assert_eq!(bad.effective_auth_failure_limit(), 5);
+        assert_eq!(
+            bad.effective_auth_failure_window(),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(bad.effective_pairing_ttl_secs(), 600);
+
+        let custom = gateway(
+            "bind = \"0.0.0.0:8080\"\nauth_failure_limit = 3\nauth_failure_window_secs = 10\npairing_ttl_secs = 30\n",
+        );
+        assert!(custom.diagnostics().is_empty());
+        assert_eq!(custom.effective_bind_addr().port(), 8080);
+        assert_eq!(custom.effective_auth_failure_limit(), 3);
+        assert_eq!(
+            custom.effective_auth_failure_window(),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(custom.effective_pairing_ttl_secs(), 30);
+    }
+
+    #[test]
+    fn origins_parse_scheme_host_and_optional_port() {
+        let origin = parse_gateway_origin("HTTPS://Fleet.Example.TS.net").expect("parses");
+        assert_eq!(origin.scheme, "https");
+        assert_eq!(origin.host, "fleet.example.ts.net");
+        assert_eq!(origin.port, None);
+        assert_eq!(origin.to_header_value(), "https://fleet.example.ts.net");
+
+        let origin = parse_gateway_origin("http://127.0.0.1:7788").expect("parses");
+        assert_eq!(origin.port, Some(7788));
+        assert_eq!(origin.to_header_value(), "http://127.0.0.1:7788");
+
+        let origin = parse_gateway_origin("http://[::1]:7788").expect("parses");
+        assert_eq!(origin.host, "[::1]");
+        assert_eq!(origin.port, Some(7788));
+        assert_eq!(origin.to_header_value(), "http://[::1]:7788");
+        assert_eq!(
+            parse_gateway_origin("http://[::1]").expect("parses").host,
+            "[::1]"
+        );
+    }
+
+    #[test]
+    fn origins_normalize_the_way_browsers_serialize_them() {
+        // A default port is what a browser omits, so it is folded away.
+        assert_eq!(
+            parse_gateway_origin("https://a.test:443").expect("parses"),
+            parse_gateway_origin("https://a.test").expect("parses")
+        );
+        assert_eq!(
+            parse_gateway_origin("http://a.test:80").expect("parses"),
+            parse_gateway_origin("http://a.test").expect("parses")
+        );
+        assert_eq!(
+            parse_gateway_origin("https://a.test:443")
+                .expect("parses")
+                .to_header_value(),
+            "https://a.test"
+        );
+        // The other scheme's default is not this scheme's default.
+        assert_eq!(
+            parse_gateway_origin("http://a.test:443")
+                .expect("parses")
+                .port,
+            Some(443)
+        );
+        assert_ne!(
+            parse_gateway_origin("https://a.test:8443").expect("parses"),
+            parse_gateway_origin("https://a.test").expect("parses")
+        );
+        // IPv6 literals compare in their compressed spelling.
+        assert_eq!(
+            parse_gateway_origin("http://[0:0:0:0:0:0:0:1]:7788").expect("parses"),
+            parse_gateway_origin("http://[::1]:7788").expect("parses")
+        );
+        // Leading zeros in a port are the same port; a sign is not a port.
+        assert_eq!(
+            parse_gateway_origin("http://a.test:07788")
+                .expect("parses")
+                .port,
+            Some(7788)
+        );
+        assert!(parse_gateway_origin("http://a.test:+80").is_err());
+        assert!(parse_gateway_origin("http://a.test:0").is_err());
+    }
+
+    #[test]
+    fn origins_reject_everything_a_browser_never_sends() {
+        for value in [
+            "",
+            "null",
+            "example.test",
+            "http://",
+            "https://example.test/",
+            "https://example.test/app",
+            "https://example.test?q=1",
+            "https://example.test#f",
+            "https://user:pw@example.test",
+            "ftp://example.test",
+            "file://example.test",
+            "https://example.test:70000",
+            "https://example.test:",
+            "https://example.test:https",
+            "https://::1:7788",
+            "https://[::1:7788",
+            "https://[not-an-address]:1",
+            "https://exa mple.test",
+            "https://a.test:+443",
+            "https://a.test:0",
+            "https://a.test:-1",
+            "https://\u{e9}xample.test",
+            "https://a.test\u{0}",
+            "https://a.test\t",
+        ] {
+            assert!(
+                parse_gateway_origin(value).is_err(),
+                "{value:?} must be refused"
+            );
+        }
     }
 }

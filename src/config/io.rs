@@ -8,6 +8,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "advanced",
     "experimental",
     "fleet",
+    "gateway",
     "keys",
     "onboarding",
     "remote",
@@ -358,9 +359,18 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         &mut invalid_sections,
         |section| config.fleet = section,
     );
+    load_live_section(
+        table,
+        "gateway",
+        "gateway config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.gateway = section,
+    );
 
     diagnostics.extend(config.theme.diagnostics());
     diagnostics.extend(config.fleet.diagnostics());
+    diagnostics.extend(config.gateway.diagnostics());
 
     Ok(LoadedConfig {
         config,
@@ -1153,6 +1163,61 @@ target = "workbox"
             ]
         );
         assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn live_config_loads_the_gateway_section_and_reports_its_diagnostics() {
+        let loaded = load_live_config_from_str(
+            r#"
+[gateway]
+bind = "0.0.0.0:7788"
+allowed_origins = ["https://fleet.example.ts.net"]
+"#,
+        )
+        .expect("live config parses");
+
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert_eq!(loaded.config.gateway.bind, "0.0.0.0:7788");
+        assert_eq!(loaded.config.gateway.allowed_origins.len(), 1);
+
+        let loaded = load_live_config_from_str(
+            "[gateway]\nbind = \"not-an-addr\"\nallowed_origins = [\"http://x/path\"]\nbnid = 1\n",
+        )
+        .expect("live config parses");
+
+        assert_eq!(
+            loaded.diagnostics,
+            vec![
+                "unknown config key gateway.bnid; ignoring key".to_string(),
+                "invalid gateway bind: gateway.bind = \"not-an-addr\"; expected ADDRESS:PORT (for \
+                 example 127.0.0.1:7788); using 127.0.0.1:7788"
+                    .to_string(),
+                "invalid gateway origin: gateway.allowed_origins[0] = \"http://x/path\"; origin \
+                 must not contain a path; ignoring this origin"
+                    .to_string(),
+            ]
+        );
+        assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn live_config_keeps_an_invalid_gateway_section_local_to_gateway() {
+        let loaded = load_live_config_from_str(
+            "[gateway]\nauth_failure_limit = \"many\"\n\n[ui]\nmouse_capture = false\n",
+        )
+        .expect("live config parses");
+
+        assert_eq!(loaded.diagnostics.len(), 1, "{:?}", loaded.diagnostics);
+        assert!(loaded.diagnostics[0].contains("invalid gateway config"));
+        assert_eq!(loaded.invalid_sections, vec!["gateway"]);
+        assert_eq!(
+            loaded.config.gateway.auth_failure_limit, 5,
+            "gateway stays at defaults"
+        );
+        assert!(
+            !loaded.config.ui.mouse_capture,
+            "other sections still apply"
+        );
     }
 
     #[test]
