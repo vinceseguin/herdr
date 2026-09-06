@@ -17,12 +17,6 @@
 //!   exist, and a pairing code with a wrong secret all produce the same
 //!   outcome, and none of them deletes a file.
 
-// Consumed by PR 4 (`TokenStore::verify_bearer`, `DeviceStore::verify_cookie`,
-// `AuthLimiter`, `Principal`) and PR 8 (`PairingStore`, `DeviceStore::insert`,
-// `TokenStore::rotate`). Every item is exercised by this module's tests; the
-// allow only covers the non-test build until those PRs call them.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
@@ -80,6 +74,9 @@ impl TokenScope {
 
     /// Both scopes, control first so a presented secret is checked against the
     /// stronger one before the weaker one.
+    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
+    // caller; until then only this module's tests reach it.
+    #[allow(dead_code)]
     pub fn all() -> [TokenScope; 2] {
         [TokenScope::Control, TokenScope::Read]
     }
@@ -114,6 +111,9 @@ impl TokenDigest {
     }
 
     /// Lowercase hex, for the records that persist a digest.
+    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
+    // caller; until then only this module's tests reach it.
+    #[allow(dead_code)]
     pub fn to_hex(self) -> String {
         let mut out = String::with_capacity(64);
         for byte in self.0 {
@@ -242,6 +242,9 @@ impl TokenStore {
     }
 
     /// Load both token files without creating anything.
+    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
+    // caller; until then only this module's tests reach it.
+    #[allow(dead_code)]
     pub fn load(dir: &Path) -> io::Result<Self> {
         paths::verify_private_dir(dir)?;
         Self::from_digests(
@@ -296,6 +299,9 @@ impl TokenStore {
     ///
     /// The caller is responsible for revoking that scope's devices
     /// ([`DeviceStore::revoke_scope`]) and for reloading the store.
+    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
+    // caller; until then only this module's tests reach it.
+    #[allow(dead_code)]
     pub fn rotate(dir: &Path, scope: TokenScope) -> io::Result<()> {
         paths::create_private_dir(dir)?;
         let secret = random_secret_hex()?;
@@ -304,6 +310,9 @@ impl TokenStore {
 
     /// The digest of one scope's token, for tests and for PR 8's rotation
     /// check that the file really changed.
+    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
+    // caller; until then only this module's tests reach it.
+    #[allow(dead_code)]
     pub fn digest(&self, scope: TokenScope) -> TokenDigest {
         match scope {
             TokenScope::Read => self.read,
@@ -401,6 +410,9 @@ impl DeviceStore {
         Ok(Self { path, devices })
     }
 
+    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
+    // caller; until then only this module's tests reach it.
+    #[allow(dead_code)]
     pub fn devices(&self) -> &[DeviceRecord] {
         &self.devices
     }
@@ -432,6 +444,9 @@ impl DeviceStore {
 
     /// Mint a device: returns the cookie value `<id>.<secret>`, which the
     /// caller hands to the browser once and cannot recover afterwards.
+    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
+    // caller; until then only this module's tests reach it.
+    #[allow(dead_code)]
     pub fn insert(&mut self, scope: TokenScope, label: &str, now_unix: u64) -> io::Result<String> {
         let id = random_secret_hex()?;
         let secret = random_secret_hex()?;
@@ -450,6 +465,9 @@ impl DeviceStore {
     /// Forget every device of `scope`, returning how many were removed. Called
     /// by `rotate-token`: rotating a token must not leave cookies behind that
     /// still carry the scope it granted.
+    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
+    // caller; until then only this module's tests reach it.
+    #[allow(dead_code)]
     pub fn revoke_scope(&mut self, scope: TokenScope) -> io::Result<usize> {
         let before = self.devices.len();
         self.devices.retain(|record| record.scope != scope);
@@ -461,6 +479,9 @@ impl DeviceStore {
     }
 
     /// Forget one device by id, returning whether it existed.
+    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
+    // caller; until then only this module's tests reach it.
+    #[allow(dead_code)]
     pub fn revoke_id(&mut self, id: &str) -> io::Result<bool> {
         let before = self.devices.len();
         self.devices.retain(|record| record.id != id);
@@ -500,6 +521,9 @@ impl DeviceRecord {
 
 /// Keep a device label printable and bounded; it is user input that ends up in
 /// a JSON file and in `herdr gateway status`.
+// PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first caller;
+// until then only this module's tests reach it.
+#[allow(dead_code)]
 fn sanitize_label(label: &str) -> String {
     label
         .chars()
@@ -512,6 +536,9 @@ fn sanitize_label(label: &str) -> String {
 
 /// One outstanding pairing code, as stored in `pairings/<id>.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first caller;
+// until then only this module's tests reach it.
+#[allow(dead_code)]
 pub struct PairingCode {
     pub id: String,
     pub secret_sha256: String,
@@ -521,6 +548,9 @@ pub struct PairingCode {
 
 /// Why a pairing code was not accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first caller;
+// until then only this module's tests reach it.
+#[allow(dead_code)]
 pub enum PairingError {
     /// No such code — including a real id presented with the wrong secret, so
     /// guessing an id teaches nothing.
@@ -547,10 +577,16 @@ impl std::fmt::Display for PairingError {
 
 /// `pairings/`: one `0600` file per outstanding `herdr gateway pair` code.
 #[derive(Debug)]
+// PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first caller;
+// until then only this module's tests reach it.
+#[allow(dead_code)]
 pub struct PairingStore {
     dir: PathBuf,
 }
 
+// PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first caller;
+// until then only this module's tests reach it.
+#[allow(dead_code)]
 impl PairingStore {
     pub fn new(gateway_dir: &Path) -> Self {
         Self {
@@ -661,6 +697,7 @@ impl PairingStore {
     }
 }
 
+#[allow(dead_code)] // PR 8; see `PairingStore`.
 impl PairingCode {
     fn digest(&self) -> Option<TokenDigest> {
         TokenDigest::from_hex(&self.secret_sha256)
@@ -672,6 +709,9 @@ impl PairingCode {
 ///
 /// The id becomes a file name, so this is also the path-traversal guard: `.`,
 /// `..`, `/` and `\` cannot survive the hex check.
+// PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first caller;
+// until then only this module's tests reach it.
+#[allow(dead_code)]
 fn split_code(code_text: &str) -> Option<(&str, &str)> {
     let (id, secret) = code_text.split_once('.')?;
     if !is_secret_hex(id) || !is_secret_hex(secret) {
@@ -680,6 +720,9 @@ fn split_code(code_text: &str) -> Option<(&str, &str)> {
     Some((id, secret))
 }
 
+// PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first caller;
+// until then only this module's tests reach it.
+#[allow(dead_code)]
 fn is_secret_hex(value: &str) -> bool {
     value.len() == SECRET_HEX_LEN && value.bytes().all(|byte| hex_value(byte).is_some())
 }
@@ -751,6 +794,8 @@ impl AuthLimiter {
     }
 
     /// Peers currently tracked. Exposed for tests and for PR 4's metrics.
+    // Read by this module's tests and by PR 8's `herdr gateway status`.
+    #[allow(dead_code)]
     pub fn tracked_peers(&self) -> usize {
         self.peers.len()
     }

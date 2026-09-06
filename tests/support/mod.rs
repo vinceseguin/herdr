@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 /// Driver for `scripts/fork/fleet-lab.sh`, shared by the fork lab tests.
 pub mod fleet_lab;
+/// Driver for a real `herdr gateway` process, shared by the fork gateway tests.
+pub mod gateway;
 
 static PID_REGISTRY: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 static RUNTIME_DIR_REGISTRY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();

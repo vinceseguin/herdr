@@ -31,6 +31,9 @@ fn env_bool(name: &str) -> Option<bool> {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    // The gateway embeds `web/dist` with `include_bytes!`; a rebuilt web app
+    // must therefore re-run this build script.
+    println!("cargo:rerun-if-changed=web/dist");
     println!("cargo:rerun-if-changed=vendor/libghostty-vt.vendor.json");
     println!("cargo:rerun-if-changed=vendor/libghostty-vt/build.zig");
     println!("cargo:rerun-if-changed=vendor/libghostty-vt/build.zig.zon");

@@ -16,11 +16,6 @@
 //!   exactly; a request without one (curl, a native client) passes this check
 //!   and is decided by its token alone, because only browsers attach `Origin`.
 
-// Consumed by PR 4: `BindPolicy::check` gates startup and `OriginAllowlist`
-// backs the router's origin middleware. The types are exercised by this
-// module's tests; the allow only covers the non-test build until then.
-#![allow(dead_code)]
-
 use std::net::{IpAddr, SocketAddr};
 
 use crate::config::{parse_gateway_origin, GatewayConfig, GatewayOrigin};
@@ -142,12 +137,17 @@ impl OriginAllowlist {
     }
 
     /// The allowed origins, for `GET /api/gateway` and `herdr gateway status`.
+    // PR 8 (`herdr gateway pair` / `status` / `rotate-token`) is the first
+    // caller; until then only this module's tests reach it.
+    #[allow(dead_code)]
     pub fn origins(&self) -> &[GatewayOrigin] {
         &self.origins
     }
 
     /// Whether device cookies minted for this gateway must be `Secure`: true
     /// when the advertised public origin is https.
+    // PR 8 mints the device cookie this decides the `Secure` flag of.
+    #[allow(dead_code)]
     pub fn requires_secure_cookies(config: &GatewayConfig) -> bool {
         parse_gateway_origin(&config.public_url).is_ok_and(|origin| origin.scheme == "https")
     }
