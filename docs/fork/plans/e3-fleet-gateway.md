@@ -672,7 +672,7 @@ exactly these E1 contracts (verified in the code):
 | 5 | feat(gateway): websocket fleet event stream | C · Streams | 4 | ✅ |
 | 6 | feat(gateway): websocket terminal observe stream over per-host transports | C · Streams | 4 | ✅ |
 | 7 | feat(gateway): terminal control mode gated by the control scope | C · Streams | 6 | ✅ |
-| 8 | feat(gateway): pairing urls with qr codes, device cookies, status and token rotation | D · Ops | 4 | ⬜ |
+| 8 | feat(gateway): pairing urls with qr codes, device cookies, status and token rotation | D · Ops | 4 | ✅ |
 | 9 | feat(fleet): opt-in hosts from saved machine profiles | D · Ops | 3 | ✅ |
 | 10 | docs: gateway guide, systemd unit, adr e3 review, roadmap drift | E · Docs | 5, 7, 8, 9 | ⬜ |
 
@@ -2795,6 +2795,147 @@ rotate lines, the `ls -l` modes. Never paste the URL or the cookie.
 - `herdr gateway status --json` fields are additive (`running`, `pid`,
   `listen`, `devices`, `pairings_pending`).
 
+**Landed** (merged; gate `EXIT=0` for both `ci` and `ci-no-default`)
+
+- **Rotation really is "no restart needed", and it cost more than the plan
+  thought.** `AuthState.tokens` is a `Mutex<TokenStore>`, and **both**
+  `TokenStore` and `DeviceStore` now remember the `FileStamp` (length, mtime,
+  and the inode on unix) of the files they were read from and reload when
+  another process replaces them. The device half is not optional: `rotate-token`
+  runs in a *separate process*, so without it a running gateway would keep
+  honouring a revoked cookie **and** write the revoked records back the next
+  time the middleware persisted `last_seen`. The freshness check is two `stat`s
+  on the requests that present a bearer token, and one on the requests that
+  present a cookie; a full re-read happens only when a stamp changed. Stamps
+  are taken **before** the read, so a file replaced mid-read is reloaded next
+  time rather than missed forever. A reload that fails keeps the digests
+  already in memory and logs at `warn` (fail-open, recorded below).
+  `DeviceStore::persist` sets its stamp to `None` rather than re-stat'ing what
+  is on disk: adopting a concurrent writer's stamp would hide that write from
+  every later refresh. `DeviceStore::refresh` returns whether it reloaded, and
+  the debounced `last_seen` writer drops its pending write when it did.
+- **`rotate-token` revokes three things, in this order:** the token file, then
+  the scope's **pending pairing codes**, then the scope's devices. The plan
+  listed only the last two. A code outstanding when the token rotates would
+  otherwise mint a device carrying exactly the authority the operator just took
+  back, and a code redeemed after the device sweep would survive the rotation
+  entirely. Only a redemption already in flight remains. The command reads the
+  store back and refuses (exit 1) if the token file did not actually change, so
+  a no-op rotation never revokes anything.
+- **CLI surface, as shipped.** `herdr gateway pair [--control] [--ttl-secs N]
+  [--label TEXT] [--no-qr] [--invert] [--json]`, `herdr gateway status
+  [--json]`, `herdr gateway rotate-token <read|control>`. Exit codes: 0 success,
+  1 refusal (unusable store, no address to advertise, a rotation that did not
+  change the file), 2 usage, **3** `status` with no gateway running. Two
+  additions to the plan's list: `--invert` (a QR code is dark modules on a light
+  field and a terminal draws blocks in its *foreground* colour, so the default
+  is correct on a light terminal and unscannable on a dark one), and `--label`
+  travelling with the code — `PairingCode` gained a `#[serde(default)] label`
+  because the device record is created when the code is redeemed, on a machine
+  the operator is not typing at.
+- **The pairing URL's base**, in order: `[gateway] public_url` (through
+  `parse_gateway_origin`, so casing folds, a default port disappears and a path
+  is refused by name), else the **running gateway's own `gateway.json`
+  `listen`** — which is the only source that knows the port after `--bind …:0`,
+  and is what makes the integration tests work — else `[gateway] bind`. A
+  wildcard address or port 0 with no running gateway is a refusal naming
+  `public_url`, never a URL that cannot work. A loopback base prints a warning
+  on stderr, and so does a `pair` with no gateway running.
+- **`GET /pair?code=…` contract E4/E5 build on.** `303` with `Location: /`
+  (static, so it cannot become an open redirect), `Cache-Control: no-store`,
+  `nosniff`, and `Set-Cookie: herdr_gateway_device=<id>.<secret>; Path=/;
+  HttpOnly; SameSite=Strict; Max-Age=31536000[; Secure]`. `Secure` when
+  `public_url` is https (`OriginAllowlist::requires_secure_cookies`) or when the
+  request carried `X-Forwarded-Proto: https` **from a loopback peer** (`tailscale
+  serve`). Failures: `403 {"error":"pairing_invalid"}` for unknown, malformed and
+  already-redeemed, `403 {"error":"pairing_expired"}` for a code whose window
+  passed, `400 {"error":"pairing_required"}` when `?code=` is absent or the query
+  is malformed, `429` with `Retry-After` when the peer is blocked. The route is
+  public (a `GET` outside `/api/`), so it runs the failure limiter **itself**: a
+  bad or expired code counts, a missing one does not. `consume` runs *before* the
+  sweep so an expired code says so — and because `consume` compares the secret in
+  constant time before it looks at the clock, only the holder of the whole code
+  can tell expired from invalid.
+- **`/api/gateway` gained `via` (`"bearer"`/`"device"`) as well as the plan's
+  `device: {id, label}`**, which is present only for a device principal.
+  `GatewayInfo::features()` is now `["fleet", "events", "terminal", "pairing"]`.
+  `DeviceRecord.id` is 64 hex characters, not the plan's 8: PR 2 shipped
+  `insert` that way and a longer id is only better.
+- **`herdr gateway status --json`** is
+  `{"schema":"herdr.gateway.status.v1","running","healthy","pid","listen",
+  "devices":{"read","control"},"pairings_pending"}`; `schema` and `healthy` are
+  additions to the plan's list. `running` is "the recorded pid is alive"
+  (`crate::platform::process_exists`), which is how a `gateway.json` left by a
+  crash is refused — by `status`, and by `pair` when it looks for a port.
+  `healthy` is a real `GET /health` on the recorded address, over a hand-rolled
+  `TcpStream` request (the epic's dependency budget has no HTTP client): one
+  shared 2 s deadline, reads until the status line is complete, a wildcard bind
+  dialled on loopback.
+- **Every `#[allow(dead_code)]` that named PR 8 is gone.** Items this PR
+  consumes lost the attribute; the ones it does not (`TokenScope::all`,
+  `PairingStore::dir`, `paths::verify_private_file`, `OriginAllowlist::origins`,
+  `AuthLimiter::tracked_peers`) became `#[cfg(test)]`, which is what they always
+  were. `DeviceStore::revoke_id` keeps a narrow allow naming the revoke-device
+  command that is not E3's. `http::ApiError::{with_message, code}` are consumed.
+  `server::shutdown_signal`'s `#[cfg(not(unix))]` arm carries the scoped
+  `clippy::manual_async_fn` allow PR 6 asked for, with PR 4's "must not be an
+  `async fn`" reason, so `just windows-lint` no longer fails on it.
+- **The review pass fixed six things**, all now the contract: the `last_seen`
+  write that could resurrect a revoked device; `persist` adopting a concurrent
+  writer's stamp; the rotation order above; `herdr gateway pair` creating
+  `<config>/gateway/` with the process umask when it ran before the daemon ever
+  had (`create_private_dir` makes missing *parents* with the umask — the files
+  inside were always `0600`, the names were not); a `/health` probe that decided
+  on one `read` (a split status line read as "no answer", and its per-read
+  timeout let a dribbling peer hold the command); and a stale-marker integration
+  test that wrote `gateway.json` `0644`, so it was refused for its mode and never
+  reached the pid check it is about.
+- **Accepted, recorded rather than fixed** (PR 10 documents them): a token or
+  device file that cannot be *reloaded* leaves the digests already in memory in
+  force (fail-open, logged at `warn`; the alternative locks every client out, and
+  an attacker who can break the file already has write access to the gateway
+  directory — any further change retries). On Windows a stamp has no inode and a
+  token file is always 64 bytes, so two rotations inside one mtime tick could be
+  missed. `pair`/`status`/`rotate-token` do **not** take `--config`; the store
+  follows `XDG_CONFIG_HOME` either way and `pair` prefers the running gateway's
+  marker, but a daemon started with `--config` could have a `public_url` these
+  commands do not see. A one-time `GET` URL is burned by a link previewer.
+- **The plan's `fable` review model was out of quota** (HTTP 429 on two
+  attempts), so the mandated hardening pass ran on `opus` with the same
+  security-reviewer brief. Recorded here because the model assignment above asks
+  for `fable` on this PR.
+- **Real-server evidence** (fleet lab, 2 local sessions, gateway on
+  `127.0.0.1:7798`, `HERDR_FLEET_LAB_ROOT=/tmp/herdr-fleet-lab-e3-pr8`):
+  `status` before startup printed `not running` / `read 0, control 0` /
+  `0 pending` and exited **3**, `--json` keys `['devices','healthy','listen',
+  'pairings_pending','pid','running','schema']`; `pair --json` keys
+  `['expires_unix','scope','url']` with `scope read` and `expires_in_s=599`, the
+  URL based on the **bound** address with a 129-character `code` parameter;
+  `pair` text was the sentence, the URL line, a **31-line, 61-column** QR code
+  and the one-time note; redeeming it gave `303` → `http://127.0.0.1:7798/` with
+  `Set-Cookie` attributes `['Path','HttpOnly','SameSite','Max-Age']` (no
+  `Secure`, plain http) plus `cache-control: no-store` and `nosniff`, and curl's
+  jar recorded the `#HttpOnly_` marker; the cookie got `200` on `/api/fleet` and
+  `/api/gateway` `scope: read via: device device.id_len: 64`, `features
+  ['fleet','events','terminal','pairing']`; the second `GET` on the same URL was
+  `403 pairing_invalid`; `status` then reported `running (pid …)`, `health: ok`,
+  `devices: read 1, control 0`, `pairings: 1 pending`, exit **0**;
+  `rotate-token read` printed `rotated the read token; revoked 1 device and 1
+  pending pairing code` and the running gateway answered `401` to the old cookie,
+  `200` to the freshly written token and `200` to the untouched control token —
+  **no restart**, with `reloaded the paired devices…` and `reloaded the gateway
+  token store…` in its log; a second pass with the fleet fully connected paired a
+  `--control --label "kitchen tablet"` device that read
+  `herdr.fleet.status.v1` with `[('lab-1','connected'),('lab-2','connected')]`,
+  and `rotate-token control` left the read token at `200`; `--no-qr` printed 3
+  lines, `--invert` printed 31 QR lines whose first row is solid; `rotate-token
+  bogus`, `rotate-token` with no scope and `status --nope` all exited 2; the
+  store was `drwx------` for `gateway/` and `pairings/` and `-rw-------` for
+  `read.token`, `control.token`, `devices.json` and `gateway.json`, with
+  `pairings/` empty after the rotation; `SIGTERM` exited **0**, removed
+  `gateway.json`, and the daemon's whole log held **zero** non-`gateway` lines
+  and no secret.
+
 ### PR 9 — feat(fleet): opt-in hosts from saved machine profiles · deps: 3
 
 > **Landed** (`feat/e3-pr9-fleet-machine-hosts`). What later PRs must know:
@@ -2994,6 +3135,22 @@ E2E validation covers it otherwise).
   else.
 
 ### PR 10 — docs: gateway guide, systemd unit, adr e3 review, roadmap drift · deps: 5, 7, 8, 9
+
+> **From PR 8 (landed):** `docs/fork/gateway.md` must say that `pair` also
+> takes `--invert` (a QR code is unscannable on a dark terminal without it) and
+> `--label`, that `status` exits **3** when nothing is running and reports
+> `healthy` from a real `/health` probe, that `rotate-token` revokes the scope's
+> **pending pairing codes** as well as its devices and takes effect on the
+> running gateway's next request with **no restart**, and that
+> `pair`/`status`/`rotate-token` ignore `--config` (they follow
+> `XDG_CONFIG_HOME` like the token store, and `pair` prefers the running
+> gateway's `gateway.json` for the address). Document the two accepted
+> fail-open behaviours: a token or device file that cannot be *reloaded* leaves
+> the credentials already in memory in force, and a Windows stamp has no inode.
+> Error codes to add to the reference: `pairing_invalid`, `pairing_expired`,
+> `pairing_required`. The dead-code allows this PR was to clean up are gone
+> except `DeviceStore::revoke_id`, which names a revoke-device command outside
+> E3.
 
 **Goal:** the user-facing reference for everything E3 shipped, the example
 `systemd --user` unit, the ADR's E3 review, and factual drift fixed in the
