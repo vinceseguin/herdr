@@ -121,7 +121,7 @@ pub(crate) fn run(args: &[String]) -> io::Result<i32> {
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, path);
     }
 
-    crate::logging::init_file_logging("herdr-gateway.log");
+    init_gateway_logging();
 
     let loaded = Config::load();
     for diagnostic in &loaded.diagnostics {
@@ -163,6 +163,25 @@ pub(crate) fn run(args: &[String]) -> io::Result<i32> {
         tokens,
         devices,
     ))
+}
+
+/// Logs go to stderr, which is where a supervisor collects a foreground
+/// daemon's output (systemd's journal, a container's log, the operator's
+/// terminal). Herdr's other long-running roles log to files because they own a
+/// terminal and cannot; a gateway does not have that problem.
+///
+/// `HERDR_LOG` overrides the filter, which by default carries this module's
+/// `gateway` target as well as `herdr` — the shared file-logging default is
+/// `herdr=info` alone, which would silently drop every line below.
+fn init_gateway_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("HERDR_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("herdr=info,gateway=info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_target(true)
+        .try_init();
 }
 
 /// Everything that needs the runtime: the fleet, the listener, the server.
@@ -207,6 +226,11 @@ async fn serve_until_signal(
         info: std::sync::Arc::new(GatewayInfo::new(listen, &config.gateway)),
     };
 
+    // Before the address is announced, so nothing that reacts to that line can
+    // beat the signal handlers into place; the future itself is only awaited
+    // by `serve`.
+    let shutdown = server::shutdown_signal();
+
     let marker = gateway_dir.join(paths::RUNTIME_FILE);
     if let Err(error) = write_runtime_marker(&marker, listen) {
         // Not fatal: the marker is how `herdr gateway status` finds a running
@@ -219,7 +243,7 @@ async fn serve_until_signal(
     let _ = std::io::stdout().flush();
     tracing::info!(target: "gateway", listen = %listen, "gateway listening");
 
-    let outcome = server::serve(listener, state, server::shutdown_signal()).await;
+    let outcome = server::serve(listener, state, shutdown).await;
 
     tracing::info!(target: "gateway", "gateway stopping");
     fleet.shutdown().await;

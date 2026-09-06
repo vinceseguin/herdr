@@ -141,38 +141,62 @@ where
     .await
 }
 
-/// Resolves on Ctrl-C, or on `SIGTERM` (what systemd and `kill` send).
-pub(crate) async fn shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::warn!(target: "gateway", error = %error, "could not listen for ctrl-c");
-            // Never resolve: a broken ctrl-c handler must not look like a
-            // shutdown request.
-            std::future::pending::<()>().await;
-        }
-    };
+/// A future that resolves on `SIGINT` (Ctrl-C) or `SIGTERM` (what systemd and
+/// `kill` send).
+///
+/// **Registration happens in this call, not on the first poll.** The caller
+/// prints its listen address before it starts serving, and a supervisor — or a
+/// test — that stops the process the instant it sees that line would otherwise
+/// race a lazily installed handler and hit the default disposition, killing
+/// the gateway instead of draining it.
+///
+/// A signal that cannot be registered is logged and then never fires, so a
+/// broken handler looks like "no shutdown request", never like one.
+#[cfg(unix)]
+pub(crate) fn shutdown_signal() -> impl Future<Output = ()> + Send + 'static {
+    use tokio::signal::unix::{signal, Signal, SignalKind};
 
-    #[cfg(unix)]
-    {
-        let terminate = async {
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(mut signal) => {
-                    signal.recv().await;
-                }
-                Err(error) => {
-                    tracing::warn!(target: "gateway", error = %error, "could not listen for SIGTERM");
-                    std::future::pending::<()>().await;
-                }
+    fn register(kind: SignalKind, name: &'static str) -> Option<Signal> {
+        match signal(kind) {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                tracing::warn!(
+                    target: "gateway",
+                    error = %error,
+                    signal = name,
+                    "could not listen for this signal; it will not stop the gateway"
+                );
+                None
             }
-        };
-        tokio::select! {
-            () = ctrl_c => {}
-            () = terminate => {}
         }
     }
-    #[cfg(not(unix))]
-    {
-        ctrl_c.await;
+
+    let mut interrupt = register(SignalKind::interrupt(), "SIGINT");
+    let mut terminate = register(SignalKind::terminate(), "SIGTERM");
+
+    async move {
+        match (interrupt.as_mut(), terminate.as_mut()) {
+            (Some(interrupt), Some(terminate)) => {
+                tokio::select! {
+                    _ = interrupt.recv() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            (Some(only), None) | (None, Some(only)) => {
+                only.recv().await;
+            }
+            (None, None) => std::future::pending::<()>().await,
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn shutdown_signal() -> impl Future<Output = ()> + Send + 'static {
+    async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(target: "gateway", error = %error, "could not listen for ctrl-c");
+            std::future::pending::<()>().await;
+        }
     }
 }
 
