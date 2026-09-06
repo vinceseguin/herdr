@@ -378,7 +378,7 @@ the binary, commands and paths stay `herdr`.
 | 4 | feat: herdr fleet opens the client shell over the fleet connector | B · Console loop | 2, 3 | ✅ |
 | 5 | feat(fleet): sidebar host groups with live status and click-to-switch | C · Fleet UX | 4 | ✅ |
 | 6 | feat(fleet): host picker overlay and fleet.keys host_picker binding | C · Fleet UX | 5 | ✅ |
-| 7 | feat(fleet): host-aware notifications and cross-host notification targets | C · Fleet UX | 5 | ⬜ |
+| 7 | feat(fleet): host-aware notifications and cross-host notification targets | C · Fleet UX | 5 | ✅ |
 | 8 | feat(fleet): reconnect notice for the active host and resize on reconnect | C · Fleet UX | 5 | ✅ |
 | 9 | docs: fleet console guide, adr e2 review, roadmap drift | D · Docs | 6, 7, 8 | ⬜ |
 
@@ -1863,11 +1863,103 @@ python3 scripts/fork/tui-drive.py … --expect 'herdr-fleet-lab:lab-1' --expect 
 bash scripts/fork/fleet-lab.sh down
 ```
 
+**As built (PR 7, merged).** Deviations from the shapes above, all deliberate:
+
+- **The host travels on a fifth `Translated` variant, not on the frozen wire
+  type.** `translate` keeps the ids and returns
+  `Translated::Notification { host, notification }`; `src/client/mod.rs`'s
+  `handle_fleet_event` gains one arm that calls fork-owned
+  `fleet::deliver_notification`, which is the loop's
+  `ServerMessage::SemanticNotification` arm with the host added (effects
+  through `handle_shell_notification_effects`, then `present` when the shell
+  asked to repaint). Reusing the upstream arm was not possible: it calls
+  `receive_notification`, which has no host. The helper returns whether it
+  recomposed so the arm never composes the same console frame twice.
+- **`receive_notification` became a one-line delegation.**
+  `receive_notification_from(host: Option<HostId>, event, now)` in
+  `notifications.rs` is the old body; `receive_notification` passes `None` and
+  is byte-for-byte the single-host behaviour, and
+  `ClientShellState::receive_fleet_notification(host, event, now)` in
+  `shell/fleet.rs` is the console's wrapper. The console passes `Some(host)`
+  for **every** host, the active one included, so nothing downstream infers a
+  host.
+- **Dedup is host-qualified.** Replacing "the notification for this pane"
+  compares the host too: `w1:p1` exists on every server, so without it one
+  machine's agent silently dropped another's toast. A test pins that two hosts
+  keep two pending notifications and that a host still replaces its own.
+- **`notification_target_is_active` is false for any host that is not on
+  screen**, and `notification_still_current` for such a host is answered by
+  `FleetSidebarModel::agent_status`. Both take the `ClientPendingNotification`
+  (not the bare event) so the host is in hand.
+- **`agent_status` reads a new `HostGroup::agent_statuses`, not the rows.**
+  Found by the `fable` review: a named agent view (`agent_view_label`) filters
+  a group's `agents`, so validating against the rows turned a still-blocked
+  agent on another host into a stale toast — a divergence from upstream, which
+  validates against `snapshot.agents`. `agent_statuses` is every agent of that
+  host's last snapshot, built once per rebuild, and is part of `HostGroup`'s
+  equality so a hidden agent's status change still fails `same_rows` and
+  installs the rebuilt model.
+- **A host-qualified notification that arrives before the console has a fleet
+  view is treated as belonging elsewhere** (also from the review): it is shown,
+  never validated against the shell's own snapshot, and `prefix+o` dismisses it
+  without a switch or a focus. Unreachable in practice — a host is `Connected`,
+  and that change installs the model, before it can notify — but it was the one
+  branch where a remote pane id could still have reached `pane.focus`.
+- **`open_fleet_notification_target` returns "the fleet path owns this"**, not
+  an action. `true` also covers a notification that names no pane and a host
+  that `switch_action` refuses (disabled, unknown), so the caller can never
+  fall through to `pane.focus` with another machine's id. The click path
+  (`mouse.rs` → `focus_visible_notification`) and `prefix+o` share it.
+- **Notifications are still cleared by `reset_for_host_switch`**, PR 5's
+  behaviour, even though a host-qualified notification would now survive a
+  switch safely. Keeping them is a UX change outside this PR's spec.
+- No new upstream file beyond the plan's list; `src/client/mod.rs` gains one
+  match arm (it already carries PR 4/5 fleet wiring). `src/protocol/**` and
+  `tests/fixtures/endpoint-*` untouched; `SemanticNotification` unchanged.
+
+**Real-server evidence (PR 7).** Two lab hosts, console on lab-1, notification
+triggered on lab-2 with the server's own semantic path — `herdr --session lab-2
+pane report-agent <pane> --source fleet-pr7 --agent codex --state blocked`
+(a transition into `Blocked` is what `forward_semantic_agent_transition` turns
+into a `NeedsAttention` with a workspace, tab and pane id). With `[ui.toast]
+delivery = "herdr"` the console drew
+
+```
+┌─────────────────────────────────┐
+│● [lab-2] codex needs attention  │
+│  lab-2 · 1                      │
+└─────────────────────────────────┘
+```
+
+while `herdr-fleet-lab:lab-1` was still the pane area; `\x02o` gave
+`switching to lab-2…`, then `▾ lab-2 · 1 blocked` with a `codex` agent row and
+lab-2's own `herdr-fleet-lab:lab-2` prompt. Sound: with `HERDR_DISABLE_SOUND`
+unset and a fake `paplay` first on `PATH`, `[ui.sound] enabled = true` played
+the request sound once (`paplay /tmp/herdr-sound-<pid>-0.mp3`) and
+`enabled = false` played nothing — the existing gate is untouched by the fleet
+path.
+
 **Downstream**
 
 - E6's push and E4's toasts take the host from `FleetEvent::Notification`,
   the same source; the `[host]` prefix is a TUI presentation choice, not a
-  server fact.
+  server fact. **As built:** the host reaches the shell on
+  `Translated::Notification`, and `ClientPendingNotification.host` /
+  `ClientVisibleNotification.host` are where it lives after that — a second
+  consumer takes the host from the event, never from the active host.
+- **Any new "is this notification still worth showing" rule must ask the
+  sender's host.** `FleetSidebarModel::agent_status` (backed by
+  `HostGroup::agent_statuses`, every agent, not the filtered panel) is that
+  question's only sanctioned answer for a host the console is not drawing.
+- **PR 9:** `docs/fork/fleet.md` documents the `[host]` prefix on *every*
+  notification including the active host's, that `prefix+o` (and a click on
+  the toast) on another host's notification switches to that host and focuses
+  the pane there, that toasts need `[ui.toast] delivery` set (they are `off`
+  by default, which is why the console shows nothing out of the box), that
+  sound follows `[ui.sound]` unchanged, and that a host switch clears the
+  notifications on screen. The trigger for a manual walkthrough is
+  `herdr --session <lab> pane report-agent <pane> --source X --agent codex
+  --state blocked`.
 
 ### PR 8 — feat(fleet): reconnect notice for the active host and resize on reconnect · deps: 5
 

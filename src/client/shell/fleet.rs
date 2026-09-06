@@ -34,10 +34,14 @@ use ratatui::{
 use crate::fleet::hosts::HostId;
 use crate::fleet::refs::{FleetPaneRef, FleetWorkspaceRef};
 use crate::fleet::sidebar::{FleetSidebarModel, HostRowState};
-use crate::protocol::{ClientShellSnapshot, FrameData, PaneSurfaceFrame};
+use crate::protocol::{
+    ClientShellSnapshot, FrameData, PaneSurfaceFrame, SemanticNotification,
+    SemanticNotificationKind,
+};
 
 use super::{
-    ClientShellAction, ClientShellConfig, ClientShellInput, ClientShellState, ShellHitMap,
+    ClientShellAction, ClientShellConfig, ClientShellInput, ClientShellNotificationEffect,
+    ClientShellState, ClientVisibleNotification, ShellHitMap,
 };
 
 /// A clickable fleet row, always naming the host it belongs to.
@@ -672,6 +676,129 @@ impl ClientShellState {
         let mut outcome = ClientShellInput::default();
         self.push_endpoint_method(method, &mut outcome);
         outcome
+    }
+
+    // -----------------------------------------------------------------------
+    // Notifications (E2 PR 7)
+    //
+    // A notification names a pane, a tab and a workspace *on the machine that
+    // sent it*. In a console those ids reach a shell whose projection is
+    // another host's, where the same strings mean different things — every
+    // herdr server starts at `w1`/`w1:p1`. So the host travels beside the
+    // frozen wire event, and the three questions the shell asks about a
+    // notification are answered against that host: is it still current, is the
+    // user already looking at it, and what does opening it do.
+    // -----------------------------------------------------------------------
+
+    /// Take one host's notification.
+    ///
+    /// The console calls this for *every* host, the active one included, so
+    /// nothing downstream has to infer which machine an id belongs to. The
+    /// title already carries the `[host] ` prefix (`client::fleet::translate`):
+    /// which machine is asking is the point of a fleet notification.
+    pub(crate) fn receive_fleet_notification(
+        &mut self,
+        host: HostId,
+        event: SemanticNotification,
+        now: std::time::Instant,
+    ) -> (Vec<ClientShellNotificationEffect>, bool) {
+        self.receive_notification_from(Some(host), event, now)
+    }
+
+    /// The host of a notification whose ids must *not* be resolved against
+    /// this shell's snapshot, if that is what this is.
+    ///
+    /// `None` for a notification with no host (the single-host client: one
+    /// server, so its ids can only mean that one) and for the active host —
+    /// the shell's own snapshot is the right thing to resolve those against.
+    /// `Some` for every other host, and also for a host-qualified notification
+    /// that arrives before the console has installed a fleet view: nothing
+    /// then says the host on screen is the one that sent it, and the safe
+    /// answer is that its ids belong elsewhere — it cannot be opened here.
+    pub(super) fn remote_fleet_notification_host<'a>(
+        &self,
+        host: Option<&'a HostId>,
+    ) -> Option<&'a HostId> {
+        let host = host?;
+        match self.fleet.as_ref() {
+            Some(fleet) if fleet.is_active(host) => None,
+            _ => Some(host),
+        }
+    }
+
+    /// Whether this notification came from a host the shell is not showing.
+    pub(super) fn is_remote_fleet_notification(&self, host: Option<&HostId>) -> bool {
+        self.remote_fleet_notification_host(host).is_some()
+    }
+
+    /// Whether another host's notification still describes that host.
+    ///
+    /// Answered from the row model — the console's only view of a machine it
+    /// is not showing — and never from `self.snapshot`, which is the *active*
+    /// host's and would answer about a different agent that happens to share
+    /// the pane id. A host whose model has no such agent (it has not sent a
+    /// projection, or the agent is gone) suppresses the notification, exactly
+    /// as an unknown pane does for the single-host client.
+    pub(super) fn fleet_notification_still_current(
+        &self,
+        host: &HostId,
+        event: &SemanticNotification,
+    ) -> bool {
+        let Some(pane_id) = event.pane_id.as_deref() else {
+            return true;
+        };
+        let Some(fleet) = self.fleet.as_ref() else {
+            return false;
+        };
+        let pane = FleetPaneRef::new(host.clone(), pane_id);
+        let Some(status) = fleet.model.agent_status(&pane) else {
+            return false;
+        };
+        match event.kind {
+            SemanticNotificationKind::NeedsAttention => {
+                status == crate::api::schema::AgentStatus::Blocked
+            }
+            SemanticNotificationKind::Finished => matches!(
+                status,
+                crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
+            ),
+            SemanticNotificationKind::UpdateInstalled | SemanticNotificationKind::Custom => true,
+        }
+    }
+
+    /// Open a notification that belongs to another host: switch there, then
+    /// focus its pane.
+    ///
+    /// Returns whether the fleet path owns this notification. `true` also
+    /// covers the cases where nothing can be done (the notification names no
+    /// pane, or that host can no longer be switched to): the caller must not
+    /// fall through to `pane.focus`, which would send another machine's pane
+    /// id to the one on screen.
+    ///
+    /// The focus itself is deferred by the loop
+    /// (`FleetClientState::pending_focus`), which sends it once the target
+    /// host has installed a projection.
+    pub(super) fn open_fleet_notification_target(
+        &self,
+        notification: &ClientVisibleNotification,
+        outcome: &mut ClientShellInput,
+    ) -> bool {
+        let Some(host) = self.remote_fleet_notification_host(notification.host.as_ref()) else {
+            return false;
+        };
+        let Some(pane_id) = notification.event.pane_id.clone() else {
+            tracing::debug!(%host, "a fleet notification with no pane cannot be opened");
+            return true;
+        };
+        match self.switch_action(host.clone(), Some(FleetFocusTarget::Pane(pane_id))) {
+            Some(action) => {
+                outcome.actions.push(ClientShellAction::Fleet(action));
+            }
+            None => {
+                tracing::debug!(%host, "cannot open a notification for this fleet host");
+            }
+        }
+        true
     }
 
     /// Tell the loop that the agent-panel sort changed, if this is a console.
