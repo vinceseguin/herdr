@@ -192,9 +192,10 @@ impl FleetSidebarModel {
     }
 
     /// Status of one agent, addressed across hosts.
-    // Read by host-aware notifications (E2 PR 7) to decide whether a toast for
-    // another host's agent is still worth showing.
-    #[allow(dead_code)]
+    ///
+    /// Read by host-aware notifications (E2 PR 7) to decide whether a toast
+    /// for another host's agent is still worth showing: that host's rows are
+    /// the console's only view of a machine it is not currently drawing.
     pub fn agent_status(&self, pane: &FleetPaneRef) -> Option<AgentStatus> {
         self.group(&pane.host)?
             .agents

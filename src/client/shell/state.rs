@@ -776,11 +776,21 @@ pub(super) struct ClientPendingNotification {
     pub(super) event: SemanticNotification,
     pub(super) deadline: std::time::Instant,
     pub(super) validate_state: bool,
+    /// The Fleet host that sent this (fork, E2 PR 7); `None` for the
+    /// single-host client, which has exactly one server.
+    ///
+    /// `SemanticNotification` is a frozen wire type, so the host travels
+    /// beside it: the ids inside it are that host's, and validating or
+    /// focusing them against another machine's projection is the mis-route
+    /// this field exists to prevent.
+    pub(super) host: Option<crate::fleet::hosts::HostId>,
 }
 
 pub(super) struct ClientVisibleNotification {
     pub(super) event: SemanticNotification,
     pub(super) deadline: std::time::Instant,
+    /// The Fleet host that sent this; see [`ClientPendingNotification::host`].
+    pub(super) host: Option<crate::fleet::hosts::HostId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

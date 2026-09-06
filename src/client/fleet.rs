@@ -57,6 +57,14 @@ pub(super) enum Translated {
         request_id: String,
         result: Result<Vec<u8>, String>,
     },
+    /// A notification from one host, with the host it belongs to.
+    ///
+    /// Not a plain `Server(SemanticNotification)`: the wire type is frozen and
+    /// carries no host, and its ids mean nothing without one.
+    Notification {
+        host: HostId,
+        notification: Box<crate::protocol::SemanticNotification>,
+    },
     /// Fleet-model changes only: nothing for the shell to draw yet.
     Changes(Vec<FleetChange>),
     /// Not this host's business: dropped, and logged.
@@ -259,6 +267,29 @@ pub(super) fn sync_switching_notice(state: &mut ClientState) -> bool {
 }
 
 /// Compose and present, after something that changed the console's chrome.
+/// Deliver one host's notification to the shell, with its host.
+///
+/// The loop's `ServerMessage::SemanticNotification` arm cannot be reused: it
+/// hands the event to `receive_notification`, which has no host and would let
+/// the shell resolve another machine's ids against the active host's
+/// projection. Everything else it does — the effects, the repaint — is the
+/// same, and is done here once (E2 PR 7).
+pub(super) fn deliver_notification(
+    state: &mut ClientState,
+    host: HostId,
+    notification: crate::protocol::SemanticNotification,
+) {
+    let Some(shell) = state.shell.as_mut() else {
+        return;
+    };
+    let (effects, repaint) =
+        shell.receive_fleet_notification(host, notification, std::time::Instant::now());
+    super::notifications::handle_shell_notification_effects(effects, &state.sound_config);
+    if repaint {
+        present(state);
+    }
+}
+
 pub(super) fn present(state: &mut ClientState) {
     let Some(frame) = state
         .shell
@@ -558,22 +589,20 @@ fn translate_event(state: &mut FleetState, active: &HostId, event: FleetEvent) -
             Translated::Server(message)
         }
         // Every host may notify: which machine is asking is the point, so the
-        // title carries the host. Targeting (clicking one, on another host) is
-        // E2 PR 7.
+        // title carries the host — the active one included, so the console is
+        // consistent about it.
+        //
+        // The ids stay. They are that host's, and the host travels with them
+        // (`Translated::Notification`), so the shell validates and opens them
+        // against the right machine instead of resolving `w1:p1` against
+        // whatever the console happens to be showing (E2 PR 7).
         FleetEvent::Notification { host, notification } => {
             let mut notification = *notification;
             notification.title = format!("[{host}] {}", notification.title);
-            if host != *active {
-                // The shell resolves a notification's ids against the *active*
-                // host's snapshot: a `w1:p1` on another machine would be
-                // validated against, suppressed by, and — on click — focused
-                // on this one. Until PR 7 targets across hosts, another
-                // host's notification is informational only.
-                notification.workspace_id = None;
-                notification.tab_id = None;
-                notification.pane_id = None;
+            Translated::Notification {
+                host,
+                notification: Box::new(notification),
             }
-            Translated::Server(Box::new(ServerMessage::SemanticNotification(notification)))
         }
         FleetEvent::EndpointResponse {
             host,
@@ -1214,13 +1243,11 @@ mod tests {
             },
         );
 
-        let Translated::Server(message) = translated else {
-            panic!("notifications from every host reach the shell");
+        let Translated::Notification { host, notification } = translated else {
+            panic!("notifications from every host reach the shell, with their host");
         };
-        assert!(matches!(
-            *message,
-            ServerMessage::SemanticNotification(event) if event.title == "[beta] agent is blocked"
-        ));
+        assert_eq!(host, host_id("beta"));
+        assert_eq!(notification.title, "[beta] agent is blocked");
     }
 
     fn targeted_notification(title: &str) -> Box<SemanticNotification> {
@@ -1233,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn an_inactive_hosts_notification_keeps_no_target_the_active_host_could_resolve() {
+    fn an_inactive_hosts_notification_keeps_its_target_beside_its_host() {
         let mut state = fleet();
         let active = host_id("alpha");
 
@@ -1246,22 +1273,26 @@ mod tests {
             },
         );
 
-        let Translated::Server(message) = translated else {
-            panic!("notifications from every host reach the shell");
+        let Translated::Notification { host, notification } = translated else {
+            panic!("notifications from every host reach the shell, with their host");
         };
-        let ServerMessage::SemanticNotification(event) = *message else {
-            panic!("a notification stays a notification");
-        };
-        assert_eq!(event.title, "[beta] agent is blocked");
+        assert_eq!(host, host_id("beta"));
+        assert_eq!(notification.title, "[beta] agent is blocked");
         assert_eq!(
-            event.agent.as_deref(),
+            notification.agent.as_deref(),
             Some("claude"),
             "the agent name is display, kept"
         );
+        // The ids are kept — and they are only safe *because* the host travels
+        // with them. PR 4 cleared them here; the shell now resolves them
+        // against beta's own rows (`ClientShellState::receive_fleet_notification`).
         assert_eq!(
-            (event.workspace_id, event.tab_id, event.pane_id),
-            (None, None, None),
-            "ids are the other host's: the shell would validate, suppress or focus them on the active host"
+            (
+                notification.workspace_id.as_deref(),
+                notification.tab_id.as_deref(),
+                notification.pane_id.as_deref()
+            ),
+            (Some("w1"), Some("w1:t1"), Some("w1:p1")),
         );
     }
 
@@ -1279,16 +1310,14 @@ mod tests {
             },
         );
 
-        let Translated::Server(message) = translated else {
-            panic!("notifications from every host reach the shell");
+        let Translated::Notification { host, notification } = translated else {
+            panic!("notifications from every host reach the shell, with their host");
         };
-        let ServerMessage::SemanticNotification(event) = *message else {
-            panic!("a notification stays a notification");
-        };
-        assert_eq!(event.title, "[alpha] agent is blocked");
-        assert_eq!(event.pane_id.as_deref(), Some("w1:p1"));
-        assert_eq!(event.workspace_id.as_deref(), Some("w1"));
-        assert_eq!(event.tab_id.as_deref(), Some("w1:t1"));
+        assert_eq!(host, host_id("alpha"));
+        assert_eq!(notification.title, "[alpha] agent is blocked");
+        assert_eq!(notification.pane_id.as_deref(), Some("w1:p1"));
+        assert_eq!(notification.workspace_id.as_deref(), Some("w1"));
+        assert_eq!(notification.tab_id.as_deref(), Some("w1:t1"));
     }
 
     #[test]

@@ -211,6 +211,7 @@ fn surface_with_popup() -> PaneSurfaceFrame {
 mod agents_worktrees_notifications;
 mod chrome_context;
 mod copy;
+mod fleet_notifications;
 mod fleet_picker;
 mod fleet_reconnect;
 mod fleet_scale;

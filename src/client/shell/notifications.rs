@@ -253,6 +253,13 @@ impl ClientShellState {
             return;
         };
         outcome.repaint = true;
+        // A Fleet console's notification may name a pane on another machine.
+        // Its ids mean nothing here, so the console switches host first and
+        // focuses there; anything the fleet path claims must not fall through
+        // to the active host's `pane.focus` below (fork, E2 PR 7).
+        if self.open_fleet_notification_target(&notification, outcome) {
+            return;
+        }
         if let Some(pane_id) = notification.event.pane_id {
             self.push_endpoint_method(
                 crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget { pane_id }),
@@ -266,6 +273,21 @@ impl ClientShellState {
         event: SemanticNotification,
         now: std::time::Instant,
     ) -> (Vec<ClientShellNotificationEffect>, bool) {
+        self.receive_notification_from(None, event, now)
+    }
+
+    /// The body of [`ClientShellState::receive_notification`], with the Fleet
+    /// host the event came from (fork, E2 PR 7).
+    ///
+    /// `None` is the single-host client: one server, so an id can only ever
+    /// mean one machine. A console passes `Some(host)` for *every* host,
+    /// including the active one, so nothing downstream has to guess.
+    pub(super) fn receive_notification_from(
+        &mut self,
+        host: Option<crate::fleet::hosts::HostId>,
+        event: SemanticNotification,
+        now: std::time::Instant,
+    ) -> (Vec<ClientShellNotificationEffect>, bool) {
         let delay = if event.kind == SemanticNotificationKind::Custom {
             0
         } else {
@@ -274,14 +296,19 @@ impl ClientShellState {
         let deadline = now
             .checked_add(std::time::Duration::from_secs(delay))
             .unwrap_or(now);
+        // A pane id is only unique *per host*: every herdr server starts at
+        // `w1:p1`, so replacing "the notification for this pane" without
+        // comparing the host would let one machine's agent silently drop
+        // another's toast.
         let cleared_visible = event.pane_id.as_deref().is_some_and(|pane_id| {
-            self.visible_notification
-                .as_ref()
-                .is_some_and(|visible| visible.event.pane_id.as_deref() == Some(pane_id))
+            self.visible_notification.as_ref().is_some_and(|visible| {
+                visible.event.pane_id.as_deref() == Some(pane_id) && visible.host == host
+            })
         });
         if let Some(pane_id) = event.pane_id.as_deref() {
-            self.pending_notifications
-                .retain(|pending| pending.event.pane_id.as_deref() != Some(pane_id));
+            self.pending_notifications.retain(|pending| {
+                pending.event.pane_id.as_deref() != Some(pane_id) || pending.host != host
+            });
             if cleared_visible {
                 self.visible_notification = None;
             }
@@ -290,6 +317,7 @@ impl ClientShellState {
             event,
             deadline,
             validate_state: delay > 0,
+            host,
         });
         let (effects, repaint) = self.tick_notifications(now);
         (effects, repaint || cleared_visible)
@@ -324,10 +352,10 @@ impl ClientShellState {
                 self.pending_notifications.push(pending);
                 continue;
             }
-            if pending.validate_state && !self.notification_still_current(&pending.event) {
+            if pending.validate_state && !self.notification_still_current(&pending) {
                 continue;
             }
-            let target_active = self.notification_target_is_active(&pending.event);
+            let target_active = self.notification_target_is_active(&pending);
             let suppress_external = target_active && self.outer_focused != Some(false);
             if let Some(sound) = pending.event.sound {
                 let suppress_sound =
@@ -355,6 +383,7 @@ impl ClientShellState {
                     self.visible_notification = Some(ClientVisibleNotification {
                         event: pending.event,
                         deadline: now + std::time::Duration::from_secs(duration),
+                        host: pending.host,
                     });
                     repaint = true;
                 }
@@ -377,7 +406,17 @@ impl ClientShellState {
         (effects, repaint)
     }
 
-    fn notification_target_is_active(&self, event: &SemanticNotification) -> bool {
+    /// Whether the user is already looking at what this notification is about.
+    ///
+    /// Only ever true for the machine the shell is showing: another Fleet
+    /// host's focused tab is not on screen, and its ids would be compared
+    /// against the active host's projection — where `w1` means a different
+    /// workspace entirely (fork, E2 PR 7).
+    fn notification_target_is_active(&self, pending: &ClientPendingNotification) -> bool {
+        if self.is_remote_fleet_notification(pending.host.as_ref()) {
+            return false;
+        }
+        let event = &pending.event;
         let Some(snapshot) = self.snapshot.as_deref() else {
             return false;
         };
@@ -389,7 +428,15 @@ impl ClientShellState {
         })
     }
 
-    fn notification_still_current(&self, event: &SemanticNotification) -> bool {
+    /// Whether the state that produced this notification still holds.
+    ///
+    /// For another Fleet host that question is answered by *that host's* row
+    /// model, never by the active host's agents (fork, E2 PR 7).
+    fn notification_still_current(&self, pending: &ClientPendingNotification) -> bool {
+        if let Some(host) = self.remote_fleet_notification_host(pending.host.as_ref()) {
+            return self.fleet_notification_still_current(host, &pending.event);
+        }
+        let event = &pending.event;
         let Some(pane_id) = event.pane_id.as_deref() else {
             return true;
         };
@@ -420,6 +467,7 @@ mod tests {
 
     fn notification() -> ClientVisibleNotification {
         ClientVisibleNotification {
+            host: None,
             event: SemanticNotification {
                 kind: SemanticNotificationKind::Custom,
                 title: "notice".into(),
