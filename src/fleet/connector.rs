@@ -174,6 +174,17 @@ impl FleetConnectorOptions {
     /// the ssh child's stderr to `/dev/null` instead of inheriting the
     /// daemon's. The handshake stays [`HandshakeParams::read_only`], so every
     /// host sees a passive client.
+    ///
+    /// The switch reaches the *bridged* ssh children — the ones that carry the
+    /// endpoint stream. It does not reach the short-lived discovery commands
+    /// `SshTransport` runs first (`uname`, the binary probe): those go through
+    /// `remote::attach`'s interactive `RemoteSsh`, whose output is piped (so
+    /// nothing is painted on a daemon's stderr) but which has no `BatchMode`.
+    /// Against a host that cannot authenticate without a prompt, that probe
+    /// blocks its own supervisor thread — host-local, exactly as a hung ssh
+    /// probe is elsewhere — and no other host or reader is affected. Closing
+    /// it needs a constructor in `src/remote/`, which E3 deliberately leaves
+    /// untouched.
     // The gateway is this constructor's only production caller, and it is
     // compiled out by `--no-default-features`. The allow is therefore scoped to
     // exactly that build rather than being unconditional, so a future default

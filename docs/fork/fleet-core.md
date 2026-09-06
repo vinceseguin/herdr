@@ -523,6 +523,17 @@ A full-screen consumer is in the same position as a daemon — an ssh warning on
 the inherited stderr is painted straight over the TUI — so it uses
 `ssh_noninteractive: true` as well.
 
+The flag covers the **bridged** ssh children, which is where the endpoint stream
+and the inherited stderr live. It does **not** cover the short discovery
+commands an ssh transport runs first (`uname -s`, the remote-binary probe):
+those use `remote::attach`'s interactive `RemoteSsh`, which pipes stdout *and*
+stderr — so nothing is painted on a daemon's terminal — but does not force
+`BatchMode`. A host that cannot authenticate without a prompt therefore blocks
+its own supervisor thread there, which is the same host-local outcome as any
+other hung ssh probe: no other host, reader or request is affected, and
+`shutdown` detaches the thread. Closing it needs a noninteractive constructor
+in `src/remote/`, which E3 leaves untouched on purpose.
+
 ## Reconnecting
 
 Every host has its own supervisor thread and its own backoff, and every failure

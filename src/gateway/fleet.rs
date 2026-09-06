@@ -172,7 +172,7 @@ impl FleetRuntime {
     ///
     /// The join is blocking (it waits on OS threads), so it runs on
     /// `spawn_blocking` rather than on a runtime worker: a request in flight
-    /// must never be stalled by a host that is slow to hang up. Both waits are
+    /// must never be stalled by a host that is slow to hang up. Every wait is
     /// bounded — a shutdown that cannot complete logs and detaches rather than
     /// hanging the process.
     pub async fn shutdown(self) {
@@ -182,10 +182,13 @@ impl FleetRuntime {
             connector,
             handle,
         } = self;
-        // Subscribers see the stream end when the last sender is dropped; the
-        // fold task holds one and drops it as it exits.
+        // Latch the stop *before* releasing this handle, and with
+        // `send_replace` rather than `send`: `watch::Sender::send` leaves the
+        // value untouched when it happens to see no receivers, and the latch is
+        // what ends every stream — including one a handle cloned earlier opens
+        // after this point. Only then drop the runtime's own handle.
+        let _ = stop.send_replace(true);
         drop(handle);
-        let _ = stop.send(true);
         if tokio::time::timeout(FOLD_STOP_TIMEOUT, &mut task)
             .await
             .is_err()
@@ -196,8 +199,20 @@ impl FleetRuntime {
             );
             task.abort();
             // Awaiting the aborted handle is what drops the task's future, and
-            // with it the connector's event receiver.
-            let _ = task.await;
+            // with it the connector's event receiver. Bounded too: `abort`
+            // can only take effect at a yield point, so a task that somehow
+            // never reaches one must not turn this wait into a hang. The
+            // connector's own shutdown tolerates a receiver that is still
+            // alive (it detaches after its bounded wait).
+            if tokio::time::timeout(FOLD_STOP_TIMEOUT, &mut task)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    target: "gateway",
+                    "the fleet fold task did not stop after being aborted; detaching it"
+                );
+            }
         }
 
         match tokio::time::timeout(
@@ -710,6 +725,59 @@ mod tests {
         assert_eq!(agent.pane.host(), &host("alpha"));
         assert_ne!(agent.agent_status, AgentStatus::Unknown);
     }
+
+    /// A panic while the state lock is held poisons it. A daemon must survive
+    /// that: the next reader recovers the guard and answers, rather than every
+    /// later request panicking too.
+    #[test]
+    fn a_poisoned_state_lock_still_answers_readers() {
+        let (handle, _stop) = test_handle(FleetState::new(vec![spec("alpha")]), 4);
+        let poisoner = {
+            let handle = handle.clone();
+            std::thread::spawn(move || {
+                let _guard = lock(&handle.state);
+                panic!("a reader panicked while holding the fleet state");
+            })
+        };
+        assert!(poisoner.join().is_err(), "the thread must have panicked");
+        assert!(
+            handle.state.is_poisoned(),
+            "the panic must have poisoned the lock"
+        );
+
+        assert_eq!(handle.report().hosts.len(), 1);
+        assert!(handle.host_spec(&host("alpha")).is_some());
+        let mut stream = handle.subscribe();
+        handle.apply(&host("alpha"), connected());
+        assert_eq!(kinds(&drain(&mut stream)), vec!["host_connection"]);
+    }
+
+    /// An invalid `[fleet]` section is an operator error, not a host failure —
+    /// and it is refused before a single supervisor thread is spawned.
+    ///
+    /// Pure: `start` returns on the `resolve_hosts` error before it reaches the
+    /// connector, so this covers every platform, not only the socket ones.
+    #[tokio::test]
+    async fn an_invalid_fleet_section_is_a_config_error() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[fleet]
+include_local = true
+
+[[fleet.hosts]]
+name = "local"
+kind = "local"
+"#,
+        )
+        .expect("config parses");
+        let diagnostics = FleetRuntime::start(&config).err().expect(
+            "a [fleet] section that names `local` while include_local is on must not start",
+        );
+        assert!(
+            !diagnostics.is_empty(),
+            "the error must carry the diagnostics"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -818,6 +886,15 @@ mod socket_tests {
                 vec![false],
                 "the gateway's hello must be passive on the wire"
             );
+            // Passivity is a property of what was *sent*, not only of the
+            // hello's flag: the runtime clears the active host, and a cleared
+            // host whose announced geometry already matches is not resized.
+            assert!(
+                !received
+                    .iter()
+                    .any(|message| matches!(message, ClientMessage::ClientShellResize { .. })),
+                "a gateway must never resize a host: {received:?}"
+            );
 
             let stopped = Instant::now();
             fleet.shutdown().await;
@@ -826,9 +903,11 @@ mod socket_tests {
                 "shutdown took {:?}",
                 stopped.elapsed()
             );
-            // The last sender went with the runtime, so the stream ends rather
-            // than hanging a WebSocket task forever — after the subscriber has
-            // read whatever was already queued for it.
+            // The stop latch the runtime set ends the stream rather than
+            // hanging a WebSocket task forever — after the subscriber has read
+            // whatever was already queued for it. (The broadcast sender is
+            // still alive: every `FleetHandle` holds one, and in the gateway a
+            // handle outlives the runtime.)
             let ended = loop {
                 match tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
                     Ok(None) => break true,
@@ -904,31 +983,5 @@ mod socket_tests {
         });
         drop(alpha);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// An invalid `[fleet]` section is an operator error, not a host failure.
-    #[test]
-    fn an_invalid_fleet_section_is_a_config_error() {
-        let config: crate::config::Config = toml::from_str(
-            r#"
-[fleet]
-include_local = true
-
-[[fleet.hosts]]
-name = "local"
-kind = "local"
-"#,
-        )
-        .expect("config parses");
-        let runtime = runtime();
-        let diagnostics = runtime.block_on(async {
-            FleetRuntime::start(&config).err().expect(
-                "a [fleet] section that names `local` while include_local is on must not start",
-            )
-        });
-        assert!(
-            !diagnostics.is_empty(),
-            "the error must carry the diagnostics"
-        );
     }
 }

@@ -109,6 +109,12 @@ impl HandshakeParams {
             // A console *is* looking at whichever host is active, and the
             // connector activates one; a foreground client is what makes the
             // active host render at the console's geometry.
+            //
+            // One hello serves every host, so a console's *inactive* hosts
+            // announce `true` as well. They are protected by the value, not
+            // the flag: they handshake at
+            // [`crate::fleet::connector::INACTIVE_SURFACE`], which is the
+            // geometry a headless host already uses.
             surface_active: true,
             read_timeout: LOCAL_HANDSHAKE_READ_TIMEOUT,
         }
