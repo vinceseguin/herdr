@@ -17,19 +17,13 @@
 
 mod assets;
 mod auth;
-// PR 4 consumes `FleetRuntime::{start, handle, shutdown}` and
-// `FleetHandle::report`, but the module's streaming half is still unreached:
-// `ChangeStream`/`ChangeItem` and `FleetHandle::subscribe_with_report` are
-// PR 5's (`/api/events`), and `host_connection`/`host_spec` are PR 6's
-// (`/api/terminal/{host}/{pane}`). Those items live in `fleet.rs`, which PR 4
-// does not otherwise touch, so the allow stays on this declaration until PR 6
-// has landed rather than becoming a scatter of per-item attributes there.
-#[allow(dead_code)]
+mod events;
 mod fleet;
 mod http;
 mod middleware;
 mod paths;
 mod policy;
+mod protocol;
 mod run;
 mod server;
 

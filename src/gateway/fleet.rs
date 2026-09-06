@@ -62,9 +62,31 @@ const CONNECTOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// get a [`FleetHandle`] clone.
 pub struct FleetRuntime {
     task: JoinHandle<()>,
-    stop: watch::Sender<bool>,
+    /// Shared so [`FleetRuntime::stopper`] can hand out a latch that outlives
+    /// this struct's borrow — the process's shutdown future needs to end every
+    /// stream *before* the HTTP server drains, and it cannot own the runtime.
+    stop: Arc<watch::Sender<bool>>,
     connector: FleetConnector,
     handle: FleetHandle,
+}
+
+/// A latch that ends every [`ChangeStream`], without owning the runtime.
+///
+/// The gateway's shutdown future holds one: an open WebSocket keeps the HTTP
+/// server's graceful shutdown waiting, so the streams have to be told the fleet
+/// is going away first. Latching early is safe — [`FleetRuntime::shutdown`]
+/// sets the same flag and is what actually joins anything.
+#[derive(Clone)]
+pub struct FleetStopper(Arc<watch::Sender<bool>>);
+
+impl FleetStopper {
+    /// Tell every subscriber the fleet is stopping. Idempotent.
+    pub fn stop(&self) {
+        // `send_replace`, not `send`: `send` leaves the value untouched when it
+        // sees no receivers, and the latch must hold for a stream opened after
+        // this point.
+        let _ = self.0.send_replace(true);
+    }
 }
 
 /// A cheap, cloneable reader of the fleet.
@@ -153,7 +175,7 @@ impl FleetRuntime {
 
         Self {
             task,
-            stop,
+            stop: Arc::new(stop),
             connector,
             handle,
         }
@@ -162,6 +184,11 @@ impl FleetRuntime {
     /// A reader for handlers to clone.
     pub fn handle(&self) -> FleetHandle {
         self.handle.clone()
+    }
+
+    /// A latch the caller can pull when the process is stopping.
+    pub fn stopper(&self) -> FleetStopper {
+        FleetStopper(Arc::clone(&self.stop))
     }
 
     /// Stop the fold task, then every host supervisor.
@@ -249,6 +276,9 @@ impl FleetHandle {
     ///
     /// Handlers use it to fail a request fast (a terminal on a host that is
     /// down is a stream-local error, never a 5xx) without building a report.
+    // PR 6 (`/api/terminal/{host}/{pane}`) is the first caller outside this
+    // module's tests; the allow goes with that PR.
+    #[allow(dead_code)]
     pub fn host_connection(&self, host: &HostId) -> Option<HostConnection> {
         lock(&self.state)
             .host(host)
@@ -259,6 +289,8 @@ impl FleetHandle {
     ///
     /// This is how a terminal stream learns *what* to open (a local session, an
     /// ssh target) without a second copy of the host list living in the gateway.
+    // PR 6, as above.
+    #[allow(dead_code)]
     pub fn host_spec(&self, host: &HostId) -> Option<HostSpec> {
         lock(&self.state).host(host).map(|host| host.spec.clone())
     }
@@ -323,6 +355,37 @@ impl FleetHandle {
                 "dropping a fleet change that would not serialize"
             ),
         }
+    }
+}
+
+/// Test-only constructors, so another module's tests can drive a real
+/// `FleetHandle` without a connector, a socket or a tokio runtime.
+///
+/// A separate `#[cfg(test)]` impl block, like `AppState`'s own test helpers:
+/// nothing in a release build can reach these, and the production impl above
+/// stays exactly the reader surface a handler sees.
+#[cfg(test)]
+impl FleetHandle {
+    /// A handle over `state`, with a broadcast channel of exactly `capacity`.
+    ///
+    /// The stop sender comes back with the handle: dropping it is what a
+    /// stopped runtime looks like, so a test that wants a live stream has to
+    /// hold it, exactly as [`FleetRuntime`] does.
+    pub(crate) fn test_new(state: FleetState, capacity: usize) -> (Self, watch::Sender<bool>) {
+        let (changes, _) = broadcast::channel(capacity);
+        let (stop, stop_rx) = watch::channel(false);
+        let handle = Self {
+            state: Arc::new(Mutex::new(state)),
+            changes,
+            stop: stop_rx,
+            client_version: Arc::from("0.0.0-test"),
+        };
+        (handle, stop)
+    }
+
+    /// Fold one host event in, exactly as the fold task would.
+    pub(crate) fn test_apply(&self, host: &HostId, event: HostEvent) {
+        self.apply(host, event);
     }
 }
 
@@ -466,15 +529,7 @@ mod tests {
     /// stopped runtime looks like, so a test that wants a live stream has to
     /// hold it, exactly as `FleetRuntime` does.
     fn test_handle(state: FleetState, capacity: usize) -> (FleetHandle, watch::Sender<bool>) {
-        let (changes, _) = broadcast::channel(capacity);
-        let (stop, stop_rx) = watch::channel(false);
-        let handle = FleetHandle {
-            state: Arc::new(Mutex::new(state)),
-            changes,
-            stop: stop_rx,
-            client_version: Arc::from("0.0.0-test"),
-        };
-        (handle, stop)
+        FleetHandle::test_new(state, capacity)
     }
 
     fn connected() -> HostEvent {
@@ -814,17 +869,6 @@ mod socket_tests {
                 _ => None,
             })
             .collect()
-    }
-
-    async fn wait_for(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if condition() {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        condition()
     }
 
     /// A real socket, a real handshake, a real fold: the host reports

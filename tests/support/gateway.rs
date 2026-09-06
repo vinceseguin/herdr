@@ -261,6 +261,45 @@ impl Gateway {
         parse_response(&raw)
     }
 
+    /// Run `scripts/fork/ws-client.py` against this gateway with the `read`
+    /// bearer token, to completion.
+    ///
+    /// The python client is the fork's only WebSocket implementation (no
+    /// dependency for something the tests and the epic validation drive by
+    /// hand), and it prints one line per message: `text <payload>`,
+    /// `binary <hex|length>` or `close <code>`.
+    pub fn ws(&self, path: &str, args: &[&str]) -> Output {
+        self.ws_with(path, &[("Authorization", &self.authorization())], args)
+    }
+
+    /// [`Self::ws`] with exactly the headers given — no token is added, so a
+    /// test can drive the unauthenticated and foreign-origin paths, and a
+    /// control-scope test can present its own bearer.
+    pub fn ws_with(&self, path: &str, headers: &[(&str, &str)], args: &[&str]) -> Output {
+        self.ws_spawn(path, headers, args)
+            .wait_with_output()
+            .expect("run ws-client.py")
+    }
+
+    /// [`Self::ws_with`], left running — for a test that has to change the
+    /// world (stop a host, type into a pane) while the socket is open.
+    pub fn ws_spawn(&self, path: &str, headers: &[(&str, &str)], args: &[&str]) -> Child {
+        let mut command = Command::new("python3");
+        command
+            .arg(ws_client_script())
+            .arg(format!("ws://{}{path}", self.addr));
+        for (name, value) in headers {
+            command.arg("--header").arg(format!("{name}: {value}"));
+        }
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ws-client.py")
+    }
+
     /// Ask the gateway to stop, and return its exit code.
     pub fn stop(&mut self) -> Option<i32> {
         let mut child = self.child.take()?;
@@ -297,6 +336,30 @@ impl Drop for Gateway {
             super::unregister_spawned_herdr_pid(Some(pid));
         }
     }
+}
+
+/// The repository's WebSocket stand-in.
+pub fn ws_client_script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("fork")
+        .join("ws-client.py")
+}
+
+/// The stdout lines of a `ws-client.py` run, one per message.
+pub fn ws_lines(output: &Output) -> Vec<String> {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The JSON of a `text <payload>` line, or a panic naming what was there.
+pub fn ws_text_json(line: &str) -> serde_json::Value {
+    let payload = line
+        .strip_prefix("text ")
+        .unwrap_or_else(|| panic!("not a text message: {line}"));
+    serde_json::from_str(payload).unwrap_or_else(|err| panic!("not JSON ({err}): {payload}"))
 }
 
 fn send_sigterm(pid: u32) {
