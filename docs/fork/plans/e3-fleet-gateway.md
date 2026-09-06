@@ -666,7 +666,7 @@ exactly these E1 contracts (verified in the code):
 | # | Title | Group | Depends on | Status |
 | --- | --- | --- | --- | --- |
 | 1 | chore: add gateway cargo feature with axum, qrcode and token dependencies | A · Foundations | — | ✅ |
-| 2 | feat(gateway): gateway config section, token store, bind and origin policy | A · Foundations | 1 | ⬜ |
+| 2 | feat(gateway): gateway config section, token store, bind and origin policy | A · Foundations | 1 | ✅ |
 | 3 | feat(gateway): passive async fleet runtime folding connector events into shared state | A · Foundations | 1 | ⬜ |
 | 4 | feat(gateway): herdr gateway serves health, fleet report and embedded assets over http | B · HTTP | 2, 3 | ⬜ |
 | 5 | feat(gateway): websocket fleet event stream | C · Streams | 4 | ⬜ |
@@ -1197,6 +1197,82 @@ first consumed by PR 4).
   `--tailscale` only computes them).
 - File names under `<config>/gateway/` are fixed; E6 adds `vapid.json` and
   `subscriptions.json` beside them using the same `write_private_file`.
+
+**Landed** (merged; gate `EXIT=0` for both `ci` and `ci-no-default`, and
+`just windows-lint` `EXIT=0`)
+
+- **Exact API PR 4 and PR 8 call.** `src/gateway/auth.rs`: `TokenScope::
+  {allows, as_str, token_file_name, all}`; `TokenDigest::{of, ct_eq,
+  ct_eq_choice, to_hex, from_hex}`; `random_secret_hex()`; `unix_now()`;
+  `Credential::{Bearer, Device{id}}` and `Principal::{bearer, device,
+  allows}`; `TokenStore::{load_or_create, load, verify_bearer, rotate,
+  digest}`; `DeviceRecord`, `DeviceStore::{load, devices, verify_cookie,
+  insert, revoke_scope, revoke_id, touch, persist}`; `PairingCode`,
+  `PairingError::{NotFound, Expired, Invalid, Io}`, `PairingStore::{new,
+  dir, create, consume, sweep_expired}`; `AuthLimiter::{new, from_config,
+  check, record_failure, tracked_peers}` and `MAX_TRACKED_PEERS`.
+  `src/gateway/policy.rs`: `BindPolicy::check`, `OriginAllowlist::{for_bind,
+  allows, is_empty, origins, requires_secure_cookies}`.
+  `src/gateway/paths.rs`: `gateway_dir`, `pairings_dir`, `READ_TOKEN_FILE`,
+  `CONTROL_TOKEN_FILE`, `DEVICES_FILE`, `PAIRINGS_DIR`, `RUNTIME_FILE`,
+  `DIRECTORY_MODE`/`FILE_MODE` (unix), `create_private_dir`,
+  `verify_private_dir`, `verify_private_file`, `write_private_file`,
+  `read_private_file`.
+- **`[gateway]` keys and defaults**, as shipped: `bind = "127.0.0.1:7788"`,
+  `allowed_origins = []`, `public_url = ""`, `auth_failure_limit = 5`,
+  `auth_failure_window_secs = 60`, `pairing_ttl_secs = 600` (valid range
+  `30..=86400`). A bad value is a diagnostic naming the key, never a parse
+  failure, and never fatal: `[gateway]` refuses nothing at load time, because
+  a `--bind` flag can still make the same config valid. **`BindPolicy::check`
+  at startup is the only refusal**, and PR 4 owns calling it.
+- **Origins normalize the way browsers serialize them** (RFC 6454 §6.1), a
+  correction to the plan's "exact on scheme/host/port": a scheme's default
+  port folds to `None`, so a configured `HTTPS://Fleet.Example:443` matches
+  the `https://fleet.example` a browser actually sends, and a bracketed IPv6
+  literal is canonicalized (`[0:0:0:0:0:0:0:1]` → `[::1]`). Port `0`, a
+  signed port (`+80`), non-ASCII hosts (punycode required), userinfo, paths,
+  queries, fragments, `null` and any non-http(s) scheme are refused. The
+  parser is `crate::config::parse_gateway_origin` returning `GatewayOrigin
+  { scheme, host, port }` — it lives in `src/config/model.rs`, not in
+  `policy.rs`, because `[gateway]` is unconditional while the gateway module
+  is feature-gated, so one parser serves both builds.
+- **The three gateway re-exports are feature-gated.** `pub use
+  self::model::{parse_gateway_origin, GatewayConfig, GatewayOrigin}` in
+  `src/config.rs` carries `#[cfg(feature = "gateway")]`; without it a
+  `--no-default-features` build fails `-D warnings` on unused imports. The
+  `GatewayConfig` *field* on `Config` stays unconditional.
+- **`effective_*` accessors exist and PR 4 must use them.** The diagnostics
+  promise "using 60"/"using 5"/"using 600"/"using 127.0.0.1:7788";
+  `GatewayConfig::{effective_bind_addr, effective_auth_failure_limit,
+  effective_auth_failure_window, effective_pairing_ttl_secs}` and
+  `DEFAULT_GATEWAY_BIND_ADDR` deliver them, and `AuthLimiter::from_config`
+  wraps the two limiter values, so a configured `auth_failure_window_secs =
+  0` cannot silently disable rate limiting.
+- **Security decisions the review pass added.** A token store whose two files
+  hold the *same* secret is refused (a copy-pasted `read.token` must never
+  grant control). Every pairing failure except expiry collapses to
+  `NotFound`, and a wrong secret never deletes a valid code, so guessing an
+  id learns nothing; only success and expiry delete a file. The failure
+  limiter evicts unblocked peers before blocked ones, so a flood of fresh
+  addresses cannot clear a victim's counter, and a success never resets a
+  window (no oracle). The gateway directory is created `0700` with
+  `DirBuilder::mode`, not chmod'ed after, and the private temp file name
+  carries a per-process sequence so two writers to one file cannot delete
+  each other's temp.
+- **Deferred, with reasons.** `TokenStore` has **no** `loaded_at: FileStamp`
+  (the plan's shape): nothing reloads a token file yet, so PR 8's
+  `rotate-token` must reload the store explicitly after rotating and must
+  call `DeviceStore::revoke_scope` itself — `rotate` only rewrites the file.
+  `DeviceStore::touch` mutates in memory and does **not** persist (the
+  gateway must not write a file per request); the caller batches
+  `persist()`. Token plaintext is not zeroized after digesting (no `zeroize`
+  dependency; out of the epic's dependency budget). Windows keeps no-op mode
+  verification, as the plan allows.
+- Every item in the three new modules carries a module-level
+  `#![allow(dead_code)]` with a comment naming PR 4 and PR 8; **PR 4 must
+  narrow or delete those allows** as it consumes the API. `[gateway]` is in
+  `SKIPPED_SUBTREES` of `scripts/config_reference_check.py`, so PR 10's
+  `docs/fork/gateway.md` is the only reference for these keys.
 
 ### PR 3 — feat(gateway): passive async fleet runtime folding connector events into shared state · deps: 1
 
