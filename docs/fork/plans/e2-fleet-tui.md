@@ -381,6 +381,7 @@ the binary, commands and paths stay `herdr`.
 | 7 | feat(fleet): host-aware notifications and cross-host notification targets | C · Fleet UX | 5 | ✅ |
 | 8 | feat(fleet): reconnect notice for the active host and resize on reconnect | C · Fleet UX | 5 | ✅ |
 | 9 | docs: fleet console guide, adr e2 review, roadmap drift | D · Docs | 6, 7, 8 | ⬜ |
+| 10 | fix(fleet): log fleet console active-host changes | C · Fleet UX | 5 | ✅ |
 
 **Wave preview (2-agent cap):** W1 `[1, 2]` → W2 `[3]` → W3 `[4]` → W4 `[5]`
 → W5 `[6, 8]` → W6 `[7]` → W7 `[9]`. Critical path 1 → 3 → 4 → 5 → 6 → 9. No
@@ -2233,6 +2234,49 @@ confirm the user's `herdr session list` shows no `lab-*`.
 
 - E7 adds its console actions to `fleet.md`; E8's install doc links here for
   "console machine".
+
+### PR 10 — fix(fleet): log fleet console active-host changes · deps: 5
+
+**Goal:** close the gap the epic's end-to-end validation found. Step 1 of
+*End-to-end epic validation* asserts the herdr log records the active host
+change, but nothing logged a *positive* one: only the refusal paths
+(`refusing to switch to a host disabled in [fleet]`) and host-local resize
+failures were logged, and the switch itself was a `debug!` phrased
+`the fleet console switched host`. A console run at `HERDR_LOG=debug`
+therefore had no line answering "which machine was this console driving?".
+
+**Files**
+
+- `src/client/fleet.rs` only. Two `tracing::info!` lines, one event name:
+  - `console_link`, right after `state.set_active_host(Some(active))` — the
+    launch decision: `info!(host = %active, "fleet console active host")`.
+  - `retarget_host`, after the switch has been applied to the connector, the
+    link, the fleet state and the endpoint lane (replacing the old `debug!`):
+    `info!(host = %host, from = %previous, "fleet console active host")`.
+    A refused switch never reaches `retarget_host` (`switch_target_allowed`
+    warns and returns), so the line only ever describes a change that
+    happened.
+
+No upstream file is touched, no wire or endpoint change, no new dependency.
+`info!` (not `debug!`) because this is the one fact an operator reading a
+console log needs by default.
+
+**Tests:** `a_switch_moves_the_connector_the_link_and_the_fleet_state_together`
+in `src/client/fleet.rs` gains a thread-local `tracing` capture
+(`CapturedLog`, a `MakeWriter` over `Arc<Mutex<Vec<u8>>>` installed with
+`tracing::subscriber::set_default`) and asserts both lines: the launch line
+naming `alpha` and the switch line carrying `host=beta from=alpha`. The
+capture is thread-local, so the fake hosts' supervisor threads never write
+into it.
+
+**Real-server validation**
+
+`fleet-lab.sh up 2`, an `[fleet]` block with `include_local = false` and
+`lab-1`/`lab-2` as `kind = "local"`, then drive the console through
+`scripts/fork/tui-drive.py` at `HERDR_LOG=debug`: expect `lab-1`, open the
+picker, pick 2, expect `lab-2`, quit. `grep -i 'active host'
+$XDG_CONFIG_HOME/herdr-dev/herdr-client.log` must show the launch line for
+`lab-1` and the switch line `host=lab-2 from=lab-1`.
 
 ## Critical files referenced (reuse, don't reinvent)
 
