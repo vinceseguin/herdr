@@ -1582,20 +1582,26 @@ async fn run_client_loop(
                     }
                 };
                 // The console follows the terminal even while the active host
-                // is down: the connector's own geometry is what a reconnecting
-                // host handshakes at, and the write below reaches nobody then.
-                if let (Some(fleet), ClientMessage::ClientShellResize { surface_size, .. }) =
-                    (state.fleet.as_ref(), &msg)
-                {
-                    fleet.announce_geometry(
-                        *surface_size,
-                        cell_width_px,
-                        cell_height_px,
-                        pixel_geometry_exact,
-                    );
-                }
-                if let Err(e) = write_to_server(&mut write_stream, &msg) {
-                    return Err(ClientError::ConnectionLost(e));
+                // is down: the connector adopts the geometry either way, sends
+                // it to the active host only when connected and only when it
+                // changed, and a reconnecting host handshakes at it. That *is*
+                // the resize — writing the message through the link as well
+                // would send the active host every resize twice.
+                let announced = match (state.fleet.as_ref(), &msg) {
+                    (Some(fleet), ClientMessage::ClientShellResize { surface_size, .. }) => {
+                        fleet.announce_geometry(
+                            *surface_size,
+                            cell_width_px,
+                            cell_height_px,
+                            pixel_geometry_exact,
+                        );
+                        true
+                    }
+                    _ => false,
+                };
+                if !announced {
+                    write_to_server(&mut write_stream, &msg)
+                        .map_err(ClientError::ConnectionLost)?;
                 }
             }
             ClientLoopEvent::ServerMessage(msg) => match *msg {

@@ -261,8 +261,11 @@ def main(argv: list[str]) -> int:
                     break
         # Let the last frame (and any exit output) land.
         screen.pump(0.3)
-        status = reap(pid, screen)
     finally:
+        # On every way out — an expectation that failed, a broken PTY, a
+        # KeyboardInterrupt — the child is waited for and, failing that,
+        # killed: a herdr left behind would keep its hosts' sockets open.
+        status = reap(pid, screen)
         screen.pump(0.05)
         try:
             os.close(master)

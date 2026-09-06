@@ -114,16 +114,45 @@ fn a_fleet_with_no_enabled_host_refuses_before_it_touches_the_terminal() {
     );
 }
 
+/// A throwaway, empty config home for a launch that must exit before it
+/// touches a terminal or a server. Never the developer's `~/.config/herdr*`:
+/// the nested guard below reads `[experimental] allow_nested`, and a test
+/// must not depend on — or log into — the real one.
+fn scratch_config_home(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "herdr-fleet-tui-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("scratch config home");
+    dir
+}
+
+fn bare_launch(args: &[&str], config_home: &std::path::Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .args(args)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_RUNTIME_DIR", config_home)
+        .env("HERDR_ENV", "1")
+        .env_remove("HERDR_CONFIG_PATH")
+        .env_remove("HERDR_SOCKET_PATH")
+        .env_remove("HERDR_CLIENT_SOCKET_PATH")
+        .env_remove("HERDR_SESSION")
+        .output()
+        .expect("run herdr")
+}
+
 /// `--fleet` is the console's flag alias. The nested guard is the cheapest
 /// proof that the flag was accepted *and* reached the console's launch branch,
 /// without opening a terminal in the test harness.
 #[test]
 fn the_fleet_flag_is_accepted_and_launches_the_console() {
-    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
-        .arg("--fleet")
-        .env("HERDR_ENV", "1")
-        .output()
-        .expect("run herdr --fleet");
+    let config_home = scratch_config_home("flag");
+    let output = bare_launch(&["--fleet"], &config_home);
+    let _ = std::fs::remove_dir_all(&config_home);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -139,11 +168,9 @@ fn the_fleet_flag_is_accepted_and_launches_the_console() {
 
 #[test]
 fn the_fleet_flag_cannot_be_combined_with_remote() {
-    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
-        .args(["--fleet", "--remote", "example.invalid"])
-        .env("HERDR_ENV", "1")
-        .output()
-        .expect("run herdr --fleet --remote");
+    let config_home = scratch_config_home("flag-remote");
+    let output = bare_launch(&["--fleet", "--remote", "example.invalid"], &config_home);
+    let _ = std::fs::remove_dir_all(&config_home);
 
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);

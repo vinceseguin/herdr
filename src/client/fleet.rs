@@ -154,6 +154,16 @@ fn translate_event(state: &mut FleetState, active: &HostId, event: FleetEvent) -
         FleetEvent::Notification { host, notification } => {
             let mut notification = *notification;
             notification.title = format!("[{host}] {}", notification.title);
+            if host != *active {
+                // The shell resolves a notification's ids against the *active*
+                // host's snapshot: a `w1:p1` on another machine would be
+                // validated against, suppressed by, and — on click — focused
+                // on this one. Until PR 7 targets across hosts, another
+                // host's notification is informational only.
+                notification.workspace_id = None;
+                notification.tab_id = None;
+                notification.pane_id = None;
+            }
             Translated::Server(Box::new(ServerMessage::SemanticNotification(notification)))
         }
         FleetEvent::EndpointResponse {
@@ -350,7 +360,7 @@ fn console_link(
         link,
         Console {
             connector: Some(connector),
-            stderr,
+            _stderr: stderr,
         },
     ))
 }
@@ -365,7 +375,8 @@ pub(super) struct Console {
     /// `None` once shut down. The loop holds the other references (the link and
     /// its own fleet state); both are gone by the time this drops.
     connector: Option<Rc<FleetConnector>>,
-    stderr: ConsoleStderr,
+    /// Held for its `Drop`, which puts stderr back after the shutdown above.
+    _stderr: ConsoleStderr,
 }
 
 impl Drop for Console {
@@ -384,8 +395,9 @@ impl Drop for Console {
                 }
             }
         }
-        // After shutdown, so anything ssh says on its way out is still logged.
-        self.stderr.restore();
+        // `stderr` is a field, so it restores itself *after* this body: the
+        // shutdown above runs with anything ssh says on its way out still in
+        // the log.
     }
 }
 
@@ -416,6 +428,16 @@ impl ConsoleStderr {
         if std::mem::take(&mut self.installed) {
             restore_console_stderr();
         }
+    }
+}
+
+impl Drop for ConsoleStderr {
+    /// Every owner — the console, and an `open_console` that failed between
+    /// installing the redirect and building the console — puts stderr back.
+    /// Without this an early error would be printed into the log the user
+    /// cannot see, and the saved descriptor would leak.
+    fn drop(&mut self) {
+        self.restore();
     }
 }
 
@@ -789,6 +811,74 @@ mod tests {
         ));
     }
 
+    fn targeted_notification(title: &str) -> Box<SemanticNotification> {
+        let mut event = notification(title);
+        event.workspace_id = Some("w1".to_string());
+        event.tab_id = Some("w1:t1".to_string());
+        event.pane_id = Some("w1:p1".to_string());
+        event.agent = Some("claude".to_string());
+        event
+    }
+
+    #[test]
+    fn an_inactive_hosts_notification_keeps_no_target_the_active_host_could_resolve() {
+        let mut state = fleet();
+        let active = host_id("alpha");
+
+        let translated = translate_event(
+            &mut state,
+            &active,
+            FleetEvent::Notification {
+                host: host_id("beta"),
+                notification: targeted_notification("agent is blocked"),
+            },
+        );
+
+        let Translated::Server(message) = translated else {
+            panic!("notifications from every host reach the shell");
+        };
+        let ServerMessage::SemanticNotification(event) = *message else {
+            panic!("a notification stays a notification");
+        };
+        assert_eq!(event.title, "[beta] agent is blocked");
+        assert_eq!(
+            event.agent.as_deref(),
+            Some("claude"),
+            "the agent name is display, kept"
+        );
+        assert_eq!(
+            (event.workspace_id, event.tab_id, event.pane_id),
+            (None, None, None),
+            "ids are the other host's: the shell would validate, suppress or focus them on the active host"
+        );
+    }
+
+    #[test]
+    fn the_active_hosts_notification_keeps_its_target() {
+        let mut state = fleet();
+        let active = host_id("alpha");
+
+        let translated = translate_event(
+            &mut state,
+            &active,
+            FleetEvent::Notification {
+                host: host_id("alpha"),
+                notification: targeted_notification("agent is blocked"),
+            },
+        );
+
+        let Translated::Server(message) = translated else {
+            panic!("notifications from every host reach the shell");
+        };
+        let ServerMessage::SemanticNotification(event) = *message else {
+            panic!("a notification stays a notification");
+        };
+        assert_eq!(event.title, "[alpha] agent is blocked");
+        assert_eq!(event.pane_id.as_deref(), Some("w1:p1"));
+        assert_eq!(event.workspace_id.as_deref(), Some("w1"));
+        assert_eq!(event.tab_id.as_deref(), Some("w1:t1"));
+    }
+
     #[test]
     fn an_endpoint_response_is_taken_only_from_the_active_host() {
         let mut state = fleet();
@@ -837,6 +927,62 @@ mod tests {
 
         assert!(matches!(translated, Translated::Changes(changes) if changes.is_empty()));
         assert!(state.host(&host_id("ghost")).is_none());
+    }
+}
+
+/// The redirect's bookkeeping, without ever pointing this process's stderr
+/// anywhere: fd 2 is duplicated onto itself, so a restore is a visible no-op.
+#[cfg(all(test, unix))]
+mod console_stderr_tests {
+    use super::*;
+
+    /// The tests share one process-wide static; `cargo test` runs them on
+    /// threads (nextest does not), so they take turns.
+    static REDIRECT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn dropping_an_installed_redirect_restores_and_releases_the_saved_descriptor() {
+        let _serial = REDIRECT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved =
+            crate::pty::fd::duplicate_cloexec_fd(libc::STDERR_FILENO).expect("duplicate fd 2");
+        assert!(
+            ORIGINAL_STDERR
+                .compare_exchange(-1, saved, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "no other test in this process may hold the redirect"
+        );
+
+        drop(ConsoleStderr { installed: true });
+
+        assert_eq!(
+            ORIGINAL_STDERR.load(Ordering::Acquire),
+            -1,
+            "the saved descriptor was handed back"
+        );
+        // SAFETY: `fcntl(F_GETFD)` only inspects a descriptor.
+        assert_eq!(
+            unsafe { libc::fcntl(saved, libc::F_GETFD) },
+            -1,
+            "the saved descriptor was closed, not leaked"
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETFD) },
+            -1,
+            "fd 2 is still open"
+        );
+    }
+
+    #[test]
+    fn a_passthrough_restores_nothing() {
+        let _serial = REDIRECT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(ConsoleStderr::passthrough());
+        assert_eq!(ORIGINAL_STDERR.load(Ordering::Acquire), -1);
+        restore_console_stderr();
+        assert_eq!(ORIGINAL_STDERR.load(Ordering::Acquire), -1, "idempotent");
     }
 }
 
