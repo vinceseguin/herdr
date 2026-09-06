@@ -665,7 +665,7 @@ exactly these E1 contracts (verified in the code):
 
 | # | Title | Group | Depends on | Status |
 | --- | --- | --- | --- | --- |
-| 1 | chore: add gateway cargo feature with axum, qrcode and token dependencies | A · Foundations | — | ⬜ |
+| 1 | chore: add gateway cargo feature with axum, qrcode and token dependencies | A · Foundations | — | ✅ |
 | 2 | feat(gateway): gateway config section, token store, bind and origin policy | A · Foundations | 1 | ⬜ |
 | 3 | feat(gateway): passive async fleet runtime folding connector events into shared state | A · Foundations | 1 | ⬜ |
 | 4 | feat(gateway): herdr gateway serves health, fleet report and embedded assets over http | B · HTTP | 2, 3 | ⬜ |
@@ -973,6 +973,54 @@ and both CI jobs green on the PR. No lab is needed.
   second dispatch in `src/cli.rs`.
 - `just ci-no-default` and the `check-no-default-features (ubuntu-latest)`
   job are part of "green" for every later PR in the fork, not only E3.
+
+**Landed** (merged; gate `EXIT=0` for both `ci` and `ci-no-default`)
+
+- `Cargo.toml` grew exactly the planned `[features]` block and the four
+  optional crates; resolved versions are `axum 0.8.9`, `qrcode 0.14.1`,
+  `subtle 2.6.1`, and `getrandom` stayed at the `0.3.4` the lock already
+  carried (no new `getrandom` entry). `Cargo.lock` gained **33** packages,
+  all of them inside axum's `http1`/`ws`/`json`/`query` closure or tokio's
+  `net`: `hyper 1.11.1`, `http 1.5.0`, `tower`, `matchit`, `socket2`,
+  `tokio-tungstenite 0.29.0` (**not** the 0.30.0 the registry note
+  predicted) and `tungstenite 0.29.0`. Correction to the plan's reasoning:
+  choosing `getrandom` over `rand` did avoid a *direct* subtree, but
+  `rand 0.9.5` + `rand_chacha` + `ppv-lite86` + `zerocopy` arrive anyway as
+  `tungstenite`'s RFC 6455 masking dependency. `image` is **not** in the
+  lock (`qrcode`'s lock entry has no dependencies at all), and
+  `cargo tree --no-default-features -e normal` matches none of
+  axum/qrcode/subtle/hyper/tungstenite.
+- **Two shared constants** in `src/gateway/mod.rs` instead of one
+  `GATEWAY_USAGE`: `GATEWAY_COMMAND_LINE` (`herdr gateway [--bind ADDR]
+  [--config PATH]`, also printed by `src/main.rs`'s `--help` so the two
+  cannot drift) and `GATEWAY_STAGING_NOTE`. The staging note is appended to
+  both help surfaces — `gateway_help()` and `gateway_command()`'s
+  `.after_help(…)` — because PR 1 advertises `--bind`/`--config` while
+  nothing runs them. **PR 4 must delete `GATEWAY_STAGING_NOTE`, its two
+  call sites and the `the_staging_note_matches_the_dispatch` test**; that
+  test asserts `--bind` still exits 2, so it fails the moment the run path
+  lands and cannot be forgotten.
+- `herdr gateway --help` and `-h` never reach `run_gateway_command`:
+  `spec::print_requested_help` intercepts them and renders clap's help
+  (exit 0). The `--help`/`-h` arms inside `run_gateway_command` are
+  defensive, matching `run_fleet_command`/`run_channel_command`.
+- `tests/fork_gateway.rs` is gated `#![cfg(all(unix, feature = "gateway"))]`,
+  **without** the planned `not(target_os = "macos")`: these tests only spawn
+  the binary and read stdout, so the macOS exclusion that `tests/cli.rs`
+  needs (servers, PTYs) does not apply, and keeping it would have silently
+  dropped every appended E3 test on macOS.
+- `just ci-no-default` takes the same `filter='all()'` parameter as `ci`;
+  both it and `lint-no-default` are `[unix]`, so Windows sees no dangling
+  recipe dependency. Test counts: 3436 (default) vs 3429
+  (`--no-default-features`).
+- `just windows-lint` is green with the new dependency set (axum, qrcode,
+  subtle, hyper-util, matchit and tokio `net`/`signal` all clippy-compile
+  for `x86_64-pc-windows-msvc` under `-D warnings`), so no PR in this epic
+  starts from a broken Windows target.
+- Known stale text, deliberately not touched here: `.claude/rules/fork.md`'s
+  *The gate (every PR)* section still describes green as `just ci` alone.
+  `docs/fork/README.md` and this plan's *Verification* section both carry
+  the two-feature-set rule; fold the rules file in with PR 10's docs pass.
 
 ### PR 2 — feat(gateway): gateway config section, token store, bind and origin policy · deps: 1
 
@@ -1348,7 +1396,11 @@ network surface, loopback by default, with graceful shutdown.
   SPA fallback.
 - `src/gateway/run.rs` (new): `RunArgs`, `parse_run_args`, `run(args) ->
   io::Result<i32>`; the `gateway.json` marker.
-- `src/gateway/mod.rs`: modules + dispatch of the bare command to `run`.
+- `src/gateway/mod.rs`: modules + dispatch of the bare command to `run`;
+  **delete `GATEWAY_STAGING_NOTE`** (PR 1), its `gateway_help()` line, the
+  `.after_help(…)` in `src/cli/spec.rs`'s `gateway_command()` and the
+  `the_staging_note_matches_the_dispatch` test — that test fails as soon as
+  `--bind` stops exiting 2, which is this PR.
 - `web/dist/index.html` (new, committed, < 4 KiB): Herdr Fleet placeholder
   (title, the E4 note, a `<script>` that fetches `/api/gateway` and prints
   `paired as <scope>` or `not paired — run: herdr gateway pair`).

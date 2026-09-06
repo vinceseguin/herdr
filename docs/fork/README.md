@@ -473,7 +473,7 @@ The upstream files that currently carry fork wiring, and may conflict:
 | --- | --- |
 | `.cargo/config.toml` | the `[env]` build channel |
 | `src/build_info.rs`, `src/update.rs`, `src/release_notes.rs` | fork build identity, self-update disabled |
-| `Cargo.toml`, `Cargo.lock` | the `[features]` section (`default = ["gateway"]`) and the five gateway dependencies (E3 PR 1) |
+| `Cargo.toml`, `Cargo.lock` | the `[features]` section (`default = ["gateway"]`), the four optional gateway dependencies (`axum`, `qrcode`, `subtle`, `getrandom`) and `tokio`'s `net`/`signal` features (E3 PR 1) |
 | `justfile` | `lint-no-default` and `ci-no-default` (E3 PR 1) |
 | `src/main.rs` | `mod fleet;`, gated `mod gateway;`, the `[fleet]` block of `DEFAULT_CONFIG`, two `--help` usage lines, `"fleet"` and gated `"gateway"` in the bare-command list |
 | `src/remote/attach.rs` | `pub(crate)` visibility on the ssh stdio bridge and remote discovery, plus `start_with`/`local_forward_socket_path_scoped`/`BridgeErrorSink` (E1 PR 3) — upstream's side first, then re-apply |

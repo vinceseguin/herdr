@@ -22,8 +22,9 @@ include = [
 
 [features]
 # The fork's HTTP/WebSocket gateway (`herdr gateway`). On by default in fork
-# builds; `--no-default-features` yields an upstream-shaped binary with no
-# network surface and none of the optional dependencies below.
+# builds; `--no-default-features` drops the command, its listening socket and
+# every optional dependency below, leaving the upstream-shaped binary that fork
+# CI's `check-no-default-features` job builds.
 default = ["gateway"]
 gateway = [
     "dep:axum",
@@ -38,7 +39,8 @@ gateway = [
 # gateway: HTTP router and WebSocket upgrade on the existing tokio runtime.
 # Hand-rolling HTTP/1.1 plus RFC 6455 would be ~1.5 kLOC of security-sensitive
 # parsing. `ws` pulls tokio-tungstenite transitively, so no direct WebSocket
-# dependency is needed, and `axum::http`/`axum::body` re-export hyper's types.
+# dependency is needed, and `axum::http` re-exports the `http` crate, so no
+# direct `http` or `hyper` dependency is needed either.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "json", "query"], optional = true }
 base64 = "0.22.1"
 bincode = { version = "2", features = ["serde"] }

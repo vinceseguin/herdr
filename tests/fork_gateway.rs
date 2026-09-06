@@ -3,8 +3,10 @@
 //! The whole file is gated on the `gateway` feature so `cargo nextest run
 //! --no-default-features` (fork CI's `check-no-default-features` job) compiles
 //! it to an empty test binary instead of failing on a missing subcommand.
-//! Later E3 PRs append their gateway tests here.
-#![cfg(all(unix, not(target_os = "macos"), feature = "gateway"))]
+//! `unix` is the only platform gate: these tests run the binary and never boot
+//! a server or a PTY, so unlike `tests/cli.rs` they have no reason to skip
+//! macOS. Later E3 PRs append their gateway tests here.
+#![cfg(all(unix, feature = "gateway"))]
 
 use std::path::PathBuf;
 use std::process::Command;

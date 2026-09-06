@@ -16,6 +16,12 @@
 /// The invocation line, shared with `herdr --help` so the two never drift.
 pub(crate) const GATEWAY_COMMAND_LINE: &str = "herdr gateway [--bind ADDR] [--config PATH]";
 
+/// Both help surfaces carry this while the run path is unbuilt, so the options
+/// they advertise never read as working ones. Delete it, and
+/// `the_staging_note_matches_the_dispatch`, in the PR that serves requests.
+pub(crate) const GATEWAY_STAGING_NOTE: &str =
+    "Not implemented yet: this build accepts only `herdr gateway help`.";
+
 pub(crate) fn run_gateway_command(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(|arg| arg.as_str()) {
         Some("help" | "--help" | "-h") if args.len() == 1 => {
@@ -38,6 +44,7 @@ fn gateway_help() -> String {
     help.push_str("Options:\n");
     help.push_str("  --bind ADDR         Listen on ADDR instead of the configured address\n");
     help.push_str("  --config PATH       Read configuration from PATH\n");
+    help.push_str(&format!("\n{GATEWAY_STAGING_NOTE}\n"));
     help
 }
 
@@ -80,5 +87,17 @@ mod tests {
         );
         assert!(help.contains("--bind ADDR"), "help: {help}");
         assert!(help.contains("--config PATH"), "help: {help}");
+    }
+
+    /// The staging note is only honest while nothing but `help` succeeds, so it
+    /// is pinned to the dispatch: the PR that makes `--bind` run a server fails
+    /// here and must remove the note from both help surfaces.
+    #[test]
+    fn the_staging_note_matches_the_dispatch() {
+        assert!(gateway_help().contains(GATEWAY_STAGING_NOTE));
+        assert_eq!(
+            run_gateway_command(&args(&["--bind", "127.0.0.1:7788"])).expect("usage"),
+            2
+        );
     }
 }
