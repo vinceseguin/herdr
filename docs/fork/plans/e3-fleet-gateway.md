@@ -669,7 +669,7 @@ exactly these E1 contracts (verified in the code):
 | 2 | feat(gateway): gateway config section, token store, bind and origin policy | A · Foundations | 1 | ✅ |
 | 3 | feat(gateway): passive async fleet runtime folding connector events into shared state | A · Foundations | 1 | ✅ |
 | 4 | feat(gateway): herdr gateway serves health, fleet report and embedded assets over http | B · HTTP | 2, 3 | ✅ |
-| 5 | feat(gateway): websocket fleet event stream | C · Streams | 4 | ⬜ |
+| 5 | feat(gateway): websocket fleet event stream | C · Streams | 4 | ✅ |
 | 6 | feat(gateway): websocket terminal observe stream over per-host transports | C · Streams | 4 | ⬜ |
 | 7 | feat(gateway): terminal control mode gated by the control scope | C · Streams | 6 | ⬜ |
 | 8 | feat(gateway): pairing urls with qr codes, device cookies, status and token rotation | D · Ops | 4 | ⬜ |
@@ -1816,7 +1816,9 @@ modes, the `stty size` line, the exit lines. Paste no token.
   `wait_for` test helper are still unreached, and narrowing them means editing
   `src/gateway/fleet.rs`, which PR 9 held open concurrently. The allow now
   carries a comment naming PR 5 and PR 6; **PR 6 removes it** (PR 5 should
-  narrow the comment to PR 6's items).
+  narrow the comment to PR 6's items). *Resolved in PR 5:* the module allow is
+  gone, `host_connection`/`host_spec` carry their own attributes naming PR 6,
+  and the unused `wait_for` test helper it was hiding was deleted.
 - **Deviation 2 — the dead-code allows in `auth.rs`/`policy.rs`/`paths.rs` are
   now per item**, each naming PR 8: `TokenScope::all`, `TokenDigest::to_hex`,
   `TokenStore::{load, rotate, digest}`, `DeviceStore::{devices, insert,
@@ -1946,6 +1948,47 @@ modes, the `stty size` line, the exit lines. Paste no token.
 
 ### PR 5 — feat(gateway): websocket fleet event stream · deps: 4
 
+> **Landed (fork PR #43).** `GET /api/events` serves
+> `herdr.fleet.events.v1`; `GatewayInfo::features()` is now
+> `["fleet", "events"]` (PR 6 appends `"terminal"`, PR 8 `"pairing"`).
+> What later PRs need to know:
+>
+> - **`src/gateway/protocol.rs` exists** and opens with a
+>   `// ---- events (PR 5) ----` section holding `EVENTS_SCHEMA`,
+>   `EventsHello`, `EventsFleet`, `Resync` and
+>   `encode<T: Serialize>(&T) -> Result<String, serde_json::Error>` (which
+>   `debug_assert!`s the JSON is newline-free). PR 6 appends its own
+>   `// ---- terminal (PR 6) ----` section **below** that one; do not
+>   reinterpret an events field.
+> - **`src/gateway/mod.rs`'s module-wide `#[allow(dead_code)] mod fleet;` is
+>   gone.** The two items PR 6 consumes, `FleetHandle::host_connection` and
+>   `host_spec`, now carry their own narrow `#[allow(dead_code)]` with a
+>   comment naming PR 6 — **delete those two attributes** in PR 6 rather than
+>   a module-level one. A test-only helper (`wait_for`) that the module allow
+>   had been hiding was removed with it.
+> - **`FleetHandle` has `#[cfg(test)] test_new(state, capacity) ->
+>   (FleetHandle, watch::Sender<bool>)` and `test_apply(&HostId, HostEvent)`**
+>   in a separate `#[cfg(test)] impl` block, so any gateway module's tests can
+>   drive a real handle without a connector, a socket or a runtime.
+> - **A stopping gateway ends its streams before the HTTP drain.**
+>   `FleetRuntime::stop` is an `Arc<watch::Sender<bool>>` and
+>   `FleetRuntime::stopper() -> FleetStopper` hands out the latch;
+>   `run::serve_until_signal` pulls it inside the shutdown future. Reason: an
+>   upgraded WebSocket keeps axum's graceful shutdown waiting for as long as
+>   it is open, so without it a `SIGTERM` stalled for the whole 5 s
+>   `SHUTDOWN_DRAIN` and then dropped clients' TCP connections instead of
+>   sending a close frame. PR 6/7's terminal sockets inherit this for free —
+>   watch `ChangeStream`/the same latch, or accept the drain.
+> - **The `EventSink` trait pattern** (`send_text`/`send_ping`/`close`/`recv`
+>   returning `impl Future + Send`, with a `Recorder` test sink whose
+>   `recv()` is `pending()`) is how a socket loop is unit-tested here without
+>   a server. PR 6/7 should reuse the shape rather than invent one.
+> - **`Gateway::{ws, ws_with, ws_spawn}`** are in `tests/support/gateway.rs`:
+>   `ws(path, args)` adds the `read` bearer, `ws_with(path, headers, args)`
+>   adds nothing (drive 401/403, or present the control token), and
+>   `ws_spawn(...) -> Child` leaves the client running while the test changes
+>   the world. `ws_lines(&Output)` and `ws_text_json(line)` parse the output.
+>
 > **From PR 4 (landed):** add the route as `pub(crate) fn routes() ->
 > Router<AppState>` in `src/gateway/events.rs` and `.merge(events::routes())`
 > in `server::router` — that is the only place a route inherits the auth layer
@@ -2010,14 +2053,27 @@ async fn run_events(mut socket: WebSocket, state: AppState, scope: TokenScope) {
 ```
 
 Text frames only, one JSON object per message, no newlines. Inbound
-messages from the client are ignored (a text/binary message above 4 KiB
-closes 1009). `ws-client.py`:
+messages from the client are ignored; a message above 4 KiB is a protocol
+error to the WebSocket layer, which ends the connection (`max_message_size`/
+`max_frame_size` on the upgrade — the exact close code is tungstenite's, not
+the gateway's, so nothing asserts 1009). `ws-client.py` **as built**:
 
 ```text
-usage: ws-client.py URL [--header 'Name: value']... [--send JSON]... [--send-stdin]
+usage: ws-client.py URL [-H|--header 'Name: value']... [--send JSON]... [--send-stdin]
                         [--max-messages N] [--timeout SECS] [--binary hex|len]
-prints one line per message: `text <payload>` | `binary <hex or byte count>` | `close <code>`
-exit 0 on close/--max-messages, 2 on handshake failure (prints the HTTP status), 3 on timeout
+stdout, one line per message — the format is frozen, flags may be added:
+  text <payload>       raw newlines in the payload become the two chars \n
+  binary <hex>         with --binary hex
+  binary <length>      with --binary len (the default)
+  close <code>         the peer's close frame; its reason goes to stderr
+  handshake <status>   the only stdout line when the upgrade was refused
+ping/pong are answered and logged to stderr; they are not messages and do not
+count toward --max-messages, and a control frame that arrives between the
+fragments of a fragmented message does not corrupt it. A fragmented control
+frame, or one over 125 bytes (RFC 6455 §5.5), is a protocol error.
+--timeout defaults to 10 s (0 waits forever) and bounds the whole run.
+exit 0 on close or --max-messages, 1 on a transport/protocol error, 2 on a
+handshake failure (status also on stdout), 3 on timeout
 ```
 
 **Tests**
@@ -2035,7 +2091,9 @@ exit 0 on close/--max-messages, 2 on handshake failure (prints the HTTP status),
   `lab-2` with `state == unavailable`), `events_rejects_missing_token`
   (`ws-client.py` exit 2 with status 401) and a foreign `Origin` (403).
 
-**Real-server validation**
+**Real-server validation** (run: `hello`/`fleet` verbatim, the `lab-2`
+`host_connection` delta on an open socket, and the two refusals; see the PR
+body for the pasted output)
 
 ```bash
 # lab + [fleet] + gateway as in PR 4; TOKEN = read token
@@ -2072,10 +2130,20 @@ Evidence: the message lines (with `reason` text), the two exit codes.
 > `Arc::new(config)` in `run::run` (`Config` is not `Clone`;
 > `serve_until_signal` takes `&Config` today). Register the route through
 > `terminal::routes()` + `.merge(…)` and take `Authed`; append `"terminal"` in
-> `GatewayInfo::features()`. **Delete** `src/gateway/mod.rs`'s
-> `#[allow(dead_code)]` on `mod fleet;` in this PR: PR 6 is the last consumer
-> of `host_connection`/`host_spec`, and it was left in place only because PR 4
-> ran concurrently with PR 9 in that file.
+> `GatewayInfo::features()`.
+
+> **From PR 5 (landed):** the module-wide `#[allow(dead_code)]` on
+> `src/gateway/mod.rs`'s `mod fleet;` is already gone. What remains are two
+> narrow attributes in `src/gateway/fleet.rs`, on `FleetHandle::host_connection`
+> and `FleetHandle::host_spec`, each with a comment naming this PR — **delete
+> those two** as you consume them. `src/gateway/protocol.rs` exists: append a
+> `// ---- terminal (PR 6) ----` section below the events one, and reuse its
+> `encode` helper. `FleetHandle::{test_new, test_apply}` (`#[cfg(test)]`) build
+> a real handle without a connector, and `src/gateway/events.rs`'s `EventSink`
+> trait + `Recorder` sink are the pattern for unit-testing a socket loop.
+> `Gateway::{ws, ws_with, ws_spawn}` in `tests/support/gateway.rs` drive
+> `scripts/fork/ws-client.py` (`ws_with` adds no token, so it is the one to use
+> with the control bearer).
 
 > **From PR 3 (landed):** `FleetHandle::host_connection(&HostId)` and
 > `host_spec(&HostId)` are the fail-fast pair — `None` means the host is not
