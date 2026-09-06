@@ -148,8 +148,9 @@ a terminal to the wrong machine:
 - the saved ssh target or session is malformed
 
 Each diagnostic names the machine's label and profile id and the command that
-fixes it — `herdr machine rename <profile-id> --label <name>` — and, like every
-`[fleet]` problem, means no host resolves at all:
+fixes it — `herdr machine rename <profile-id> --label <name>` for an id
+problem, `herdr machine remove <profile-id>` for a malformed target or session
+— and, like every `[fleet]` problem, means no host resolves at all:
 
 ```console
 $ herdr fleet status
@@ -185,13 +186,18 @@ live `herdr server reload-config` produces. The rules:
   silently dropping it would attach you to a same-named local session instead of
   the machine you named
 - a `session` that is not a valid session name
-- with `include_machines = true`, any of the saved-machine problems listed
-  under [Saved machines as hosts](#saved-machines-as-hosts)
 
 Validation is all-or-nothing: **any** diagnostic, including one on a host with
 `enabled = false`, means no host specs are resolved. `herdr fleet status` then
 prints the diagnostics on stderr and exits **1** rather than reporting a partial
 fleet, so a typo in one host cannot quietly drop it from the list.
+
+With `include_machines = true`, the saved-machine problems listed under
+[Saved machines as hosts](#saved-machines-as-hosts) join that all-or-nothing
+rule with one difference: they need the endpoint catalog on disk, so they are
+reported when the fleet is resolved — by `herdr fleet status` (stderr, exit 1)
+and by the gateway at startup — not by `herdr config check`, the TUI banner or
+`reload-config`, which validate `[fleet]` without touching the filesystem.
 
 ```console
 $ herdr config check

@@ -129,7 +129,7 @@ pub fn machine_host_specs(
                 diagnostics.push(named(
                     "reserved saved machine host name",
                     format!(
-                        "derives the fleet host id {:?}, which names this machine's default session",
+                        "derives the fleet host id {:?}, which is reserved for this machine's default session",
                         HostId::LOCAL
                     ),
                     &rename,

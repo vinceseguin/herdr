@@ -673,7 +673,7 @@ exactly these E1 contracts (verified in the code):
 | 6 | feat(gateway): websocket terminal observe stream over per-host transports | C · Streams | 4 | ⬜ |
 | 7 | feat(gateway): terminal control mode gated by the control scope | C · Streams | 6 | ⬜ |
 | 8 | feat(gateway): pairing urls with qr codes, device cookies, status and token rotation | D · Ops | 4 | ⬜ |
-| 9 | feat(fleet): opt-in hosts from saved machine profiles | D · Ops | 3 | ⬜ |
+| 9 | feat(fleet): opt-in hosts from saved machine profiles | D · Ops | 3 | ✅ |
 | 10 | docs: gateway guide, systemd unit, adr e3 review, roadmap drift | E · Docs | 5, 7, 8, 9 | ⬜ |
 
 **Wave preview (2-agent cap, Cargo PR alone):** W1 `[1]` → W2 `[2, 3]` →
@@ -2212,6 +2212,50 @@ rotate lines, the `ls -l` modes. Never paste the URL or the cookie.
   `listen`, `devices`, `pairings_pending`).
 
 ### PR 9 — feat(fleet): opt-in hosts from saved machine profiles · deps: 3
+
+> **Landed** (`feat/e3-pr9-fleet-machine-hosts`). What later PRs must know:
+>
+> - **`hosts_for_config(&Config) -> Result<Vec<HostSpec>, Vec<String>>`**
+>   (`src/fleet/hosts_source.rs`) is now the **only** resolver a fleet
+>   consumer calls. `FleetSession::start` and `FleetRuntime::start` both use
+>   it; `hosts::resolve_hosts(&FleetConfig)` is its `[fleet]`-only half and
+>   nothing else calls it. A future consumer takes the whole `Config`.
+> - **Host id from a machine label (frozen).** `machine_host_id(label)`:
+>   the label verbatim when `HostId::new(label)` accepts it (case included —
+>   `Workbox` stays `Workbox`), otherwise the label lowercased with every run
+>   of characters outside `[A-Za-z0-9._-]` folded to a single `-` and leading
+>   and trailing runs dropped (`Lab SSH` → `lab-ssh`, `My Laptop (home)` →
+>   `my-laptop-home`, `///` → invalid). **E4/E5/E7:** a machine host id is
+>   not the machine's profile id and not its label; read `hosts[].id` from
+>   the report, never re-derive it, and never assume a label round-trips.
+>   E5's tailnet machines need no fleet change (`herdr machine add
+>   <host>.<tailnet>.ts.net`); E7 may key per-machine actions on
+>   `hosts[].id`.
+> - **All-or-nothing, like `resolve_hosts`.** An underivable id, the
+>   reserved `local`, a collision with a `[[fleet.hosts]]` name or another
+>   machine, a malformed saved ssh target or session, or an unreadable
+>   catalog is a diagnostic and **no** host resolves (`herdr fleet status`
+>   exits 1, `FleetRuntime::start` returns `Err`). A *missing* catalog is an
+>   empty machine list, not an error.
+> - **Report shape unchanged.** A machine host is `kind = "ssh"` with the
+>   profile's target/session/enabled; `herdr.fleet.status.v1` and
+>   `/api/fleet` gain no field, so PR 4/5 need no change.
+> - **Scope deltas from the plan as written:** `MachineProfile` carries a
+>   fifth field, `id` (the catalog profile id), so every diagnostic can print
+>   the exact `herdr machine rename <profile-id> --label <name>` that fixes
+>   it. `machine_host_specs` also re-validates the saved ssh target with
+>   `config::validate_fleet_host_target` and the saved session with
+>   `session::validate_name`: upstream's catalog only applies `--remote`'s
+>   weaker rule, which admits whitespace in a target, and an ssh destination
+>   is one argv element. That needed one extra upstream line —
+>   `src/config.rs` re-exports `validate_fleet_host_target` next to
+>   `validate_fleet_host_name` (PR 2 owns that file otherwise; this is an
+>   additive `pub(crate) use` item, no behaviour).
+> - `src/fleet/machines.rs` is in `PURE_MODULES`;
+>   `src/fleet/hosts_source.rs` is the one fleet module that names
+>   `crate::client` (`EndpointCatalog::load_profiles`, five
+>   `SavedSshEndpoint` fields), so an upstream rename breaks the build there
+>   and nowhere else.
 
 > **From PR 3 (landed):** the call to swap is in `FleetRuntime::start`
 > (`src/gateway/fleet.rs`), which today reads

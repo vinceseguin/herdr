@@ -37,7 +37,7 @@ fn hosts_from(
     }
     let profiles = load().map_err(|error| {
         vec![format!(
-            "saved machines unavailable: {error}; fix it with `herdr machine list` or set fleet.include_machines = false; ignoring [fleet] hosts"
+            "saved machines unavailable: {error}; repair or remove the endpoint catalog, or set fleet.include_machines = false; ignoring [fleet] hosts"
         )]
     })?;
     let machines = machine_host_specs(&profiles, &specs)?;
@@ -49,8 +49,17 @@ fn hosts_from(
 ///
 /// A missing catalog is an empty list, not an error: `include_machines = true`
 /// before the first `herdr machine add` is a valid configuration.
+///
+/// The catalog validates every profile as it loads (32-hex profile ids,
+/// labels without control characters, `--remote`-shaped targets, session
+/// names), so a corrupt or hand-edited file is one `Err` here rather than a
+/// profile with an unexpected shape reaching the mapper. The error names the
+/// file: upstream's parse error does not, and the user has to find it.
 fn load_saved_machines() -> Result<Vec<MachineProfile>, String> {
-    Ok(crate::client::endpoint::EndpointCatalog::load_profiles()?
+    use crate::client::endpoint::{catalog_path, EndpointCatalog};
+
+    Ok(EndpointCatalog::load_profiles()
+        .map_err(|error| format!("{error}; catalog: {}", catalog_path().display()))?
         .into_iter()
         .map(|profile| MachineProfile {
             id: profile.id.as_str().to_string(),
@@ -65,8 +74,6 @@ fn load_saved_machines() -> Result<Vec<MachineProfile>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::sync::{Mutex, OnceLock};
 
     /// One `kind = "local"` host, optionally with the machine source on.
     fn config(include_machines: bool) -> Config {
@@ -182,25 +189,38 @@ session = "agents"
         );
     }
 
-    /// `XDG_STATE_HOME` is process-global. `just ci` runs nextest, which gives
-    /// every test its own process, but a plain `cargo test` does not.
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    /// Puts `XDG_STATE_HOME` back the way it was, on the happy path and when
+    /// the test body panics, so one failed assertion cannot leave a later
+    /// test in the same process reading the developer's real state directory.
+    struct RestoreStateHome {
+        previous: Option<std::ffi::OsString>,
+        root: std::path::PathBuf,
+    }
+
+    impl Drop for RestoreStateHome {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
     }
 
     /// Run `body` with `XDG_STATE_HOME` pointed at a throwaway directory.
     ///
-    /// The user's real catalog (`~/.local/state/herdr*/client/endpoints.json`)
-    /// is never read or written by these tests.
-    #[cfg(unix)]
+    /// `XDG_STATE_HOME` is process-global. `just ci` runs nextest, which gives
+    /// every test its own process, but a plain `cargo test` does not, so this
+    /// takes the crate-wide `test_config_env_lock` that every other test
+    /// mutating `XDG_*` variables takes. The user's real catalog
+    /// (`~/.local/state/herdr*/client/endpoints.json`) is never read or
+    /// written by these tests: `hosts_for_config` only ever reads, and it
+    /// reads under the override.
     fn with_state_home<T>(name: &str, body: impl FnOnce(&std::path::Path) -> T) -> T {
-        let guard = env_lock().lock();
-        let _guard = match guard {
+        let _guard = match crate::config::test_config_env_lock().lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let previous = std::env::var_os("XDG_STATE_HOME");
         let root = std::env::temp_dir().join(format!(
             "herdr-fleet-machines-{name}-{}",
             std::process::id()
@@ -212,20 +232,21 @@ session = "agents"
             std::fs::create_dir_all(root.join(app).join("client"))
                 .expect("state directory is creatable");
         }
+        let _restore = RestoreStateHome {
+            previous: std::env::var_os("XDG_STATE_HOME"),
+            root: root.clone(),
+        };
         std::env::set_var("XDG_STATE_HOME", &root);
-        let outcome = body(&root);
-        match previous {
-            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
-        let _ = std::fs::remove_dir_all(&root);
-        outcome
+        assert_eq!(
+            crate::config::state_dir().parent(),
+            Some(root.as_path()),
+            "the override must be what state_dir() reads"
+        );
+        body(&root)
     }
 
-    #[cfg(unix)]
     const APP_DIRS: [&str; 2] = ["herdr", "herdr-dev"];
 
-    #[cfg(unix)]
     fn write_catalog(root: &std::path::Path, content: &str) {
         for app in APP_DIRS {
             std::fs::write(
@@ -236,7 +257,6 @@ session = "agents"
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_real_catalog_is_read_only_when_it_is_opted_in() {
         let catalog = r#"{"version":1,"selected_profile":null,"ssh":[
@@ -260,7 +280,6 @@ session = "agents"
         });
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_missing_catalog_is_an_empty_machine_list() {
         with_state_home("missing", |_| {
@@ -269,7 +288,6 @@ session = "agents"
         });
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_corrupt_catalog_is_one_diagnostic() {
         with_state_home("corrupt", |root| {
