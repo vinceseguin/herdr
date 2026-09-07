@@ -396,6 +396,64 @@ pub(crate) fn parse_agent_env_hint(environ: &[u8]) -> Option<crate::detect::Agen
     None
 }
 
+/// Upper bound on how much of another process's environment herdr will read.
+///
+/// Generous next to any realistic environment block (the kernel caps the whole
+/// `execve` argument+environment area at a couple of megabytes) and small
+/// enough that a corrupt or hostile `/proc` entry cannot be turned into an
+/// unbounded allocation. Anything larger reads as "could not be read", which
+/// callers must surface as unverified rather than guessing.
+#[cfg(any(target_os = "linux", test))]
+const MAX_PROCESS_ENVIRON_BYTES: usize = 1024 * 1024;
+
+/// One variable out of another process's environment, where the OS exposes it.
+///
+/// Linux publishes a process's initial environment at `/proc/<pid>/environ`,
+/// readable for the caller's own processes. Nothing equivalent and portable
+/// exists elsewhere, so every other target returns `None`.
+///
+/// `None` means *not known*, never *not set*: a caller deciding which account
+/// an agent runs under must report that as unverified, never as verified.
+/// Note the value is the environment the process was **execed** with; a later
+/// `setenv` inside the process is not visible here, which is exactly the
+/// property that makes this a launch check and not a shell check.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_env_var(pid: u32, name: &str) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let file = std::fs::File::open(format!("/proc/{pid}/environ")).ok()?;
+    let LimitedRead::Complete(environ) =
+        read_limited_reader(file, MAX_PROCESS_ENVIRON_BYTES).ok()?
+    else {
+        return None;
+    };
+    parse_environ_blob(&environ, name)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn process_env_var(_pid: u32, _name: &str) -> Option<String> {
+    None
+}
+
+/// Pull `name` out of a NUL-separated `environ` blob.
+///
+/// First match wins, matching what the C library hands a process for a
+/// duplicated name. A value that is not valid UTF-8 is reported as unknown
+/// rather than lossily repaired: a mangled path compared against a real one
+/// would answer a question nobody asked.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn parse_environ_blob(environ: &[u8], name: &str) -> Option<String> {
+    let mut prefix = Vec::with_capacity(name.len() + 1);
+    prefix.extend_from_slice(name.as_bytes());
+    prefix.push(b'=');
+    environ
+        .split(|&byte| byte == 0)
+        .find_map(|record| record.strip_prefix(prefix.as_slice()))
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .map(str::to_owned)
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[derive(Debug)]
 pub(crate) struct InputSourceRestore;
@@ -617,5 +675,101 @@ mod tests {
             read_limited_reader(input, 16).expect("limited read"),
             LimitedRead::Complete(b"image".to_vec())
         );
+    }
+}
+
+/// Reading another process's environment is how herdr proves which Claude
+/// account an agent actually launched under, so the parse is tested on every
+/// target even where [`process_env_var`] itself always answers `None`.
+#[cfg(test)]
+mod process_environ_tests {
+    use super::*;
+
+    fn blob(records: &[&str]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for record in records {
+            bytes.extend_from_slice(record.as_bytes());
+            bytes.push(0);
+        }
+        bytes
+    }
+
+    #[test]
+    fn reads_a_variable_from_a_nul_separated_blob() {
+        let environ = blob(&["PATH=/usr/bin", "CLAUDE_CONFIG_DIR=/p/work", "TERM=xterm"]);
+        assert_eq!(
+            parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/p/work")
+        );
+    }
+
+    #[test]
+    fn a_missing_variable_is_unknown_rather_than_empty() {
+        let environ = blob(&["PATH=/usr/bin", "TERM=xterm"]);
+        assert_eq!(parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR"), None);
+        assert_eq!(parse_environ_blob(&[], "CLAUDE_CONFIG_DIR"), None);
+    }
+
+    #[test]
+    fn an_empty_value_is_read_as_an_empty_value() {
+        let environ = blob(&["CLAUDE_CONFIG_DIR="]);
+        assert_eq!(
+            parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_only_a_prefix_of_another_never_matches_it() {
+        let environ = blob(&["CLAUDE_CONFIG_DIRECTORY=/p/wrong", "CLAUDE=/p/other"]);
+        assert_eq!(parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR"), None);
+    }
+
+    #[test]
+    fn the_first_record_wins_the_way_a_c_library_resolves_a_duplicate() {
+        let environ = blob(&["CLAUDE_CONFIG_DIR=/p/first", "CLAUDE_CONFIG_DIR=/p/second"]);
+        assert_eq!(
+            parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/p/first")
+        );
+    }
+
+    #[test]
+    fn a_value_the_blob_does_not_terminate_is_still_read() {
+        // /proc/<pid>/environ normally ends with a NUL, but a process that
+        // rewrote its own environment block may not.
+        let environ = b"CLAUDE_CONFIG_DIR=/p/work".to_vec();
+        assert_eq!(
+            parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/p/work")
+        );
+    }
+
+    #[test]
+    fn a_value_that_is_not_utf8_is_unknown_rather_than_repaired() {
+        let mut environ = b"CLAUDE_CONFIG_DIR=/p/".to_vec();
+        environ.push(0xff);
+        environ.push(0);
+        assert_eq!(parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR"), None);
+    }
+
+    #[test]
+    fn pid_zero_is_never_probed() {
+        assert_eq!(process_env_var(0, "CLAUDE_CONFIG_DIR"), None);
+    }
+
+    /// The real read, where the platform has one: this test process's own
+    /// environment is the only one guaranteed to exist and be readable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reads_the_environment_of_a_live_process() {
+        let pid = std::process::id();
+        let name = "HERDR_PLATFORM_ENVIRON_PROBE";
+        assert_eq!(
+            process_env_var(pid, name),
+            None,
+            "the probe variable must not already be set"
+        );
+        assert_eq!(process_env_var(pid, "PATH"), std::env::var("PATH").ok());
     }
 }

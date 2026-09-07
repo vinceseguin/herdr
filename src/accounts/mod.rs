@@ -13,10 +13,12 @@
 //! environment line a client types to apply a profile, and [`tokens`] the
 //! metadata vocabulary reported back to the server.
 //!
-//! All six are pure: sync, socket-free, and free of `tokio`, `ratatui` and the
-//! client. Only the runtime drivers that arrive with later PRs speak to a
-//! server, and the architecture test below keeps that true.
+//! Those six are pure: sync, socket-free, and free of `tokio`, `ratatui` and
+//! the client. [`client`] is the one runtime driver — it composes stock API
+//! methods into the two-step launch — and the architecture test below keeps
+//! the split honest.
 
+pub mod client;
 pub mod config;
 pub mod launch;
 pub mod layout;

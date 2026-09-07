@@ -288,7 +288,7 @@ fn matched_rule_region_preview<'a>(
 
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let Some(name) = args.first() else {
-        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]");
+        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--account NAME|none] [--timeout MS] [-- <agent-args...>]");
         return Ok(2);
     };
     let separator = args
@@ -298,6 +298,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let mut kind = None;
     let mut pane_id = None;
     let mut timeout_ms = None;
+    let mut account = None;
     let mut index = 1;
     while index < separator {
         match args[index].as_str() {
@@ -328,6 +329,16 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                 };
                 index += 2;
             }
+            // Fork (E9): which Claude account profile the agent runs under.
+            // `none` opts out and gives back byte-for-byte stock behaviour.
+            "--account" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --account");
+                    return Ok(2);
+                };
+                account = Some(value.clone());
+                index += 2;
+            }
             other => {
                 eprintln!("unknown option: {other}");
                 return Ok(2);
@@ -352,6 +363,25 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     } else {
         Vec::new()
     };
+
+    // Fork (E9): decide and apply the Claude account profile *before* the
+    // stock start below types its command line. This is the whole of decision
+    // (b) at the call site: the pane shell is given `CLAUDE_CONFIG_DIR`, then
+    // the unmodified `agent.start` runs and the `claude` it types inherits it.
+    // Both lines reach the same pty in order, so the shell executes the
+    // assignment before it reads the command. `None` means no profile applies
+    // and the rest of this function is byte-for-byte the stock behaviour.
+    let account_plan = match prepare_account_launch(
+        &expected_kind,
+        account.as_deref(),
+        &pane_id,
+        name,
+        &agent_args,
+    ) {
+        Ok(plan) => plan,
+        Err(exit_code) => return Ok(exit_code),
+    };
+
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
     let retryable_timeout = timeout > crate::app::AGENT_START_SETTLE_DELAY
         && timeout <= crate::app::MAX_AGENT_START_TIMEOUT;
@@ -426,13 +456,95 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     match waited {
         Ok(Ok(agent)) => {
             response["result"]["agent"] = agent;
-            super::print_response(&response)
+            // Fork (E9): grade the launch against the process's own
+            // environment and record `tokens.account`, then add the two
+            // contract keys to the stock response.
+            let Some(plan) = account_plan else {
+                return super::print_response(&response);
+            };
+            let outcome = crate::accounts::client::finish(&plan);
+            response["result"]["account"] = serde_json::Value::String(outcome.account.clone());
+            response["result"]["account_state"] =
+                serde_json::Value::String(outcome.account_state.as_str().to_string());
+            let exit_code = super::print_response(&response)?;
+            for warning in &outcome.warnings {
+                eprintln!("warning: {warning}");
+            }
+            if outcome.account_state == crate::accounts::tokens::AccountState::Mismatch {
+                eprintln!(
+                    "error: agent {:?} is not running under account {:?}: its {} is {:?}. \
+                     The account token records the mismatch; stop the agent and start it again.",
+                    plan.name,
+                    outcome.account,
+                    plan.profile.agent.config_dir_env_var(),
+                    outcome.actual_config_dir.as_deref().unwrap_or("unknown"),
+                );
+                return Ok(1);
+            }
+            Ok(exit_code)
         }
         Ok(Err(error)) => super::print_response(&error),
         Err(err) => {
             print_agent_transport_error(err, "cli:agent:start", "agent_start_transport_failed")
         }
     }
+}
+
+/// Fork (E9): resolve `--account` and put the profile's environment into the
+/// pane, returning the plan the launch must be graded against.
+///
+/// `Ok(None)` means no profile applies and nothing was typed. Every refusal
+/// happens before a byte reaches the pane, and every one of them is an error:
+/// falling back to "start it anyway" is how an agent ends up billing the wrong
+/// Claude account without anyone noticing.
+fn prepare_account_launch(
+    expected_kind: &str,
+    account: Option<&str>,
+    pane_id: &str,
+    name: &str,
+    agent_args: &[String],
+) -> Result<Option<crate::accounts::launch::LaunchPlan>, i32> {
+    if expected_kind != crate::accounts::tokens::AGENT_LABEL {
+        // Decision (c): profiles configure Claude only for now. Silently
+        // ignoring `--account` on another kind would look like it worked.
+        if let Some(requested) =
+            account.filter(|value| *value != crate::accounts::profile::NO_ACCOUNT)
+        {
+            eprintln!(
+                "--account {requested:?} applies to --kind claude only (got {expected_kind:?})"
+            );
+            return Err(2);
+        }
+        return Ok(None);
+    }
+
+    let config = crate::config::Config::load().config;
+    let (profiles, diagnostics) = crate::accounts::profile::load_profiles(&config);
+    for diagnostic in &diagnostics {
+        eprintln!("warning: {diagnostic}");
+    }
+
+    let profile = match crate::accounts::client::choose_profile(&profiles, account) {
+        Ok(Some(profile)) => profile.clone(),
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            eprintln!("{error}");
+            return Err(2);
+        }
+    };
+
+    let plan = match crate::accounts::client::prepare(&profile, pane_id, name, agent_args) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("{error}");
+            return Err(1);
+        }
+    };
+    if let Err(error) = crate::accounts::client::apply_env(&plan) {
+        eprintln!("{error}");
+        return Err(1);
+    }
+    Ok(Some(plan))
 }
 
 fn agent_list(args: &[String]) -> std::io::Result<i32> {
