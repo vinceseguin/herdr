@@ -131,8 +131,7 @@ impl InspectOptions {
         Self { identity: false }
     }
 
-    /// Also read `oauthAccount` for display.
-    #[allow(dead_code)] // `herdr account status` (PR 3) is the first caller.
+    /// Also read `oauthAccount` for display. Used by `herdr account status`.
     pub fn with_identity() -> Self {
         Self { identity: true }
     }
