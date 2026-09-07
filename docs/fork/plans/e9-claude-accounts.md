@@ -344,7 +344,7 @@ implementation starts only after E3 is ✅.
 
 | # | Title | Group | Depends on | Status |
 | --- | --- | --- | --- | --- |
-| 1 | feat(accounts): account profiles config, pure resolution, herdr account list and the accounts lab | A · Foundations | — | ⬜ |
+| 1 | feat(accounts): account profiles config, pure resolution, herdr account list and the accounts lab | A · Foundations | — | ✅ |
 | 2 | feat(accounts): herdr account add, remove and default with seeded profile directories | A · Foundations | 1 | ⬜ |
 | 3 | feat(accounts): herdr account status and login | B · CLI | 2 | ⬜ |
 | 4 | feat(accounts): launch claude under a profile with herdr agent start --account | B · CLI | 1 | ⬜ |
@@ -588,10 +588,96 @@ reports no diagnostics; a deliberately duplicated name in the lab config
 produces exactly one diagnostic and exit 1; `accounts-lab.sh down`.
 
 **Downstream.** Field names (`name`, `agent`, `config_dir`, `default`), the
-store schema (`version`, `default`, `[[profiles]]`), the token constants and
-`AccountState` strings are the user-facing contract: add, never rename.
-`Profiles` and `ProfileInspection` are what PRs 2–5, 7–10 consume. The lab's
-`env` names are the fixture the E2E validation relies on.
+store schema (`version`, `default`, `[[profiles]]`), the token constants
+(`METADATA_SOURCE = "fork:accounts"`, `APPLIES_TO_SOURCE = "herdr:claude"`,
+`AGENT_LABEL = "claude"`, `ACCOUNT_TOKEN = "account"`,
+`ACCOUNT_STATE_TOKEN = "account_state"`) and the `AccountState` strings
+(`ok | unverified | mismatch | limited | logged_out`, with
+`AccountState::parse` returning `None` for anything else) are the user-facing
+contract: add, never rename. `Profiles` (`get`, `iter`, `names`,
+`default_profile`, `choose`, `Choice::{Profile, None}`,
+`ChoiceError::{Unknown, InvalidName}`) and `ProfileInspection` are what PRs
+2–5, 7–10 consume, always through
+`crate::accounts::profile::load_profiles(&Config) -> (Profiles, Vec<String>)`.
+The lab's `env` names — `HERDR_ACCOUNTS_LAB_ROOT`, `XDG_CONFIG_HOME`,
+`HERDR_ACCOUNTS_LAB_SESSION`, `HERDR_ACCOUNTS_LAB_PANE`,
+`HERDR_ACCOUNTS_LAB_PROFILE_PERSO` / `_WORK` / `_AMBIENT`,
+`HERDR_ACCOUNTS_LAB_CLIENT_SOCKET`, `HERDR_ACCOUNTS_LAB_API_SOCKET`,
+`HERDR_BIN`, `PATH` — are the fixture the E2E validation relies on.
+
+**As built (PR 1, merged).** The tree had moved three merges past the
+`ecfbb321` the *Real current state* section was verified at (all of E3, the
+fleet reconnect fix, and the upstream sync to v0.9.0 — the binary is
+`0.9.0-fork`). Every path in the section above still exists; the corrections
+below are what later PRs must code against, and they win over the prose.
+
+- **`Config.accounts` is `crate::accounts::config::AccountsSection`, not
+  `Vec<AccountProfileConfig>`.** `Config::load` deserialises the whole file in
+  one pass, so a wrong-shaped `accounts` key would have dropped the user's
+  *entire* config back to defaults. `AccountsSection` has a hand-written
+  `Deserialize` that is total over TOML: an array of tables is the profiles, a
+  table (`[accounts.defaults]`) and any scalar are an empty section plus a
+  diagnostic. Read the entries with `config.accounts.as_slice()`;
+  `crate::accounts::config::diagnostics(&AccountsSection)` covers both the
+  section verdict and the per-entry problems, and `section_diagnostic(&…)`
+  returns just the section verdict (what `load_profiles` chains, so the
+  per-entry ones are not reported twice).
+- **`layout::inspect` takes options:** `inspect(&AccountProfile,
+  InspectOptions) -> ProfileInspection`, with `InspectOptions::health()` (the
+  cheap checks) and `InspectOptions::with_identity()` (also parses
+  `.claude.json`, which is megabytes on a real installation).
+  `inspect_dir(&Path, InspectOptions)` is the same thing addressed by
+  directory. `account list` uses `health()`; PR 3's `status` wants
+  `with_identity()`.
+- **`store::load()` returns `(AccountsStore, Vec<String>)`**, not
+  `io::Result`: a missing file is an empty store with no diagnostic, and a
+  read/parse/version problem is a diagnostic, never a failure. The file
+  schema is `deny_unknown_fields` with `version = 1` (defaulted, so a
+  hand-written file without it still loads). `store::save(&AccountsStore)`
+  ships unused behind a narrow `#[allow(dead_code)]`; PR 2 removes it by
+  adding the caller. `parse`/`render` are the pure halves.
+- **`validate_name` lives in `config.rs`** and is re-exported from
+  `profile.rs`. It additionally refuses `.`, `..` and a leading `-` (the name
+  becomes a directory component in PR 2 and a CLI argument everywhere).
+- **Directories are compared and stored lexically normalized**
+  (`config::dir_key`): `~/.claude`, `~/.claude/` and `~/./.claude` are one
+  directory, so two profiles cannot share one credentials directory by
+  spelling it differently. `AccountProfile.config_dir` is the normalized form.
+- **`launch::env_assignment_line` refuses `!` for `Csh` only.** csh and tcsh
+  run history substitution before quote processing, so `setenv X '/p/a!b'`
+  fails with "Event not found", the assignment silently never happens, and the
+  agent would launch under the ambient account. Refusals per family are
+  covered by `no_family_can_be_talked_into_a_second_command`, which runs 11
+  adversarial values across all eight families — extend it, do not replace it.
+- **No `src/integration/**` edit.** `crate::integration::env` is a private
+  module, so `profile.rs` mirrors its `home_dir()` and repeats the
+  `CLAUDE_CONFIG_DIR` string (`AccountAgent::config_dir_env_var`) rather than
+  opening that module up.
+- **`mod accounts;` is alphabetical in `src/main.rs`** (before
+  `mod agent_resume;`), not after `mod gateway;`.
+- **The `DEFAULT_CONFIG` `[[accounts]]` sample is *fully* commented, including
+  its header, and sits at the end of the file after `[advanced]`** — not
+  directly after `[gateway]`. An uncommented `[[accounts]]` header with every
+  key commented out is one nameless profile, which would report two
+  diagnostics on a fresh config; and a commented block between `[gateway]` and
+  `[experimental]` breaks `uncommented_default_gateway_block()` (it would
+  uncomment `name = …` twice into `[gateway]`). The slicer anchors on
+  `"\n# [[accounts]]\n"`.
+- **`scripts/config_reference_check.py` consults `SKIPPED_SUBTREES` before it
+  resolves a field's type.** `AccountsSection` lives outside the checker's
+  `src/config` model root, so the old order treated `accounts` as a leaf key
+  the website reference had to enumerate.
+- **The lab pins `CLAUDE_CONFIG_DIR`.** `accounts-lab.sh` seeds a third,
+  deliberately logged-out profile `ambient` and points `CLAUDE_CONFIG_DIR` at
+  it for everything it starts (exported as
+  `HERDR_ACCOUNTS_LAB_PROFILE_AMBIENT`; `tests/support/accounts_lab.rs::Lab::
+  herdr` does the same), so a launch that applied no profile still lands
+  inside the lab. `fake-claude.sh` has **no** `$HOME/.claude` fallback: with
+  no `CLAUDE_CONFIG_DIR` it writes nothing, and it exits 3 if pointed at the
+  real `~/.claude`.
+- `tests/support/mod.rs` gained `pub mod accounts_lab;` **before** (not after)
+  `pub mod fleet_lab;` — the list is alphabetical. E3's `pub mod gateway;`
+  was already there.
 
 ### PR 2 — feat(accounts): herdr account add, remove and default with seeded profile directories · deps: 1
 
@@ -601,7 +687,11 @@ ever touching credentials.
 
 **Files**
 
-- `src/accounts/layout.rs` (write half): `SeedPlan { links: Vec<(src,
+- `src/accounts/layout.rs` (write half; PR 1 shipped the read half plus the
+  `SHARED_ENTRIES` / `COPIED_ENTRIES` / `PRIVATE_ENTRIES` /
+  `SCRUBBED_IDENTITY_KEYS` / `SCRUBBED_KEY_SUBSTRINGS` constants this PR
+  applies — drop their `#[allow(dead_code)]` markers as you add the callers):
+  `SeedPlan { links: Vec<(src,
   dst)>, copies: Vec<(src, dst)>, scrub: Vec<PathBuf>, skipped: Vec<String>
   }`, `plan_seed(source_dir, target_dir) -> io::Result<SeedPlan>` (pure over
   a directory listing), `apply_seed(&SeedPlan) -> io::Result<SeedReport>`
@@ -611,7 +701,8 @@ ever touching credentials.
   Result<String, String>` (pure, `serde_json::Value`, removes identity keys,
   preserves everything else).
 - `src/accounts/store.rs`: `AccountsStore::{add, remove, set_default}`
-  returning `Result<(), String>`; `save` atomic.
+  returning `Result<(), String>`; `save` is already atomic (PR 1) and only
+  needs its `#[allow(dead_code)]` removed once this PR calls it.
 - `src/cli/account.rs`: `add <name> [--config-dir <path>] [--from
   <profile>] [--dry-run] [--force] [--print-config] [--no-hook] [--json]`,
   `remove <name> [--delete-dir]` (refuses when the profile came from
@@ -656,8 +747,8 @@ then `list` shows the new default; `account remove third --delete-dir`
 cleans up; `account remove perso` (config origin) exits 1 with the message.
 Verify `stat -c %a` of the new dir is `700`.
 
-**Downstream.** `hook_installed` from PR 1's `inspect` is what PR 4's
-preflight warns on ("session ids will not be reported; switching will not
+**Downstream.** `hook_installed` from PR 1's `inspect(profile,
+InspectOptions::health())` is what PR 4's preflight warns on ("session ids will not be reported; switching will not
 work") — it must never block a launch. The seed list is documentation
 source for PR 11.
 
@@ -668,7 +759,9 @@ agents are running on it, and let the user log a profile in from a pane.
 
 **Files**
 
-- `src/accounts/status.rs` (new, pure assembly): `AccountStatus { profile,
+- `src/accounts/status.rs` (new, pure assembly; call
+  `layout::inspect(profile, InspectOptions::with_identity())` — the default
+  `health()` deliberately does not parse `.claude.json`): `AccountStatus { profile,
   inspection, agents: Vec<AgentOnAccount { pane_id, name, agent_status,
   account_state }> }`, `assemble(profiles, inspections, agent_infos) ->
   Vec<AccountStatus>` (agents matched by `tokens.account`), `render_text`.
@@ -681,7 +774,9 @@ agents are running on it, and let the user log a profile in from a pane.
 
 **Shapes/approach.** `login` = resolve the pane (`--pane` or `pane.current`),
 `pane.process_info` → shell name → `ShellFamily::from_process_name` →
-`accounts::launch::env_assignment_line` (PR 1) → `pane.send_text(line +
+`accounts::launch::env_assignment_line` (PR 1; it returns `Err` for an
+unrecognised shell *and* for a directory that shell cannot quote — surface
+both, never type a fallback) → `pane.send_text(line +
 "\r")` → `pane.send_text("claude auth login\r")` → prints "follow the login
 in pane <id>; run `herdr account status <name>` when done". An unrecognised
 shell or a pane not at its prompt is an error; nothing is typed. `status` shows
@@ -712,8 +807,10 @@ by default per decision (f).
 
 **Files**
 
-- `src/accounts/launch.rs` (created in PR 1 with `ShellFamily` and
-  `env_assignment_line`; this PR adds): `LaunchPlan { pane_id, name, kind:
+- `src/accounts/launch.rs` (created in PR 1 with `ShellFamily`,
+  `env_assignment_line` and `LaunchError`, all behind a module-level
+  `#![allow(dead_code)]` this PR should delete once it has callers; this PR
+  adds): `LaunchPlan { pane_id, name, kind:
   "claude", args, profile, line }`, `plan_launch(profiles, choice,
   pane_shell, …) -> Result<LaunchPlan, LaunchError>` (profile directory must
   exist; hook missing is a warning carried on the plan, not an error).

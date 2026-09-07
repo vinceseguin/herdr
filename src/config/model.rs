@@ -322,6 +322,10 @@ pub struct Config {
     pub remote: RemoteConfig,
     pub fleet: FleetConfig,
     pub gateway: GatewayConfig,
+    /// `[[accounts]]` — Claude account profiles (fork). A top-level array of
+    /// tables, so it lives outside `src/config` next to the rest of
+    /// `crate::accounts`.
+    pub accounts: crate::accounts::config::AccountsSection,
 }
 
 #[derive(Debug)]

@@ -5,6 +5,7 @@ use tracing::warn;
 use super::{model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
 
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
+    "accounts",
     "advanced",
     "experimental",
     "fleet",
@@ -367,10 +368,19 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         &mut invalid_sections,
         |section| config.gateway = section,
     );
+    load_live_section(
+        table,
+        "accounts",
+        "accounts config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.accounts = section,
+    );
 
     diagnostics.extend(config.theme.diagnostics());
     diagnostics.extend(config.fleet.diagnostics());
     diagnostics.extend(config.gateway.diagnostics());
+    diagnostics.extend(crate::accounts::config::diagnostics(&config.accounts));
 
     Ok(LoadedConfig {
         config,
@@ -1198,6 +1208,139 @@ allowed_origins = ["https://fleet.example.ts.net"]
             ]
         );
         assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn live_config_loads_the_accounts_section_and_reports_its_diagnostics() {
+        let loaded = load_live_config_from_str(
+            r#"
+[[accounts]]
+name = "perso"
+config_dir = "~/.claude"
+default = true
+
+[[accounts]]
+name = "work"
+config_dir = "~/.claude-work"
+"#,
+        )
+        .expect("live config parses");
+
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert_eq!(loaded.config.accounts.as_slice().len(), 2);
+        assert_eq!(loaded.config.accounts.as_slice()[0].name, "perso");
+        assert!(loaded.config.accounts.as_slice()[0].default);
+
+        let loaded = load_live_config_from_str(
+            "[[accounts]]\nname = \"perso\"\nconfig_dir = \"~/.claude\"\nagent = \"codex\"\ndefualt = true\n",
+        )
+        .expect("live config parses");
+
+        assert_eq!(
+            loaded.diagnostics,
+            vec![
+                "unknown config key accounts.0.defualt; ignoring key".to_string(),
+                "unsupported account agent: accounts[0].agent = \"codex\"; only \"claude\" is \
+                 supported; ignoring the entry"
+                    .to_string(),
+            ]
+        );
+        assert!(loaded.invalid_sections.is_empty());
+    }
+
+    /// `[accounts.defaults]` is reserved for per-workspace defaults. Writing it
+    /// today must cost the user one diagnostic, never the rest of their config.
+    #[test]
+    fn live_config_reports_a_reserved_accounts_table_without_losing_the_config() {
+        let loaded = load_live_config_from_str(
+            "[accounts.defaults]\nworkspace = \"x\"\n\n[ui]\nmouse_capture = false\n",
+        )
+        .expect("live config parses");
+
+        assert!(loaded.config.accounts.is_empty());
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("[accounts.defaults] is reserved")),
+            "{:?}",
+            loaded.diagnostics
+        );
+        assert!(loaded.invalid_sections.is_empty());
+        assert!(
+            !loaded.config.ui.mouse_capture,
+            "the rest of the config must survive"
+        );
+    }
+
+    #[test]
+    fn startup_config_reports_a_reserved_accounts_table_without_losing_the_config() {
+        let _guard = crate::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "herdr-config-accounts-reserved-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "[accounts.defaults]\nworkspace = \"x\"\n\n[ui]\nmouse_capture = false\n",
+        )
+        .expect("write config");
+        std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+        let loaded = Config::load();
+        std::env::remove_var(CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(loaded.config.accounts.is_empty());
+        assert!(
+            !loaded.config.ui.mouse_capture,
+            "a reserved key must not fall the whole config back to defaults: {:?}",
+            loaded.diagnostics
+        );
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("[accounts.defaults] is reserved")),
+            "{:?}",
+            loaded.diagnostics
+        );
+    }
+
+    /// `Config::load` deserialises the whole file in one pass, so a scalar
+    /// `accounts` key must be a diagnostic. A hard type error there would take
+    /// the user's keybindings, theme and everything else down with it.
+    #[test]
+    fn startup_config_survives_a_scalar_accounts_key() {
+        let _guard = crate::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "herdr-config-accounts-scalar-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "accounts = 3\n\n[ui]\nmouse_capture = false\n")
+            .expect("write config");
+        std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+        let loaded = Config::load();
+        std::env::remove_var(CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(loaded.config.accounts.is_empty());
+        assert!(
+            !loaded.config.ui.mouse_capture,
+            "one bad fork key must not fall the whole config back to defaults: {:?}",
+            loaded.diagnostics
+        );
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("invalid accounts config")),
+            "{:?}",
+            loaded.diagnostics
+        );
     }
 
     #[test]

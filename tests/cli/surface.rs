@@ -321,6 +321,7 @@ fn subcommand_help_explains_automation_semantics_without_a_server() {
             &["pane", "send-keys", "--help"],
             "canonical Escape key name",
         ),
+        (&["account", "list", "--help"], "never reads or prints"),
     ];
 
     for (args, expected) in cases {

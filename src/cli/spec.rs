@@ -40,6 +40,7 @@ pub(super) fn command() -> Command {
         .subcommand(config_command())
         .subcommand(channel_command())
         .subcommand(machine::command())
+        .subcommand(account_command())
         .subcommand(server_command())
         .subcommand(api_command())
         .subcommand(workspace_command())
@@ -183,6 +184,20 @@ fn gateway_command() -> Command {
                         .value_parser(["read", "control"])
                         .help("Which token to replace"),
                 ),
+        )
+}
+
+fn account_command() -> Command {
+    Command::new("account")
+        .about("Manage Claude account profiles for agents")
+        .subcommand(
+            Command::new("list")
+                .about(
+                    "List configured account profiles and their health. Reads configuration and \
+                     profile directories only: it contacts no server, and never reads or prints \
+                     credentials.",
+                )
+                .arg(json_flag().help("Print the profiles as JSON")),
         )
 }
 

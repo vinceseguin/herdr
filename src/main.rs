@@ -11,6 +11,7 @@ const NESTED_HERDR_MESSAGES: [&str; 6] = [
     "recursion detected. base case not found. aborting.",
 ];
 
+mod accounts;
 mod agent_resume;
 mod api;
 mod app;
@@ -468,6 +469,23 @@ pane_history = false
 # Maximum scrollback buffer size in bytes retained per pane terminal.
 # Matches Ghostty's default scrollback-limit behavior.
 # scrollback_limit_bytes = 10000000
+
+# Claude account profiles (fork). One entry per Claude config directory: herdr
+# starts an agent under a profile by exporting its CLAUDE_CONFIG_DIR, so usage
+# limits, credentials and identity are per profile. Only "claude" in v1.
+# `herdr account add` writes to <config>/accounts/profiles.toml instead, so
+# this file stays yours; entries here win when a name is defined in both.
+# Uncomment the whole block to use it. [accounts.defaults] is reserved.
+# [[accounts]]
+# name = "perso"              # display name and id: letters, digits . _ - (max 32)
+# agent = "claude"            # only "claude" in v1
+# config_dir = "~/.claude"    # this profile's CLAUDE_CONFIG_DIR
+# default = true              # used when an agent starts without a choice
+#
+# [[accounts]]
+# name = "work"
+# agent = "claude"
+# config_dir = "~/.claude-work"
 "##;
 
 // Bundled at build time so the printed skill always matches this binary's release.
@@ -633,6 +651,7 @@ fn main() -> io::Result<()> {
         println!("       herdr api <subcommand> ...");
         println!("       herdr completion <shell>");
         println!("       herdr fleet status [--json] [--watch]");
+        println!("       herdr account list [--json]");
         #[cfg(feature = "gateway")]
         println!("       {}", crate::gateway::GATEWAY_COMMAND_LINE);
         println!("       herdr config <subcommand> ...");
@@ -708,6 +727,10 @@ fn main() -> io::Result<()> {
             (
                 "herdr integration <subcommand>",
                 "Manage built-in agent integrations",
+            ),
+            (
+                "herdr account <subcommand>",
+                "Claude account profiles for agents",
             ),
         ] {
             println!("  {command:<32} {description}");
@@ -785,6 +808,7 @@ fn main() -> io::Result<()> {
                 "fleet",
                 #[cfg(feature = "gateway")]
                 "gateway",
+                "account",
                 "machine",
                 "workspace",
                 "worktree",
@@ -1053,5 +1077,97 @@ mod tests {
                 "the [gateway] sample must stay commented out: {line}"
             );
         }
+    }
+
+    /// The `[[accounts]]` sample of `DEFAULT_CONFIG`, header line included.
+    ///
+    /// Unlike `[fleet]` and `[gateway]`, the header itself is commented: an
+    /// uncommented `[[accounts]]` with every key commented out would be one
+    /// nameless profile, which reports two diagnostics on a fresh config.
+    fn default_config_accounts_block() -> &'static str {
+        let start = DEFAULT_CONFIG
+            .find("\n# [[accounts]]\n")
+            .expect("DEFAULT_CONFIG has an [[accounts]] sample")
+            + 1;
+        let rest = &DEFAULT_CONFIG[start..];
+        let end = rest[1..]
+            .find("\n[")
+            .map(|offset| offset + 2)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// Uncomment the sample TOML lines of the `[[accounts]]` block, leaving the
+    /// prose comments alone, so a key added to the sample later is validated
+    /// too instead of being silently skipped.
+    fn uncommented_default_accounts_block() -> String {
+        default_config_accounts_block()
+            .lines()
+            .map(|line| {
+                let body = line.strip_prefix("# ").unwrap_or(line);
+                let key = body.split(" = ").next().unwrap_or_default();
+                let is_toml = body == "[[accounts]]"
+                    || (!key.is_empty()
+                        && key.len() < body.len()
+                        && key
+                            .bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte == b'_'));
+                if is_toml {
+                    body
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn default_config_accounts_block_parses_without_diagnostics() {
+        let block = uncommented_default_accounts_block();
+        assert!(
+            block.contains("\nname = \"perso\""),
+            "sample keys should be uncommented:\n{block}"
+        );
+
+        let config: config::Config = toml::from_str(&block).expect("accounts sample is valid TOML");
+        let entries = config.accounts.as_slice();
+        assert_eq!(entries.len(), 2);
+        let perso = &entries[0];
+        assert_eq!(perso.name, "perso");
+        assert_eq!(perso.agent, "claude");
+        assert_eq!(perso.config_dir, "~/.claude");
+        assert!(perso.default);
+        let work = &entries[1];
+        assert_eq!(work.name, "work");
+        assert_eq!(work.config_dir, "~/.claude-work");
+        assert!(!work.default);
+
+        let diagnostics = accounts::config::diagnostics(&config.accounts);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn default_config_accounts_block_is_commented_out() {
+        let block = default_config_accounts_block();
+        assert!(block.starts_with("# [[accounts]]\n"), "{block}");
+        for line in block.lines() {
+            assert!(
+                line.is_empty() || line.starts_with('#'),
+                "the [[accounts]] sample must stay commented out: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_config_itself_reports_no_account_diagnostics() {
+        let config: config::Config =
+            toml::from_str(DEFAULT_CONFIG).expect("DEFAULT_CONFIG is valid TOML");
+        assert!(
+            config.accounts.is_empty(),
+            "the shipped default must configure no profiles"
+        );
+        let diagnostics = accounts::config::diagnostics(&config.accounts);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 }
