@@ -1308,6 +1308,41 @@ config_dir = "~/.claude-work"
         );
     }
 
+    /// `Config::load` deserialises the whole file in one pass, so a scalar
+    /// `accounts` key must be a diagnostic. A hard type error there would take
+    /// the user's keybindings, theme and everything else down with it.
+    #[test]
+    fn startup_config_survives_a_scalar_accounts_key() {
+        let _guard = crate::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "herdr-config-accounts-scalar-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "accounts = 3\n\n[ui]\nmouse_capture = false\n")
+            .expect("write config");
+        std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+        let loaded = Config::load();
+        std::env::remove_var(CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(loaded.config.accounts.is_empty());
+        assert!(
+            !loaded.config.ui.mouse_capture,
+            "one bad fork key must not fall the whole config back to defaults: {:?}",
+            loaded.diagnostics
+        );
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("invalid accounts config")),
+            "{:?}",
+            loaded.diagnostics
+        );
+    }
+
     #[test]
     fn live_config_keeps_an_invalid_gateway_section_local_to_gateway() {
         let loaded = load_live_config_from_str(

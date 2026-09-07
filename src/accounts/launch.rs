@@ -202,8 +202,23 @@ fn check_value(family: ShellFamily, value: &str) -> Result<(), LaunchError> {
         // fish escapes inside single quotes with a backslash, so both a quote
         // and a backslash are representable.
         ShellFamily::Fish => Ok(()),
-        // csh, nu and xonsh single quotes have no escape at all.
-        ShellFamily::Csh | ShellFamily::Nu => {
+        // csh and tcsh run history substitution *before* quote processing, so
+        // single quotes do not protect `!`: ` setenv X '/p/a!b'` fails at an
+        // interactive prompt with "Event not found", the assignment never
+        // happens, and the agent would then launch under the ambient account.
+        // Only a backslash escapes it there, and mixing that with the quoting
+        // is not worth the risk — refuse instead.
+        ShellFamily::Csh => {
+            if value.contains('\'') {
+                return refuse("a single quote cannot be escaped in this shell's quoting");
+            }
+            if value.contains('!') {
+                return refuse("'!' is history-expanded even inside single quotes in csh and tcsh");
+            }
+            Ok(())
+        }
+        // nu's single quotes have no escape at all.
+        ShellFamily::Nu => {
             if value.contains('\'') {
                 return refuse("a single quote cannot be escaped in this shell's quoting");
             }
@@ -447,6 +462,103 @@ mod tests {
                     "{family:?}: the line must end inside the quotes: {line}"
                 );
                 assert!(!quoted.is_empty(), "{family:?}: {line}");
+            }
+        }
+    }
+
+    /// csh and tcsh expand `!` before they look at quotes, so a value carrying
+    /// one has to be refused: emitting it would make `setenv` fail and leave
+    /// the agent running under whatever account the pane already had.
+    #[test]
+    fn csh_refuses_a_history_expansion_character() {
+        let error =
+            env_assignment_line(ShellFamily::Csh, VAR, "/p/a!b").expect_err("csh must refuse '!'");
+        assert!(
+            matches!(&error, LaunchError::UnquotableValue { family, reason }
+                if *family == ShellFamily::Csh && reason.contains("history-expanded")),
+            "{error:?}"
+        );
+
+        // Only csh: POSIX, fish, PowerShell, nu, elvish and xonsh quoting all
+        // hold a literal `!`, and cmd refuses it for delayed expansion.
+        for family in [
+            ShellFamily::Posix,
+            ShellFamily::Fish,
+            ShellFamily::PowerShell,
+            ShellFamily::Nu,
+            ShellFamily::Elvish,
+            ShellFamily::Xonsh,
+        ] {
+            let line = env_assignment_line(family, VAR, "/p/a!b").expect("line");
+            assert!(line.contains("/p/a!b"), "{family:?}: {line}");
+        }
+    }
+
+    /// Every family, not only the ones with a quoted body: a value that a shell
+    /// would read as a second command must either be inside the quotes or
+    /// refused outright.
+    #[test]
+    fn no_family_can_be_talked_into_a_second_command() {
+        for value in [
+            "/p/a; rm -rf /",
+            "/p/a && echo x",
+            "/p/a | tee",
+            "/p/a`id`",
+            "/p/a$(id)",
+            "/p/a\nrm -rf /",
+            "/p/a!b",
+            "/p/a'; rm -rf /; '",
+            "/p/a\"; rm -rf /",
+            "/p/a%PATH%",
+            "/p/a\\",
+        ] {
+            for family in [
+                ShellFamily::Posix,
+                ShellFamily::Fish,
+                ShellFamily::Csh,
+                ShellFamily::PowerShell,
+                ShellFamily::Nu,
+                ShellFamily::Elvish,
+                ShellFamily::Xonsh,
+                ShellFamily::Cmd,
+            ] {
+                let Ok(line) = env_assignment_line(family, VAR, value) else {
+                    continue;
+                };
+                let body = match family {
+                    // ` set "VAR=value"`: the value sits between the only two
+                    // double quotes on the line.
+                    ShellFamily::Cmd => {
+                        let inner = line
+                            .split_once('"')
+                            .and_then(|(_, rest)| rest.rsplit_once('"'))
+                            .map(|(inside, _)| inside)
+                            .expect("a quoted body");
+                        assert_eq!(inner.matches('"').count(), 0, "{family:?}: {line}");
+                        inner
+                            .split_once('=')
+                            .map(|(_, value)| value)
+                            .expect("an assignment")
+                            .to_string()
+                    }
+                    _ => line
+                        .split_once('\'')
+                        .and_then(|(_, rest)| rest.rsplit_once('\''))
+                        .map(|(inside, _)| inside.to_string())
+                        .expect("a quoted body"),
+                };
+                assert!(
+                    line.ends_with(match family {
+                        ShellFamily::Cmd => '"',
+                        _ => '\'',
+                    }),
+                    "{family:?}: the line must end where the quoting does: {line}"
+                );
+                assert!(!body.is_empty(), "{family:?}: {line}");
+                assert!(
+                    !line.contains('\n') && !line.contains('\r'),
+                    "{family:?}: a line must stay one line: {line:?}"
+                );
             }
         }
     }

@@ -22,6 +22,10 @@ pub const SESSION: &str = "accounts-lab";
 pub const DEFAULT_PROFILE: &str = "perso";
 pub const SECOND_PROFILE: &str = "work";
 
+/// Where the lab points `CLAUDE_CONFIG_DIR` when no profile was applied, so a
+/// launch that chose none still lands inside the lab root.
+pub const AMBIENT_PROFILE: &str = "ambient";
+
 pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -61,6 +65,11 @@ impl Lab {
 
     pub fn claude_stub(&self) -> PathBuf {
         self.root.join("bin").join("claude")
+    }
+
+    /// The directory a lab command falls back to when it applies no profile.
+    pub fn ambient_dir(&self) -> PathBuf {
+        self.profile_dir(AMBIENT_PROFILE)
     }
 
     pub fn run(&self, args: &[&str]) -> Output {
@@ -107,6 +116,10 @@ impl Lab {
             .env("XDG_CONFIG_HOME", self.root.join("xdg"))
             .env("XDG_RUNTIME_DIR", self.runtime_dir())
             .env("PATH", path)
+            // Pinned inside the lab: a herdr subcommand that reads the ambient
+            // Claude directory (`integration install claude`, later PRs) must
+            // never reach the developer's own ~/.claude.
+            .env("CLAUDE_CONFIG_DIR", self.ambient_dir())
             .env("HERDR_BIN", env!("CARGO_BIN_EXE_herdr"))
             .env_remove("HERDR_SOCKET_PATH")
             .env_remove("HERDR_CLIENT_SOCKET_PATH")

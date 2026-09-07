@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::accounts::config::{AccountProfileConfig, DEFAULT_AGENT};
+use crate::accounts::config::{dir_key, AccountProfileConfig, DEFAULT_AGENT};
 use crate::accounts::store::AccountsStore;
 
 pub use crate::accounts::config::validate_name;
@@ -291,7 +291,10 @@ pub fn resolve(
                 ));
                 continue;
             }
-            let config_dir = expand(raw, home);
+            // Folded to the same key the duplicate check uses, so two
+            // entries cannot point at one credentials directory by spelling it
+            // `/p/work` and `/p/work/`.
+            let config_dir = dir_key(&expand(raw, home));
             if !config_dir.is_absolute() {
                 diagnostics.push(format!(
                     "invalid account config_dir: {} = {:?}; must be an absolute path after ~ expansion; ignoring the entry",
@@ -408,6 +411,13 @@ pub fn load_profiles(config: &crate::config::Config) -> (Profiles, Vec<String>) 
             PathBuf::new()
         }
     };
+    // The section-level problem first: a caller that reads no profiles has to
+    // be told the section was thrown away, not left to conclude none were
+    // configured. The per-entry problems come from `resolve`, which sees the
+    // merged view, so they are never reported twice.
+    diagnostics.extend(crate::accounts::config::section_diagnostic(
+        &config.accounts,
+    ));
     let (profiles, resolution) = resolve(config.accounts.as_slice(), &store, &home);
     diagnostics.extend(resolution);
     (profiles, diagnostics)
@@ -640,6 +650,86 @@ mod tests {
         let invalid = profiles.choose(Some("a b")).expect_err("invalid name");
         assert!(matches!(invalid, ChoiceError::InvalidName { .. }));
         assert!(invalid.to_string().contains("invalid account profile"));
+    }
+
+    #[test]
+    fn a_directory_spelled_two_ways_is_still_one_directory() {
+        let (profiles, diagnostics) = resolve(
+            &[entry("perso", "~/.claude")],
+            &store(None, vec![entry("twin", "~/.claude/")]),
+            &home(),
+        );
+        assert_eq!(profiles.names(), vec!["perso"]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|line| line.contains("duplicate account config_dir")),
+            "{diagnostics:?}"
+        );
+        assert_eq!(
+            profiles.get("perso").expect("perso").config_dir,
+            home().join(".claude"),
+            "the stored directory is normalized, not the raw string"
+        );
+    }
+
+    #[test]
+    fn a_trailing_separator_does_not_change_the_exported_directory() {
+        let (profiles, diagnostics) = resolve(
+            &[entry("perso", "/p/work/"), entry("other", "/p/./other//")],
+            &store(None, Vec::new()),
+            &home(),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(
+            profiles.get("perso").expect("perso").config_dir,
+            PathBuf::from("/p/work")
+        );
+        assert_eq!(
+            profiles.get("other").expect("other").config_dir,
+            PathBuf::from("/p/other")
+        );
+    }
+
+    #[test]
+    fn a_store_entry_is_validated_the_same_way_and_names_its_own_section() {
+        let (profiles, diagnostics) = resolve(
+            &[],
+            &store(
+                None,
+                vec![
+                    entry("bad name", "/p/a"),
+                    entry("", "/p/b"),
+                    entry("-flag", "/p/c"),
+                    entry("ok", "  "),
+                    entry("good", "/p/good"),
+                ],
+            ),
+            &home(),
+        );
+        assert_eq!(profiles.names(), vec!["good"]);
+        for expected in [
+            "profiles[0].name",
+            "profiles[1].name",
+            "profiles[2].name",
+            "profiles[3].config_dir",
+        ] {
+            assert!(
+                diagnostics.iter().any(|line| line.contains(expected)),
+                "missing {expected:?} in {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_impossible_explicit_name_never_resolves_to_a_profile() {
+        let profiles = Profiles::test_new(vec![resolved("perso", true)]);
+        for name in ["", "with space", "..", "-perso", "PERSO/../perso"] {
+            match profiles.choose(Some(name)) {
+                Err(ChoiceError::InvalidName { .. }) | Err(ChoiceError::Unknown { .. }) => {}
+                other => panic!("{name:?} resolved to {other:?}"),
+            }
+        }
     }
 
     #[test]

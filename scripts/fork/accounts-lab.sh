@@ -23,9 +23,11 @@
 #     XDG_CACHE_HOME, and drops HERDR_SOCKET_PATH, HERDR_CLIENT_SOCKET_PATH,
 #     HERDR_ENV, HERDR_SESSION and HERDR_CONFIG_PATH, so nothing here can reach
 #     ~/.config/herdr, ~/.config/herdr-dev or the caller's default session;
-#   * the profile directories live under the lab root and CLAUDE_CONFIG_DIR is
-#     never left unset for anything this script starts, so ~/.claude and
-#     ~/.claude.json are never read or written;
+#   * the profile directories live under the lab root, and CLAUDE_CONFIG_DIR is
+#     pinned to $ROOT/profiles/ambient for everything this script starts, so an
+#     agent launched without a profile still lands inside the lab; the fake
+#     `claude` additionally refuses ~/.claude outright, so neither ~/.claude nor
+#     ~/.claude.json is ever read or written;
 #   * `down` only signals a pid this script wrote itself, and only after
 #     re-checking that the pid is still this lab's herdr server (pid reuse);
 #   * `down` deletes only a plain directory carrying this lab's marker file,
@@ -43,6 +45,7 @@ MARKER_HEADER="herdr-accounts-lab"
 SESSION_NAME="accounts-lab"
 DEFAULT_PROFILE="perso"
 SECOND_PROFILE="work"
+AMBIENT_PROFILE="ambient"
 MAX_PID_DIGITS=10
 
 ROOT=""
@@ -113,6 +116,7 @@ print(
             "profiles": {
                 "perso": root + "/profiles/perso",
                 "work": root + "/profiles/work",
+                "ambient": root + "/profiles/ambient",
             },
             "claude_stub": root + "/bin/claude",
         }
@@ -314,6 +318,9 @@ set_lab_env() {
         # its session id through this exact binary.
         PATH="$ROOT/bin:${PATH:-/usr/bin:/bin}"
         HERDR_BIN="$BIN"
+        # Anything started without a profile (a hand-typed `claude`, or
+        # `--account none`) still writes inside the lab, never into ~/.claude.
+        CLAUDE_CONFIG_DIR="$ROOT/profiles/$AMBIENT_PROFILE"
     )
 }
 
@@ -430,7 +437,16 @@ stop_started_session() {
 }
 
 api_is_ready() {
-    lab_herdr api snapshot 2>/dev/null | grep -q '"snapshot"'
+    # Captured first, then matched: piping straight into `grep -q` lets grep
+    # exit on the first match, and `set -o pipefail` would then report the
+    # server's SIGPIPE as a failure and wedge the wait. Same shape as
+    # fleet-lab.sh.
+    local snapshot
+    snapshot=$(lab_herdr api snapshot 2>/dev/null || true)
+    case "$snapshot" in
+        *'"snapshot"'*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 snapshot_pane_id() {
@@ -464,6 +480,11 @@ seed_profiles() {
     # `claude --resume` finds a conversation started under the other account.
     mkdir -p "$ROOT/profiles/$DEFAULT_PROFILE/projects"
     ln -s "../$DEFAULT_PROFILE/projects" "$ROOT/profiles/$SECOND_PROFILE/projects"
+
+    # Where a launch that applied no profile ends up. Deliberately logged out,
+    # so evidence from it can never be mistaken for perso or work.
+    mkdir -p "$ROOT/profiles/$AMBIENT_PROFILE"
+    chmod 700 "$ROOT/profiles/$AMBIENT_PROFILE"
 }
 
 write_config() {
@@ -681,6 +702,8 @@ cmd_env() {
         "$(quoted "$ROOT/profiles/$DEFAULT_PROFILE")"
     printf 'export HERDR_ACCOUNTS_LAB_PROFILE_WORK=%s\n' \
         "$(quoted "$ROOT/profiles/$SECOND_PROFILE")"
+    printf 'export HERDR_ACCOUNTS_LAB_PROFILE_AMBIENT=%s\n' \
+        "$(quoted "$ROOT/profiles/$AMBIENT_PROFILE")"
     printf 'export HERDR_BIN=%s\n' "$(quoted "$BIN")"
     if [ -n "${pane_id:-}" ]; then
         printf 'export HERDR_ACCOUNTS_LAB_PANE=%s\n' "$(quoted "$pane_id")"

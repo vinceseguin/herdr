@@ -7,6 +7,7 @@
 //! Field names are the user-facing contract: add fields, never rename them.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -45,20 +46,39 @@ impl Default for AccountProfileConfig {
     }
 }
 
-/// The `accounts` key of `config.toml`, as written.
+/// What the `accounts` key of `config.toml` actually was.
 ///
-/// `[[accounts]]` is an array of tables. A plain `[accounts]` table — the
-/// shape `[accounts.defaults]` creates — is *not* a parse failure: reserved
-/// keys must be reported as a diagnostic, not cost the user their whole
-/// config, which is what a hard type error would do on the startup path.
+/// `Config::load` deserialises the whole file in one pass, so *any* error this
+/// type returns falls the user's entire config back to defaults. Every shape
+/// that is not an array of tables is therefore reported as a diagnostic
+/// instead of an error: a typo in one fork-owned key must never cost someone
+/// their keybindings.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum SectionShape {
+    /// `[[accounts]]`, the supported shape.
+    #[default]
+    Array,
+    /// A plain `[accounts]` table — the shape `[accounts.defaults]` creates.
+    Table,
+    /// A scalar (`accounts = 3`, `accounts = "work"`, …).
+    Scalar,
+}
+
+/// The `accounts` key of `config.toml`, as written.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AccountsSection {
     profiles: Vec<AccountProfileConfig>,
-    /// The key was a table rather than an array of tables.
-    reserved_table: bool,
+    shape: SectionShape,
 }
 
 impl AccountsSection {
+    fn scalar() -> Self {
+        Self {
+            profiles: Vec::new(),
+            shape: SectionShape::Scalar,
+        }
+    }
+
     pub fn as_slice(&self) -> &[AccountProfileConfig] {
         &self.profiles
     }
@@ -78,7 +98,7 @@ impl AccountsSection {
     pub fn test_new(profiles: Vec<AccountProfileConfig>) -> Self {
         Self {
             profiles,
-            reserved_table: false,
+            shape: SectionShape::Array,
         }
     }
 }
@@ -107,7 +127,7 @@ impl<'de> Deserialize<'de> for AccountsSection {
                 }
                 Ok(AccountsSection {
                     profiles,
-                    reserved_table: false,
+                    shape: SectionShape::Array,
                 })
             }
 
@@ -121,8 +141,43 @@ impl<'de> Deserialize<'de> for AccountsSection {
                 {}
                 Ok(AccountsSection {
                     profiles: Vec::new(),
-                    reserved_table: true,
+                    shape: SectionShape::Table,
                 })
+            }
+
+            // Every remaining TOML shape. `Visitor`'s defaults would raise an
+            // `invalid type` error, and on the startup path that error is not
+            // local to this section: it drops the whole file back to defaults.
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(AccountsSection::scalar())
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(AccountsSection::scalar())
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(AccountsSection::scalar())
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(AccountsSection::scalar())
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(AccountsSection::scalar())
+            }
+
+            fn visit_bytes<E>(self, _: &[u8]) -> Result<Self::Value, E> {
+                Ok(AccountsSection::scalar())
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(AccountsSection::scalar())
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(AccountsSection::scalar())
             }
         }
 
@@ -150,6 +205,18 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     {
         return Err("profile names accept letters, digits, '.', '_' and '-' only".to_string());
     }
+    if name.starts_with('-') {
+        return Err(
+            "profile names must not start with '-': it would be read as a flag on the command line"
+                .to_string(),
+        );
+    }
+    if name == "." || name == ".." {
+        return Err(
+            "\".\" and \"..\" are not profile names: the name is used as a directory component"
+                .to_string(),
+        );
+    }
     if name == "none" {
         return Err("\"none\" is reserved: `--account none` opts out of profiles".to_string());
     }
@@ -165,6 +232,25 @@ pub fn reserved_table_diagnostic() -> String {
         .to_string()
 }
 
+/// The diagnostic reported when `accounts` is neither an array of tables nor a
+/// table (`accounts = 3`).
+pub fn invalid_shape_diagnostic() -> String {
+    "invalid accounts config: accounts must be an array of tables ([[accounts]]); \
+     ignoring section"
+        .to_string()
+}
+
+/// A directory value reduced to the key the duplicate check compares.
+///
+/// Lexical only, and deliberately: this runs before `~` expansion and without
+/// touching the filesystem, so it folds away trailing and repeated separators
+/// and `.` components (`~/.claude`, `~/.claude/` and `~/./.claude` are one
+/// directory) but leaves `..` alone, since resolving that without following
+/// symlinks would be wrong.
+pub fn dir_key(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
 /// Validate `[[accounts]]` without touching the filesystem.
 ///
 /// Every problem is a diagnostic; nothing here fails a config load. The
@@ -172,17 +258,32 @@ pub fn reserved_table_diagnostic() -> String {
 /// [`crate::accounts::profile::resolve`], which reports its own diagnostics
 /// for the merged view.
 pub fn diagnostics(section: &AccountsSection) -> Vec<String> {
-    if section.reserved_table {
-        return vec![reserved_table_diagnostic()];
+    match section_diagnostic(section) {
+        Some(diagnostic) => vec![diagnostic],
+        None => diagnostics_for("accounts", &section.profiles),
     }
-    diagnostics_for("accounts", &section.profiles)
+}
+
+/// The diagnostic about the section *as a whole*, if there is one.
+///
+/// Separate from [`diagnostics`] because
+/// [`crate::accounts::profile::load_profiles`] reports the per-entry problems
+/// itself, from the merged view, and must not repeat them — but a section that
+/// was thrown away entirely is exactly what a caller reading no profiles needs
+/// to be told.
+pub fn section_diagnostic(section: &AccountsSection) -> Option<String> {
+    match section.shape {
+        SectionShape::Table => Some(reserved_table_diagnostic()),
+        SectionShape::Scalar => Some(invalid_shape_diagnostic()),
+        SectionShape::Array => None,
+    }
 }
 
 /// [`diagnostics`], with the TOML path prefix the entries were read from.
 pub fn diagnostics_for(section: &str, profiles: &[AccountProfileConfig]) -> Vec<String> {
     let mut diagnostics = Vec::new();
     let mut seen_names: BTreeSet<&str> = BTreeSet::new();
-    let mut seen_dirs: BTreeSet<&str> = BTreeSet::new();
+    let mut seen_dirs: BTreeSet<PathBuf> = BTreeSet::new();
     let mut defaults = 0usize;
 
     for (index, profile) in profiles.iter().enumerate() {
@@ -218,7 +319,7 @@ pub fn diagnostics_for(section: &str, profiles: &[AccountProfileConfig]) -> Vec<
                 "missing account config_dir: {} is required; ignoring the entry",
                 field("config_dir")
             ));
-        } else if !seen_dirs.insert(profile.config_dir.as_str()) {
+        } else if !seen_dirs.insert(dir_key(Path::new(profile.config_dir.trim()))) {
             diagnostics.push(format!(
                 "duplicate account config_dir: {} = {:?}; two profiles must not share a directory; ignoring the entry",
                 field("config_dir"),
@@ -337,7 +438,19 @@ mod tests {
         for name in ["perso", "work", "a", "A.b_c-1", &"n".repeat(MAX_NAME_LEN)] {
             assert!(validate_name(name).is_ok(), "{name} should be accepted");
         }
-        for name in ["", "with space", "sl/ash", "quote\"", "acc🙂", "none"] {
+        for name in [
+            "",
+            "with space",
+            "sl/ash",
+            "quote\"",
+            "acc🙂",
+            "none",
+            ".",
+            "..",
+            "-force",
+            "--json",
+            &"n".repeat(MAX_NAME_LEN + 1),
+        ] {
             assert!(validate_name(name).is_err(), "{name} should be refused");
         }
     }
@@ -375,6 +488,84 @@ mod tests {
             diagnostics(&wrapper.accounts),
             vec![reserved_table_diagnostic()]
         );
+    }
+
+    /// `Config::load` parses the whole file in one pass, so an `accounts` key
+    /// of the wrong *shape* must degrade to a diagnostic. A hard error here
+    /// would fall the user's entire configuration back to defaults.
+    #[test]
+    fn a_scalar_accounts_key_is_a_diagnostic_not_a_parse_failure() {
+        for text in [
+            "accounts = 3",
+            "accounts = -1",
+            "accounts = 1.5",
+            "accounts = true",
+            "accounts = \"work\"",
+        ] {
+            let wrapper: Wrapper =
+                toml::from_str(text).unwrap_or_else(|err| panic!("{text:?} must parse: {err}"));
+            assert!(wrapper.accounts.is_empty(), "{text:?}");
+            assert_eq!(
+                diagnostics(&wrapper.accounts),
+                vec![invalid_shape_diagnostic()],
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_invalid_shape_diagnostic_names_the_array_syntax() {
+        assert!(invalid_shape_diagnostic().contains("[[accounts]]"));
+    }
+
+    /// `load_profiles` reports this one and leaves the per-entry problems to
+    /// `resolve`, so a section that parsed must add nothing.
+    #[test]
+    fn only_a_thrown_away_section_has_a_section_diagnostic() {
+        assert_eq!(
+            section_diagnostic(&section(vec![profile("bad name", "  ")])),
+            None
+        );
+        let table: Wrapper =
+            toml::from_str("[accounts.defaults]\nworkspace = \"x\"\n").expect("parses");
+        assert_eq!(
+            section_diagnostic(&table.accounts),
+            Some(reserved_table_diagnostic())
+        );
+        let scalar: Wrapper = toml::from_str("accounts = 3").expect("parses");
+        assert_eq!(
+            section_diagnostic(&scalar.accounts),
+            Some(invalid_shape_diagnostic())
+        );
+    }
+
+    /// Two profiles sharing one credentials directory is the failure the
+    /// duplicate check exists for, so spelling it differently must not slip
+    /// past.
+    #[test]
+    fn directories_are_compared_after_lexical_normalization() {
+        for (first, second) in [
+            ("~/.claude", "~/.claude/"),
+            ("~/.claude", "~/./.claude"),
+            ("/p/work", "/p//work"),
+            ("/p/work", "/p/work/."),
+        ] {
+            let reported = diagnostics(&section(vec![
+                profile("one", first),
+                profile("two", second),
+            ]));
+            assert_eq!(reported.len(), 1, "{first} vs {second}: {reported:?}");
+            assert!(
+                reported[0].contains("duplicate account config_dir"),
+                "{first} vs {second}: {reported:?}"
+            );
+        }
+
+        assert!(diagnostics(&section(vec![
+            profile("one", "~/.claude"),
+            profile("two", "~/.claude-work"),
+        ]))
+        .is_empty());
     }
 
     #[test]

@@ -217,13 +217,16 @@ fn read_identity(path: &Path) -> Option<AccountIdentity> {
 pub fn identity_from_claude_json(text: &str) -> Option<AccountIdentity> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let account = value.get("oauthAccount")?.as_object()?;
+    // Display-only strings out of a file herdr does not own, printed straight
+    // into a terminal by `herdr account status`: a control character in one of
+    // them would be an escape sequence on someone's screen.
     let field = |keys: &[&str]| {
         keys.iter().find_map(|key| {
             account
                 .get(*key)
                 .and_then(serde_json::Value::as_str)
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
+                .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
                 .map(str::to_string)
         })
     };
@@ -325,6 +328,9 @@ mod tests {
             r#"{"oauthAccount": {}}"#,
             r#"{"oauthAccount": {"emailAddress": "   "}}"#,
             r#"{"oauthAccount": {"emailAddress": 42}}"#,
+            // A control character would be an escape sequence once printed.
+            r#"{"oauthAccount": {"emailAddress": "a\u001b[2Jb"}}"#,
+            r#"{"oauthAccount": {"emailAddress": "a\nb"}}"#,
         ] {
             assert_eq!(identity_from_claude_json(text), None, "{text:?}");
         }
@@ -401,6 +407,42 @@ mod tests {
             Some(false)
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Proof, not just intent: an unreadable credentials file is still reported
+    /// as logged in, which is only possible if nothing ever opens it.
+    #[cfg(unix)]
+    #[test]
+    fn inspect_never_opens_the_credentials_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp_dir("unreadable");
+        let dir = root.join("profile");
+        std::fs::create_dir_all(&dir).expect("profile dir");
+        let credentials = dir.join(CREDENTIALS_FILE);
+        std::fs::write(&credentials, "{\"claudeAiOauth\":{\"accessToken\":\"x\"}}")
+            .expect("credentials");
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        if std::fs::read_to_string(&credentials).is_ok() {
+            // root, or a filesystem that ignores modes: the check would prove
+            // nothing here.
+            let _ = std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+
+        let inspection = inspect_dir(&dir, InspectOptions::with_identity());
+        assert!(inspection.logged_in, "existence is read from metadata only");
+        assert_eq!(
+            inspection.credentials_mode_ok,
+            Some(true),
+            "0000 is private"
+        );
+        assert_eq!(inspection.identity, None, "there is no .claude.json here");
+
+        let _ = std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600));
         let _ = std::fs::remove_dir_all(&root);
     }
 

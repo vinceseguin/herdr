@@ -162,3 +162,145 @@ fn the_lab_puts_its_fake_claude_first_on_path() {
     let pane = lab.pane_id();
     assert!(!pane.is_empty(), "the lab reports a pane id");
 }
+
+/// The stub is the only thing E9 ever runs in place of Claude Code, so its
+/// refusal to touch a real installation is a tested property, not a comment.
+#[test]
+fn the_fake_claude_never_touches_a_real_claude_directory() {
+    use std::process::Stdio;
+
+    let mut lab = Lab::new("guard");
+    assert!(lab.up().status.success());
+    let stub = lab.claude_stub();
+
+    // A home that looks real, and a CLAUDE_CONFIG_DIR pointing into it.
+    let home = lab.root.join("fake-home");
+    let claude = home.join(".claude");
+    std::fs::create_dir_all(&home).expect("fake home");
+
+    for (label, dir) in [("~/.claude", claude.clone()), ("$HOME", home.clone())] {
+        let output = std::process::Command::new(&stub)
+            .arg("auth")
+            .arg("login")
+            .env("HOME", &home)
+            .env("CLAUDE_CONFIG_DIR", &dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run the stub");
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{label} must be refused: {}{}",
+            stdout_of(&output),
+            stderr_of(&output)
+        );
+        assert!(
+            stderr_of(&output).contains("refusing to run against the real"),
+            "{label}: {}",
+            stderr_of(&output)
+        );
+    }
+    assert!(
+        !claude.exists(),
+        "the stub must not create the directory it refused"
+    );
+
+    // Without a directory it guesses none: `auth login` refuses, and an
+    // ordinary launch writes nothing anywhere.
+    let login = std::process::Command::new(&stub)
+        .arg("auth")
+        .arg("login")
+        .env("HOME", &home)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the stub");
+    assert_eq!(login.status.code(), Some(3), "{}", stderr_of(&login));
+
+    let launch = std::process::Command::new(&stub)
+        .env("HOME", &home)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("HERDR_PANE_ID")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the stub");
+    assert!(launch.status.success(), "{}", stderr_of(&launch));
+    assert!(
+        stdout_of(&launch).contains("no profile state written"),
+        "{}",
+        stdout_of(&launch)
+    );
+    assert!(!claude.exists(), "still nothing under the fake home");
+}
+
+/// Everything the lab starts writes inside the lab root, including a launch
+/// that applied no profile at all.
+#[test]
+fn the_lab_pins_the_ambient_claude_directory_inside_its_root() {
+    let mut lab = Lab::new("ambient");
+    assert!(lab.up().status.success());
+    assert!(
+        lab.ambient_dir().is_dir(),
+        "the lab seeds {:?}",
+        lab.ambient_dir()
+    );
+    assert!(
+        !lab.ambient_dir().join(".credentials.json").exists(),
+        "the ambient directory stays logged out"
+    );
+
+    let env = lab.run(&["env"]);
+    assert!(env.status.success(), "{}", stderr_of(&env));
+    let exports = stdout_of(&env);
+    assert!(
+        exports.contains("HERDR_ACCOUNTS_LAB_PROFILE_AMBIENT="),
+        "{exports}"
+    );
+    assert!(
+        !exports.contains("XDG_RUNTIME_DIR="),
+        "eval-ing XDG_RUNTIME_DIR would hijack the caller's session: {exports}"
+    );
+}
+
+/// A section herdr threw away must say so. Reporting "No account profiles
+/// configured" for a config that plainly declares some would send someone
+/// looking for the mistake in the wrong file.
+#[test]
+fn a_section_of_the_wrong_shape_is_reported_not_silently_empty() {
+    let mut lab = Lab::new("shape");
+    assert!(lab.up().status.success());
+
+    let config = lab.root.join("xdg").join("herdr-dev").join("config.toml");
+    let original = std::fs::read_to_string(&config).expect("lab config");
+
+    for (label, body, expected) in [
+        (
+            "reserved table",
+            "onboarding = false\n\n[accounts.defaults]\nworkspace = \"x\"\n",
+            "[accounts.defaults] is reserved",
+        ),
+        (
+            "scalar",
+            "onboarding = false\naccounts = 3\n",
+            "accounts must be an array of tables",
+        ),
+    ] {
+        std::fs::write(&config, body).expect("write the lab config");
+        let output = lab.herdr(&["account", "list", "--json"]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{label}: {}{}",
+            stdout_of(&output),
+            stderr_of(&output)
+        );
+        assert!(
+            stderr_of(&output).contains(expected),
+            "{label}: {}",
+            stderr_of(&output)
+        );
+        assert!(rows(&output).is_empty(), "{label}: {}", stdout_of(&output));
+    }
+
+    std::fs::write(&config, original).expect("restore the lab config");
+}

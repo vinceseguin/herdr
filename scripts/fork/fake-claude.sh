@@ -5,7 +5,7 @@
 # Every E9 validation drives this instead of the real `claude`: the epic is
 # about *which config directory* an agent runs against, and that is observable
 # without a real account, a real login or a real usage limit. Nothing here ever
-# reads the user's ~/.claude.
+# reads or writes the user's ~/.claude.
 #
 # What it imitates, and why each part matters:
 #   * prints `CLAUDE_CONFIG_DIR=<dir>` and its argv, so a pane read proves which
@@ -20,6 +20,13 @@
 #     $FAKE_CLAUDE_LIMIT_FILE when set) instead of going idle;
 #   * shows a `❯ ` prompt and exits on `/exit`.
 #
+# Safety: the stub writes into CLAUDE_CONFIG_DIR, so it never guesses one. With
+# the variable unset it runs with no directory at all (printing an empty
+# CLAUDE_CONFIG_DIR= line, which is exactly what `--account none` should look
+# like) and writes nothing, and it refuses the real ~/.claude outright. A
+# `$HOME/.claude` fallback would let one forgotten variable overwrite the user's
+# own credentials.
+#
 # Environment:
 #   CLAUDE_CONFIG_DIR      the profile directory (this is the whole point)
 #   HERDR_BIN              herdr binary used to report the session id
@@ -31,9 +38,26 @@
 
 set -u
 
-dir="${CLAUDE_CONFIG_DIR:-${HOME:-/tmp}/.claude}"
+dir="${CLAUDE_CONFIG_DIR:-}"
 herdr_bin="${HERDR_BIN:-${HERDR_BIN_PATH:-herdr}}"
 prompt='❯ '
+
+# Never the caller's own Claude installation, whatever the environment says.
+if [ -n "${HOME:-}" ] && [ -n "$dir" ]; then
+    case "${dir%/}" in
+        "${HOME%/}/.claude" | "${HOME%/}")
+            printf 'fake-claude: refusing to run against the real %s\n' "$dir" >&2
+            exit 3
+            ;;
+    esac
+fi
+
+require_dir() {
+    if [ -z "$dir" ]; then
+        printf 'fake-claude: CLAUDE_CONFIG_DIR is not set; refusing to guess one\n' >&2
+        exit 3
+    fi
+}
 
 json_string() {
     printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
@@ -52,6 +76,7 @@ json_argv() {
 }
 
 cmd_auth_login() {
+    require_dir
     mkdir -p "$dir" || exit 1
     email="${FAKE_CLAUDE_EMAIL:-$(basename "$dir")@example.test}"
     plan="${FAKE_CLAUDE_PLAN:-max}"
@@ -84,6 +109,7 @@ case "${1:-}" in
                 exit 0
                 ;;
             logout)
+                require_dir
                 rm -f "$dir/.credentials.json"
                 printf 'fake-claude: auth logout\n'
                 exit 0
@@ -120,18 +146,23 @@ if [ -z "$session_id" ]; then
     start_source="startup"
 fi
 
-mkdir -p "$dir" 2>/dev/null || true
-
 printf 'CLAUDE_CONFIG_DIR=%s\n' "$dir"
 printf 'fake-claude argv: %s\n' "$argv_json"
 
-printf '{"config_dir":%s,"argv":%s,"session_id":%s,"session_start_source":%s,"pane_id":%s}\n' \
-    "$(json_string "$dir")" \
-    "$argv_json" \
-    "$(json_string "$session_id")" \
-    "$(json_string "$start_source")" \
-    "$(json_string "${HERDR_PANE_ID:-}")" \
-    >"$dir/last-launch.json" 2>/dev/null || true
+# No directory means no profile was applied: say so on screen and write
+# nothing, rather than inventing somewhere to write.
+if [ -n "$dir" ]; then
+    mkdir -p "$dir" 2>/dev/null || true
+    printf '{"config_dir":%s,"argv":%s,"session_id":%s,"session_start_source":%s,"pane_id":%s}\n' \
+        "$(json_string "$dir")" \
+        "$argv_json" \
+        "$(json_string "$session_id")" \
+        "$(json_string "$start_source")" \
+        "$(json_string "${HERDR_PANE_ID:-}")" \
+        >"$dir/last-launch.json" 2>/dev/null || true
+else
+    printf 'fake-claude: no CLAUDE_CONFIG_DIR; no profile state written\n'
+fi
 
 if [ "$start_source" = "resume" ]; then
     printf 'resumed %s\n' "$session_id"
