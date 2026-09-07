@@ -10,10 +10,11 @@
 //! CLI-managed `<config>/accounts/profiles.toml`, and [`profile`] merges the
 //! two into the one view every caller reads. [`layout`] owns what a profile
 //! directory is made of and how healthy one is, [`launch`] the per-shell
-//! environment line a client types to apply a profile, and [`tokens`] the
-//! metadata vocabulary reported back to the server.
+//! environment line a client types to apply a profile, [`status`] the join of
+//! profile health and the agents running on it, and [`tokens`] the metadata
+//! vocabulary reported back to the server.
 //!
-//! Those six are pure: sync, socket-free, and free of `tokio`, `ratatui` and
+//! Those seven are pure: sync, socket-free, and free of `tokio`, `ratatui` and
 //! the client. [`client`] is the one runtime driver — it composes stock API
 //! methods into the two-step launch — and the architecture test below keeps
 //! the split honest.
@@ -23,6 +24,7 @@ pub mod config;
 pub mod launch;
 pub mod layout;
 pub mod profile;
+pub mod status;
 pub mod store;
 pub mod tokens;
 
@@ -31,11 +33,12 @@ mod tests {
     /// Modules that must stay pure data, and the paths that would end that.
     /// Precedent: `scripts/test_ui_hot_path_architecture.py` guards the render
     /// hot path the same way.
-    const PURE_MODULES: [(&str, &str); 6] = [
+    const PURE_MODULES: [(&str, &str); 7] = [
         ("config.rs", include_str!("config.rs")),
         ("launch.rs", include_str!("launch.rs")),
         ("layout.rs", include_str!("layout.rs")),
         ("profile.rs", include_str!("profile.rs")),
+        ("status.rs", include_str!("status.rs")),
         ("store.rs", include_str!("store.rs")),
         ("tokens.rs", include_str!("tokens.rs")),
     ];

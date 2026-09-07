@@ -655,6 +655,8 @@ fn main() -> io::Result<()> {
         println!("       herdr account add <name> [--config-dir <path>] [--from <profile>]");
         println!("       herdr account remove <name> [--delete-dir]");
         println!("       herdr account default <name>");
+        println!("       herdr account status [<name>] [--json]");
+        println!("       herdr account login <name> [--pane <id>]");
         #[cfg(feature = "gateway")]
         println!("       {}", crate::gateway::GATEWAY_COMMAND_LINE);
         println!("       herdr config <subcommand> ...");

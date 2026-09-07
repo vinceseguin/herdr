@@ -322,6 +322,11 @@ fn subcommand_help_explains_automation_semantics_without_a_server() {
             "canonical Escape key name",
         ),
         (&["account", "list", "--help"], "never reads or prints"),
+        (
+            &["account", "status", "--help"],
+            "never reads that file's contents",
+        ),
+        (&["account", "login", "--help"], "nothing is typed"),
     ];
 
     for (args, expected) in cases {

@@ -265,6 +265,41 @@ fn account_command() -> Command {
                 .about("Choose the profile used when no --account is given")
                 .arg(Arg::new("name").required(true).help("Profile name")),
         )
+        .subcommand(
+            Command::new("status")
+                .about(
+                    "Report each profile's health, identity and the agents running on it. \
+                     Shows the email, organization and plan from oauthAccount and whether a \
+                     credentials file is present and private; it never reads that file's \
+                     contents. Works without a server, in which case the agents column is \
+                     unknown rather than empty.",
+                )
+                .arg(
+                    Arg::new("name")
+                        .required(false)
+                        .help("Report only this profile"),
+                )
+                .arg(json_flag().help("Print the report as JSON")),
+        )
+        .subcommand(
+            Command::new("login")
+                .about(
+                    "Types the login into a pane: the profile's CLAUDE_CONFIG_DIR export \
+                     followed by `claude auth login`, so the credentials land in that \
+                     profile instead of the ambient one. The pane must be at its shell \
+                     prompt and the shell one herdr can write an assignment for; otherwise \
+                     nothing is typed, and if the pane does not come back to its prompt the \
+                     login command is not typed either. herdr does not complete the login — \
+                     follow it in the pane, then run `herdr account status <name>`.\n\nnext: herdr account status <NAME>",
+                )
+                .arg(Arg::new("name").required(true).help("Profile name"))
+                .arg(
+                    Arg::new("pane")
+                        .long("pane")
+                        .value_name("ID")
+                        .help("Pane to type into (default: the current pane)"),
+                ),
+        )
 }
 
 fn config_command() -> Command {

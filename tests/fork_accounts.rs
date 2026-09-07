@@ -982,3 +982,393 @@ fn agent_start_reports_a_mismatch_when_the_shell_swallows_the_environment_line()
         "{agent:#?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR 3 — `herdr account status` and `herdr account login`
+//
+// `status` is a read: it must show who a profile is logged in as and which
+// agents claim it, without ever opening the credentials file, and it must
+// still answer when no server is running. `login` types two lines into a pane
+// — the profile's export and `claude auth login` — so the credentials land in
+// that profile's directory instead of the ambient one.
+// ---------------------------------------------------------------------------
+
+/// A logged-out profile, registered in the store so `status` and `login` can
+/// address it by name. The lab's own two profiles both ship logged in, so a
+/// login that really flips `logged_in` needs a fresh one.
+fn add_logged_out_profile(lab: &Lab, name: &str) -> std::path::PathBuf {
+    let dir = lab.root.join("profiles").join(name);
+    let added = lab.herdr(&[
+        "account",
+        "add",
+        name,
+        "--config-dir",
+        dir.to_str().expect("utf-8 lab path"),
+        "--no-hook",
+    ]);
+    assert!(
+        added.status.success(),
+        "account add {name} failed: {}{}",
+        stdout_of(&added),
+        stderr_of(&added)
+    );
+    assert!(
+        !dir.join(".credentials.json").exists(),
+        "a seeded profile is logged out"
+    );
+    dir
+}
+
+/// Poll a pane until its screen contains `needle`.
+fn wait_for_pane_text(lab: &Lab, pane: &str, needle: &str) -> String {
+    let mut screen = String::new();
+    for _ in 0..100 {
+        screen = stdout_of(&lab.herdr(&["pane", "read", pane, "--source", "recent"]));
+        if screen.contains(needle) {
+            return screen;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("pane {pane} never showed {needle:?}: {screen}");
+}
+
+#[test]
+fn account_status_reports_identity_without_reading_a_secret() {
+    let mut lab = Lab::new("status");
+    assert!(lab.up().status.success());
+
+    let output = lab.herdr(&["account", "status", "--json"]);
+    assert!(
+        output.status.success(),
+        "account status failed: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let statuses = rows(&output);
+    assert_eq!(statuses.len(), 2, "{statuses:#?}");
+
+    let perso = &statuses[0];
+    assert_eq!(perso["name"], DEFAULT_PROFILE);
+    assert_eq!(perso["default"], true);
+    assert_eq!(perso["origin"], "config");
+    assert_eq!(perso["dir_exists"], true);
+    assert_eq!(perso["logged_in"], true);
+    assert_eq!(
+        perso["credentials_mode_ok"], true,
+        "the lab writes its credentials 0600: {perso:#?}"
+    );
+    // Identity is display-only, out of `.claude.json`'s oauthAccount.
+    assert_eq!(perso["identity"]["email"], "perso@example.test");
+    assert_eq!(perso["identity"]["organization"], "Example Org");
+    assert_eq!(perso["identity"]["plan"], "max");
+    assert_eq!(
+        perso["agents"],
+        serde_json::json!([]),
+        "the lab starts no agent: {perso:#?}"
+    );
+
+    let work = &statuses[1];
+    assert_eq!(work["name"], SECOND_PROFILE);
+    assert_eq!(work["default"], false);
+    assert_eq!(work["identity"]["email"], "work@example.test");
+
+    // The credentials file itself is never opened, printed, or named.
+    let printed = stdout_of(&output).to_ascii_lowercase();
+    for forbidden in ["credentials.json", "claudeaioauth", "password", "secret"] {
+        assert!(
+            !printed.contains(forbidden),
+            "{forbidden} leaked into `account status`: {printed}"
+        );
+    }
+
+    // A named report is the same row on its own; an unknown name is an error,
+    // never an empty report.
+    let named = lab.herdr(&["account", "status", SECOND_PROFILE, "--json"]);
+    assert!(named.status.success(), "{}", stderr_of(&named));
+    let named = rows(&named);
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0]["name"], SECOND_PROFILE);
+
+    let unknown = lab.herdr(&["account", "status", "nope", "--json"]);
+    assert_eq!(unknown.status.code(), Some(1), "{}", stdout_of(&unknown));
+    assert!(
+        stderr_of(&unknown).contains("unknown account profile"),
+        "{}",
+        stderr_of(&unknown)
+    );
+
+    // A configuration diagnostic is exit 1 with the report still printed, the
+    // same contract `account list` holds. Last, because it edits the config.
+    let config = lab.root.join("xdg").join("herdr-dev").join("config.toml");
+    let original = std::fs::read_to_string(&config).expect("lab config");
+    std::fs::write(
+        &config,
+        format!(
+            "{original}\n[[accounts]]\nname = \"{DEFAULT_PROFILE}\"\nagent = \"claude\"\nconfig_dir = \"{}/profiles/dup\"\n",
+            lab.root.display()
+        ),
+    )
+    .expect("append a duplicate profile");
+
+    let diagnosed = lab.herdr(&["account", "status", "--json"]);
+    assert_eq!(
+        diagnosed.status.code(),
+        Some(1),
+        "diagnostics must exit 1: {}{}",
+        stdout_of(&diagnosed),
+        stderr_of(&diagnosed)
+    );
+    assert!(
+        stderr_of(&diagnosed).contains("duplicate account profile name"),
+        "{}",
+        stderr_of(&diagnosed)
+    );
+    assert_eq!(
+        rows(&diagnosed).len(),
+        2,
+        "the report is still printed: {}",
+        stdout_of(&diagnosed)
+    );
+}
+
+#[test]
+fn account_status_shows_the_agents_running_on_a_profile() {
+    let mut lab = Lab::new("status-agents");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    let started = lab.herdr(&[
+        "agent",
+        "start",
+        "a1",
+        "--kind",
+        "claude",
+        "--pane",
+        &pane,
+        "--account",
+        SECOND_PROFILE,
+    ]);
+    assert!(
+        started.status.success(),
+        "agent start failed: {}{}",
+        stdout_of(&started),
+        stderr_of(&started)
+    );
+
+    let statuses = rows(&lab.herdr(&["account", "status", "--json"]));
+    let perso = &statuses[0];
+    let work = &statuses[1];
+    assert_eq!(
+        perso["agents"],
+        serde_json::json!([]),
+        "the agent is not on perso: {perso:#?}"
+    );
+    let agents = work["agents"].as_array().expect("work agents");
+    assert_eq!(agents.len(), 1, "{work:#?}");
+    assert_eq!(agents[0]["name"], "a1");
+    assert_eq!(agents[0]["pane_id"], pane);
+    assert_eq!(agents[0]["account_state"], "ok");
+    assert_eq!(agents[0]["account_state_known"], true);
+
+    // The text report names the same agent.
+    let text = stdout_of(&lab.herdr(&["account", "status", SECOND_PROFILE]));
+    assert!(text.contains("a1 on"), "{text}");
+    assert!(text.contains("work@example.test"), "{text}");
+}
+
+/// `status` is a read, and a machine whose profiles someone is checking may
+/// well have no server running yet. That is not an error, and it must not be
+/// reported as "no agents".
+#[test]
+fn account_status_still_answers_without_a_server() {
+    let mut lab = Lab::new("status-offline");
+    assert!(lab.up().status.success());
+    // Stop the server but keep the lab root: the profiles and the config the
+    // report reads from the filesystem are exactly what must still work.
+    let stopped = lab.herdr(&["server", "stop"]);
+    assert!(
+        stopped.status.success(),
+        "server stop failed: {}{}",
+        stdout_of(&stopped),
+        stderr_of(&stopped)
+    );
+    for _ in 0..100 {
+        if lab.herdr(&["agent", "list"]).status.code() != Some(0) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let output = lab.herdr(&["account", "status", "--json"]);
+    assert!(
+        output.status.success(),
+        "status must survive a stopped server: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let statuses = rows(&output);
+    assert_eq!(statuses.len(), 2);
+    for status in &statuses {
+        assert!(
+            status["agents"].is_null(),
+            "unknown placement is null, not []: {status:#?}"
+        );
+        assert_eq!(status["logged_in"], true, "{status:#?}");
+    }
+    assert!(
+        stderr_of(&output).contains("no herdr server is running"),
+        "the reason is stated: {}",
+        stderr_of(&output)
+    );
+
+    let text = stdout_of(&lab.herdr(&["account", "status"]));
+    assert!(text.contains("no herdr server answered"), "{text}");
+}
+
+#[test]
+fn account_login_types_the_profile_into_the_pane() {
+    let mut lab = Lab::new("login");
+    assert!(lab.up().status.success());
+
+    let dir = add_logged_out_profile(&lab, "fresh");
+    let before = rows(&lab.herdr(&["account", "status", "fresh", "--json"]));
+    assert_eq!(before[0]["logged_in"], false, "{before:#?}");
+    assert!(before[0]["identity"].is_null(), "{before:#?}");
+
+    let pane = lab.pane_id();
+    let output = lab.herdr(&["account", "login", "fresh", "--pane", &pane]);
+    assert!(
+        output.status.success(),
+        "account login failed: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let printed = stdout_of(&output);
+    assert!(
+        printed.contains("export CLAUDE_CONFIG_DIR="),
+        "the command says exactly what it typed: {printed}"
+    );
+    assert!(printed.contains("claude auth login"), "{printed}");
+    assert!(printed.contains(&pane), "{printed}");
+
+    // The stub really ran, and really ran under the new profile: the export
+    // line is echoed by the pane whether or not it took effect, so the proof
+    // is a line only the stub prints, plus the file it wrote (below).
+    let screen = wait_for_pane_text(&lab, &pane, "logged in as fresh@example.test");
+    assert!(
+        screen.contains("fake-claude: auth login"),
+        "the stub ran its login path: {screen}"
+    );
+
+    // …and wrote a private credentials file there, which `status` now sees
+    // without opening it.
+    let credentials = dir.join(".credentials.json");
+    assert!(credentials.is_file(), "the stub wrote credentials");
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(&credentials)
+        .expect("credentials metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "credentials must be owner-only");
+
+    let after = rows(&lab.herdr(&["account", "status", "fresh", "--json"]));
+    assert_eq!(after[0]["logged_in"], true, "{after:#?}");
+    assert_eq!(after[0]["identity"]["email"], "fresh@example.test");
+    assert_eq!(after[0]["credentials_mode_ok"], true);
+
+    // Nothing landed in the other profiles or in the ambient directory.
+    for other in [DEFAULT_PROFILE, SECOND_PROFILE] {
+        let claude_json = lab.profile_dir(other).join(".claude.json");
+        let text = std::fs::read_to_string(&claude_json).expect("lab .claude.json");
+        assert!(
+            text.contains(&format!("{other}@example.test")),
+            "{other}'s identity must be untouched: {text}"
+        );
+    }
+    assert!(
+        !lab.ambient_dir().join(".credentials.json").exists(),
+        "the ambient directory must not have been logged into"
+    );
+}
+
+#[test]
+fn account_login_refuses_a_busy_pane_without_typing_anything() {
+    let mut lab = Lab::new("login-busy");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    let sent = lab.herdr(&[
+        "pane",
+        "send-text",
+        &pane,
+        "printf 'BUSY%s\\n' READY; sleep 30\r",
+    ]);
+    assert!(sent.status.success(), "{}", stderr_of(&sent));
+    wait_for_pane_text(&lab, &pane, "BUSYREADY");
+
+    let output = lab.herdr(&["account", "login", SECOND_PROFILE, "--pane", &pane]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a busy pane must be refused: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let refusal = stderr_of(&output);
+    assert!(refusal.contains("not at its shell prompt"), "{refusal}");
+    assert!(
+        refusal.contains("--pane") && !refusal.contains("--account none"),
+        "the refusal points at this command's own way out: {refusal}"
+    );
+    assert!(
+        stdout_of(&output).is_empty(),
+        "nothing was typed, so nothing is reported: {}",
+        stdout_of(&output)
+    );
+
+    let screen = stdout_of(&lab.herdr(&["pane", "read", &pane, "--source", "recent"]));
+    assert!(
+        !screen.contains("CLAUDE_CONFIG_DIR"),
+        "the export line must not have reached the sleeping job: {screen}"
+    );
+}
+
+#[test]
+fn account_login_refuses_a_profile_it_cannot_address() {
+    let mut lab = Lab::new("login-refusals");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+
+    let unknown = lab.herdr(&["account", "login", "nope", "--pane", &pane]);
+    assert_eq!(unknown.status.code(), Some(1), "{}", stdout_of(&unknown));
+    assert!(
+        stderr_of(&unknown).contains("unknown account profile"),
+        "{}",
+        stderr_of(&unknown)
+    );
+
+    // A profile whose directory is gone: logging in would create an unseeded,
+    // world-readable one that no other herdr command knows how to repair.
+    let dir = add_logged_out_profile(&lab, "gone");
+    std::fs::remove_dir_all(&dir).expect("remove the profile directory");
+    let missing = lab.herdr(&["account", "login", "gone", "--pane", &pane]);
+    assert_eq!(missing.status.code(), Some(1), "{}", stdout_of(&missing));
+    assert!(
+        stderr_of(&missing).contains("does not exist"),
+        "{}",
+        stderr_of(&missing)
+    );
+
+    let screen = stdout_of(&lab.herdr(&["pane", "read", &pane, "--source", "recent"]));
+    assert!(
+        !screen.contains("CLAUDE_CONFIG_DIR"),
+        "no refusal may type anything: {screen}"
+    );
+    assert!(!dir.exists(), "the missing directory was not created");
+
+    // Usage errors exit 2, before any server call.
+    let usage = lab.herdr(&["account", "login"]);
+    assert_eq!(usage.status.code(), Some(2), "{}", stderr_of(&usage));
+}

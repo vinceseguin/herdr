@@ -346,7 +346,7 @@ implementation starts only after E3 is ✅.
 | --- | --- | --- | --- | --- |
 | 1 | feat(accounts): account profiles config, pure resolution, herdr account list and the accounts lab | A · Foundations | — | ✅ |
 | 2 | feat(accounts): herdr account add, remove and default with seeded profile directories | A · Foundations | 1 | ✅ |
-| 3 | feat(accounts): herdr account status and login | B · CLI | 2 | ⬜ |
+| 3 | feat(accounts): herdr account status and login | B · CLI | 2 | ✅ |
 | 4 | feat(accounts): launch claude under a profile with herdr agent start --account | B · CLI | 1 | ✅ |
 | 5 | feat(accounts): switch a running claude agent to another profile keeping its session | B · CLI | 4 | ⬜ |
 | 6 | feat(fleet): fleet report and change stream carry agent metadata tokens | C · Fleet | 1 | ⬜ |
@@ -898,7 +898,112 @@ $HERDR_ACCOUNTS_LAB_PANE` shows the export line and the stub's login output;
 `account status` → exit 0 with `agents: -`.
 
 **Downstream.** `AccountStatus` JSON is what PR 9 extends with `limit`
-information and PR 11 documents.
+information and PR 11 documents. It is a flat object, not the nested
+`{profile, inspection, agents}` the plan sketched (see *As built*), so PR 9's
+keys go alongside `hook_installed` and `agents`.
+
+**As built (PR 3, merged).** The *As built* notes for PRs 1, 2 and 4 all still
+hold; the corrections below are what PRs 9, 10 and 11 must code against.
+
+- **`assemble` takes the name filter, and the row shape is flat.** The
+  signature is `assemble(&Profiles, only: Option<&str>, inspect: impl
+  Fn(&AccountProfile) -> ProfileInspection, agents: Option<&[AgentFact]>) ->
+  Vec<AccountStatus>`. `only` narrows *before* `inspect` runs, because
+  `InspectOptions::with_identity()` parses a whole `.claude.json` and
+  `status <name>` must not pay for the profiles it does not print; the default
+  flag is still decided against the full merged view, so a one-profile report
+  says what the full one would. `AccountStatus` is not the planned
+  `{profile, inspection, agents}` nesting but a **flat superset of `account
+  list`'s row** — `name, agent, config_dir, default, origin, dir_exists,
+  logged_in` plus `credentials_mode_ok, identity, hook_installed,
+  broken_links, agents` — so a reader who learned `list` already knows
+  `status`, and PR 9 adds its limit keys to the same flat object.
+- **`agents` is `null` when unknown and `[]` when empty.** They are different
+  answers — "no server answered" versus "the server has none" — and collapsing
+  them would let a stopped server read as an idle account. The text report
+  renders them `- (no herdr server answered)` and `none`.
+- **Inspection is a closure, not a parallel slice.** The plan's
+  `assemble(profiles, inspections, agent_infos)` would have paired two vectors
+  by index; passing `|profile| layout::inspect(profile, …)` keeps the module
+  pure, keeps the filter cheap, and cannot mis-pair.
+- **`AgentFact` is the input type, not `AgentInfo`.** `status.rs` reduces
+  `crate::api::schema::AgentInfo` to `{pane_id, name, agent_status, account,
+  account_state}` through `AgentFact::from_agent_info`, so the assembly and its
+  tests need no server and a schema change cannot reshape the report silently.
+  `account_state` is carried **verbatim**, with `account_state_known: false`
+  when `AccountState::parse` does not recognise it: a newer herdr may report a
+  state this build has never heard of, and dropping it would hide an agent's
+  state entirely.
+- **An agent on a profile that is gone is surfaced, not dropped.**
+  `status::agents_on_unknown_profiles` is reported on stderr as a warning
+  (exit code unchanged) — it is the one thing a per-profile report would
+  otherwise hide.
+- **`status` never fails because of the server.** Server-not-running,
+  protocol-mismatch, an API error and an unreadable agent list all degrade to
+  `agents: null` plus a `note:` on stderr (silent for the protocol guard, which
+  prints its own message). Exit stays 0; only configuration diagnostics make it
+  1, exactly like `list`. Usage errors are 2.
+- **`login` does not touch `src/accounts/client.rs`.** PR 5 owns that file, and
+  `AppliedLine`'s drop notice is worded for an agent launch, so `login` has its
+  own three small runtime helpers in `src/cli/account.rs` (`pane_process_info`,
+  `send_line`, `wait_for_prompt`) over `crate::cli::send_request`. They reuse
+  the tested pure pieces — `launch::pane_shell_at_prompt` and
+  `launch::env_assignment_line` — so the refusal rules are the launcher's, not
+  a second copy.
+- **`login` refuses a missing profile directory.** Letting `claude auth login`
+  create one would produce an unseeded, world-readable directory that no other
+  herdr command knows how to repair; the message names `herdr account add`.
+  It also refuses an unknown profile, a pane that is not idle at its shell
+  prompt, and a shell `env_assignment_line` cannot quote — in every case
+  nothing is typed and stdout stays empty.
+- **The lab's two profiles both ship logged in**, so the plan's recipe
+  (`account login work` then `status work` now `logged_in: true`) proves
+  nothing. Validation and `tests/fork_accounts.rs::account_login_types_the_
+  profile_into_the_pane` instead create a third, logged-out profile with
+  `herdr account add <name> --config-dir "$HERDR_ACCOUNTS_LAB_ROOT/profiles/
+  <name>" --no-hook` and watch `logged_in` flip `false → true` with a `0600`
+  credentials file and the stub's identity appearing.
+- **`main.rs` gained two usage lines** (`account status`, `account login`).
+  The plan reserved `src/main.rs` for PR 1; two adjacent `println!` lines in the
+  usage block are the whole edit and collide with nothing.
+- The `#[allow(dead_code)]` on `layout::InspectOptions::with_identity` is gone —
+  `status` is its caller. `layout::CREDENTIALS_MODE` still has no production
+  caller and keeps its marker.
+
+**Hardening found during PR 3's review** (all fixed in the same PR):
+
+- **`login`'s second line had no gate.** The launch driver hands its second
+  line to `agent.start`, which refuses a busy pane server-side; `login` submits
+  `claude auth login` with a raw `pane.send_text` that nothing stands in front
+  of. A pane that had picked up a foreground job between the two sends would
+  have received the command as *stdin*. `wait_for_prompt` timing out is now a
+  refusal (exit 1) that names the exported variable and the command to run by
+  hand; the budget grew to 5 s because a slow prompt command is the ordinary
+  reason to miss it.
+- **A lost `pane.send_text` reply is not "nothing was typed".**
+  `SendLineError { detail, may_have_landed }` draws the same distinction
+  `client::apply_env` does: a server rejection wrote nothing to the pty, a
+  transport failure may have delivered the line and lost only the reply, and
+  the second case prints a note naming the pane and directory.
+- The "already has credentials, completing this login replaces them" and "no
+  session hook" warnings are printed **before** the typing, where the user can
+  still act on them.
+- The login command is an exhaustive `match profile.agent`, so a second
+  `AccountAgent` is a compile error rather than a `claude auth login` typed at
+  a profile that is not Claude's. `login` also renders
+  `LaunchError::PaneNotAtPrompt` itself, because the shared message ends by
+  offering `--account none`, which belongs to `herdr agent start`.
+- **`identity_from_claude_json` bounds what it will print.** PR 3 is the first
+  caller of `InspectOptions::with_identity()`, so it is the first to print a
+  file herdr does not own into a terminal. `is_printable_identity` caps a field
+  at 120 characters (length first, so the scan stays bounded) and refuses bidi
+  and zero-width formatting characters as well as control ones — a 10 MB
+  `subscriptionType` used to be echoed verbatim, and a U+202E address renders
+  as one thing while it reads as another. A refused field falls through to the
+  next key name and then to "unknown"; it is never cleaned up and shown.
+- Continuation lines in the agents column align with the first agent (the join
+  is 15 spaces, matching `field`'s two-space + twelve-wide-label + one-space
+  gutter).
 
 ### PR 4 — feat(accounts): launch claude under a profile with herdr agent start --account · deps: 1
 
@@ -1288,6 +1393,14 @@ id `usage_limit`, extract the reset time when shown, and surface a "switch
 account" hint in `account status` and the switch preflight — best-effort,
 fixture-driven, with exact live follow-ups recorded.
 
+*(PR 3 as built: `AccountStatus` is one **flat** object per profile — the
+`account list` row plus `credentials_mode_ok`, `identity`, `hook_installed`,
+`broken_links`, `agents` — not the `{profile, inspection, agents}` nesting the
+prose above sketched, and `agents` is `null` when no server answered. The
+`limit` keys go on `AgentOnAccount` alongside `account_state`, which is carried
+verbatim with `account_state_known`. `jq '.[] | .agents[]? | .limit'` — the
+`?` matters, because `.agents` can be `null`.)*
+
 **Files**
 
 - `tests/fixtures/fork/claude-usage-limit.txt` (new): the bottom-buffer text
@@ -1350,7 +1463,7 @@ passes. Integration: the lab stub in limit mode → `herdr agent explain
 **Real-server validation.** Lab up with `FAKE_CLAUDE_LIMIT=1`; start `a1`;
 `herdr … agent read a1 --source detection --format text` (attach to the PR
 as evidence); `herdr … agent explain a1 --json | jq .matched_rule`; `herdr …
-account status --json | jq '.[] | .agents[] | .limit'`; `herdr … agent
+account status --json | jq '.[] | .agents[]? | .limit'`; `herdr … agent
 switch-account a1 work --yes --json` shows `limit` in preflight output.
 Negative: without the env the rule does not match (`explain` → the idle
 rule).
@@ -1527,7 +1640,20 @@ plan's *As built* notes):
   transcripts through the `projects/` symlink.
 - The `oauthAccount` key names used for email/plan display.
 - `claude auth login` exists in the installed version (else the `/login`
-  fallback) and creates `.credentials.json` in `CLAUDE_CONFIG_DIR`.
+  fallback) and creates `.credentials.json` in `CLAUDE_CONFIG_DIR`. **PR 3
+  shipped the `auth login` spelling and validated it only against the stub**,
+  which implements it: `herdr account login <name>` types
+  `export CLAUDE_CONFIG_DIR='<dir>'` and then `claude auth login`. A human must
+  run it once against a real installation and check three things — that the
+  subcommand exists at all, that it writes `.credentials.json` (mode `0600`)
+  into the exported directory and not into `~/.claude`, and that
+  `herdr account status <name>` then shows that account's `oauthAccount` email.
+  If `auth login` is gone, the fallback is `claude` then `/login` typed inside
+  the session, which is a different shape (an interactive agent, not a command
+  that exits): `login` would then type only the export line and tell the user
+  to run `claude` and `/login`, or hand off to `herdr agent start --account`.
+  Record which of the two the installed version needs before PR 11 documents
+  it.
 - `/exit` from `agent.prompt` exits cleanly from idle, blocked (after
   `Escape`) and the usage-limit screen; the resumed session reports
   `session_start_source = "resume"` with the same id through the hook.

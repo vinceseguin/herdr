@@ -21,11 +21,16 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::accounts::config::{AccountProfileConfig, DEFAULT_AGENT};
+use crate::accounts::launch::{env_assignment_line, pane_shell_at_prompt, LaunchError};
 use crate::accounts::layout::{self, InspectOptions, SeedPlan, SeedReport};
 use crate::accounts::profile::{
     self, load_profiles, validate_name, AccountAgent, AccountProfile, ProfileOrigin, Profiles,
 };
 use crate::accounts::store;
+use crate::api::schema::{
+    AgentInfo, EmptyParams, Method, PaneCurrentParams, PaneProcessInfo, PaneProcessInfoParams,
+    PaneSendTextParams, Request,
+};
 
 pub(super) const ACCOUNT_USAGE: &str = "Usage:
   herdr account list [--json]
@@ -34,6 +39,8 @@ pub(super) const ACCOUNT_USAGE: &str = "Usage:
                            [--no-hook] [--json]
   herdr account remove <name> [--delete-dir]
   herdr account default <name>
+  herdr account status [<name>] [--json]
+  herdr account login <name> [--pane <id>]
 
 An account is one Claude config directory (CLAUDE_CONFIG_DIR) with its own
 credentials. Declare profiles as [[accounts]] in config.toml, or let
@@ -44,7 +51,8 @@ shared state are symlinked, settings and .claude.json are copied with the
 identity keys removed, and credentials are never copied — the new profile is
 logged out until `herdr account login <name>`.
 
-These commands contact no server, and never read or print credentials.";
+status and login talk to the local herdr server; the rest contact none. No
+command ever reads or prints the contents of a credentials file.";
 
 const ADD_USAGE: &str = "usage: herdr account add <name> [--config-dir <path>] [--from <profile>] \
 [--dry-run] [--force] [--print-config] [--no-hook] [--json]";
@@ -68,6 +76,8 @@ pub(super) fn run_account_command(args: &[String]) -> std::io::Result<i32> {
         Some("list") => list(&args[1..]),
         Some("add") => add(&args[1..]),
         Some("remove") => remove(&args[1..]),
+        Some("status") => status(&args[1..]),
+        Some("login") => login(&args[1..]),
         Some("default") => set_default(&args[1..]),
         Some("help" | "--help" | "-h") if args.len() == 1 => {
             println!("{ACCOUNT_USAGE}");
@@ -813,6 +823,480 @@ fn set_default(args: &[String]) -> std::io::Result<i32> {
     Ok(0)
 }
 
+// ---------------------------------------------------------------------------
+// status
+// ---------------------------------------------------------------------------
+
+const STATUS_USAGE: &str = "usage: herdr account status [<name>] [--json]";
+const LOGIN_USAGE: &str = "usage: herdr account login <name> [--pane <id>]";
+
+fn parse_status(args: &[String]) -> Result<(Option<String>, bool), String> {
+    let mut name: Option<String> = None;
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => {
+                if json {
+                    return Err("--json was given more than once".to_string());
+                }
+                json = true;
+            }
+            other if other.starts_with('-') => return Err(format!("unknown flag {other:?}")),
+            other => {
+                if name.is_some() {
+                    return Err(format!("unexpected argument {other:?}"));
+                }
+                name = Some(other.to_string());
+            }
+        }
+    }
+    Ok((name, json))
+}
+
+fn status(args: &[String]) -> std::io::Result<i32> {
+    let (name, json) = match parse_status(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("herdr account status: {message}");
+            eprintln!("{STATUS_USAGE}");
+            return Ok(2);
+        }
+    };
+
+    let config = crate::config::Config::load().config;
+    let (profiles, diagnostics) = load_profiles(&config);
+
+    // A name that is not a profile is an error, never an empty report: a typo
+    // must not read as "this account is fine and idle".
+    if let Some(name) = name.as_deref() {
+        if profiles.get(name).is_none() {
+            for diagnostic in &diagnostics {
+                eprintln!("{diagnostic}");
+            }
+            eprintln!("unknown account profile {name:?} (see `herdr account list`)");
+            return Ok(1);
+        }
+    }
+
+    // Read-only and offline-tolerant: without a server the profile half of the
+    // report is still complete and correct, so the agents column says it does
+    // not know rather than the command failing.
+    let (agents, agents_note) = agent_facts();
+
+    let statuses = crate::accounts::status::assemble(
+        &profiles,
+        name.as_deref(),
+        |profile| layout::inspect(profile, InspectOptions::with_identity()),
+        agents.as_deref(),
+    );
+
+    crate::platform::begin_cli_output();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&statuses).map_err(std::io::Error::other)?
+        );
+    } else {
+        print!("{}", crate::accounts::status::render_text(&statuses));
+    }
+
+    if let Some(note) = agents_note {
+        eprintln!("note: {note}");
+    }
+    // Reported against the full merged view, not the selected profile: an
+    // agent stranded on a profile that no longer exists is exactly what a
+    // single-profile `status` would otherwise hide.
+    if let Some(agents) = agents.as_deref() {
+        for orphan in crate::accounts::status::agents_on_unknown_profiles(&profiles, agents) {
+            eprintln!(
+                "warning: {} on pane {} claims account {:?}, which is not configured",
+                orphan.name.as_deref().unwrap_or("an agent"),
+                orphan.pane_id,
+                orphan.account.as_deref().unwrap_or_default()
+            );
+        }
+    }
+    for diagnostic in &diagnostics {
+        eprintln!("{diagnostic}");
+    }
+    Ok(i32::from(!diagnostics.is_empty()))
+}
+
+/// The running agents, or why they could not be listed.
+///
+/// Every failure degrades to "unknown": `status` is a read, and a herdr that
+/// is not running is the normal state of a machine whose profiles someone is
+/// checking before starting anything.
+fn agent_facts() -> (
+    Option<Vec<crate::accounts::status::AgentFact>>,
+    Option<String>,
+) {
+    let response = match crate::cli::send_request(&Request {
+        id: "cli:accounts:status:agent_list".into(),
+        method: Method::AgentList(EmptyParams::default()),
+    }) {
+        Ok(response) => response,
+        Err(err) if crate::cli::server_not_running_was_reported(&err) => {
+            return (
+                None,
+                Some("no herdr server is running, so no agent placement is known".to_string()),
+            );
+        }
+        Err(err) if crate::cli::protocol_mismatch_was_reported(&err) => {
+            // The guard already printed the mismatch; do not say it twice.
+            return (None, None);
+        }
+        Err(err) => {
+            return (
+                None,
+                Some(format!(
+                    "could not list agents ({err}); placement is unknown"
+                )),
+            );
+        }
+    };
+    if let Some(error) = response.get("error") {
+        return (
+            None,
+            Some(format!(
+                "could not list agents ({error}); placement is unknown"
+            )),
+        );
+    }
+    match serde_json::from_value::<Vec<AgentInfo>>(response["result"]["agents"].clone()) {
+        Ok(agents) => (
+            Some(
+                agents
+                    .iter()
+                    .map(crate::accounts::status::AgentFact::from_agent_info)
+                    .collect(),
+            ),
+            None,
+        ),
+        Err(err) => (
+            None,
+            Some(format!(
+                "could not read the agent list ({err}); placement is unknown"
+            )),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// login
+// ---------------------------------------------------------------------------
+
+/// How long to wait for the pane's shell to come back to its prompt after the
+/// environment line.
+///
+/// Unlike `crate::accounts::client`, this wait is load-bearing rather than
+/// politeness. The launch driver hands its second line to `agent.start`, which
+/// refuses a busy pane itself; `login` submits its second line with a raw
+/// `pane.send_text` that nothing on the server stands in front of, so a pane
+/// that has not come back is a refusal. The budget is generous because a slow
+/// prompt command is the ordinary reason to miss it.
+const LOGIN_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
+const LOGIN_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5_000);
+const LOGIN_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn parse_login(args: &[String]) -> Result<(String, Option<String>), String> {
+    let mut name: Option<String> = None;
+    let mut pane: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--pane" => {
+                if pane.is_some() {
+                    return Err("--pane was given more than once".to_string());
+                }
+                // A flag where a pane id belongs is a typo. Typing into the
+                // pane herdr happens to focus instead would send an export
+                // line to whatever is running there.
+                match args.get(index + 1) {
+                    Some(value) if !value.starts_with('-') => {
+                        pane = Some(crate::cli::normalize_pane_id(value));
+                    }
+                    Some(value) => {
+                        return Err(format!(
+                            "--pane needs a pane id, but the next argument is {value:?}"
+                        ))
+                    }
+                    None => return Err("--pane needs a pane id".to_string()),
+                }
+                index += 2;
+            }
+            other if other.starts_with('-') => return Err(format!("unknown flag {other:?}")),
+            other => {
+                if name.is_some() {
+                    return Err(format!("unexpected argument {other:?}"));
+                }
+                name = Some(other.to_string());
+                index += 1;
+            }
+        }
+    }
+    let name = name.ok_or_else(|| "a profile name is required".to_string())?;
+    Ok((name, pane))
+}
+
+fn login(args: &[String]) -> std::io::Result<i32> {
+    let (name, pane) = match parse_login(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("herdr account login: {message}");
+            eprintln!("{LOGIN_USAGE}");
+            return Ok(2);
+        }
+    };
+
+    let config = crate::config::Config::load().config;
+    let (profiles, diagnostics) = load_profiles(&config);
+    for diagnostic in &diagnostics {
+        eprintln!("{diagnostic}");
+    }
+    let Some(profile) = profiles.get(&name) else {
+        eprintln!("unknown account profile {name:?} (see `herdr account list`)");
+        return Ok(1);
+    };
+
+    // Logging in creates this profile's credentials, so the directory has to
+    // be the one `herdr account add` built. Letting Claude create a missing
+    // one would produce an unseeded, world-readable directory that no other
+    // herdr command knows how to repair.
+    let inspection = layout::inspect(profile, InspectOptions::health());
+    if !inspection.dir_exists {
+        eprintln!(
+            "account profile {name:?} points at {}, which does not exist; \
+             run `herdr account add {name}` or fix its config_dir",
+            profile.config_dir.display()
+        );
+        return Ok(1);
+    }
+    let Some(config_dir) = profile.config_dir.to_str() else {
+        eprintln!(
+            "account profile {name:?} has a config_dir that is not valid UTF-8 ({:?}) \
+             and cannot be typed at a shell prompt",
+            profile.config_dir
+        );
+        return Ok(1);
+    };
+
+    let pane_id = match resolve_pane(pane) {
+        Ok(pane_id) => pane_id,
+        Err(message) => {
+            eprintln!("herdr account login: {message}");
+            return Ok(1);
+        }
+    };
+
+    // Everything that can refuse refuses before a byte reaches the pane.
+    let info = match pane_process_info(&pane_id) {
+        Ok(info) => info,
+        Err(message) => {
+            eprintln!("herdr account login: {message}");
+            return Ok(1);
+        }
+    };
+    let shell = match pane_shell_at_prompt(&info) {
+        Ok(shell) => shell,
+        // The shared refusal ends by offering `--account none`, which belongs
+        // to `herdr agent start`. Point at this command's own way out instead.
+        Err(LaunchError::PaneNotAtPrompt { pane_id, detail }) => {
+            eprintln!(
+                "pane {pane_id} is not at its shell prompt ({detail}); nothing was typed. \
+                 Wait for the pane to return to its prompt, or name another one with --pane"
+            );
+            return Ok(1);
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            return Ok(1);
+        }
+    };
+    let line =
+        match env_assignment_line(shell.family, profile.agent.config_dir_env_var(), config_dir) {
+            Ok(line) => line,
+            Err(error) => {
+                eprintln!("{error}");
+                return Ok(1);
+            }
+        };
+    // Matched, never assumed: a second `AccountAgent` has to be a compile error
+    // here rather than a `claude auth login` typed at a profile that is not
+    // Claude's.
+    let command = match profile.agent {
+        AccountAgent::Claude => format!(
+            "{} auth login",
+            crate::detect::interactive_agent_executable(crate::detect::Agent::Claude)
+        ),
+    };
+    let variable = profile.agent.config_dir_env_var();
+
+    // Both warnings are about what completing this login will do, so they are
+    // said while the user can still stop rather than after the fact.
+    if inspection.logged_in {
+        eprintln!(
+            "warning: account profile {name:?} already has credentials; \
+             completing this login replaces them"
+        );
+    }
+    if !inspection.hook_installed {
+        eprintln!(
+            "warning: account profile {name:?} has no herdr session hook, so Claude will not \
+             report its session id; run `CLAUDE_CONFIG_DIR={config_dir} herdr integration install claude`"
+        );
+    }
+
+    crate::platform::begin_cli_output();
+    if let Err(error) = send_line(&pane_id, &line) {
+        eprintln!("herdr account login: {error}");
+        if error.may_have_landed {
+            // The request left this process and no reply came back, so the
+            // pane's shell may already export the variable. Saying otherwise
+            // would leave a shell pointing at a profile nobody mentioned.
+            eprintln!(
+                "note: pane {pane_id} may already export {variable}={config_dir:?}; check it \
+                 before starting anything there"
+            );
+        }
+        return Ok(1);
+    }
+    if !wait_for_prompt(&pane_id, shell.pid) {
+        // `pane.send_text` has no busy check of its own, so typing the second
+        // line now would feed `claude auth login` to whatever took the
+        // foreground instead of to the shell.
+        eprintln!(
+            "herdr account login: pane {pane_id} did not come back to its shell prompt after \
+             the environment line, so `{command}` was not typed. {variable} is exported in that \
+             shell now, so running `{command}` there logs {name:?} in."
+        );
+        return Ok(1);
+    }
+    if let Err(error) = send_line(&pane_id, &command) {
+        eprintln!(
+            "herdr account login: {error}; {variable} was already exported in pane {pane_id}, \
+             so running `{command}` there by hand logs the right profile in"
+        );
+        return Ok(1);
+    }
+
+    println!("typed into pane {pane_id}:");
+    println!("  {}", line.trim_start());
+    println!("  {command}");
+    println!("Follow the login in pane {pane_id}, then run `herdr account status {name}`.");
+    Ok(0)
+}
+
+/// The pane `login` types into: `--pane`, else the pane this command runs in,
+/// else the focused one (`pane.current`).
+fn resolve_pane(explicit: Option<String>) -> Result<String, String> {
+    if let Some(pane_id) = explicit {
+        return Ok(pane_id);
+    }
+    let caller_pane_id = std::env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| crate::cli::normalize_pane_id(&value));
+    let response = crate::cli::send_request(&Request {
+        id: "cli:accounts:login:pane_current".into(),
+        method: Method::PaneCurrent(PaneCurrentParams { caller_pane_id }),
+    })
+    .map_err(|err| format!("could not resolve the current pane: {err}"))?;
+    if let Some(error) = response.get("error") {
+        return Err(format!("could not resolve the current pane: {error}"));
+    }
+    response["result"]["pane"]["pane_id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "the server named no current pane; pass --pane <id>".to_string())
+}
+
+/// Read a pane's process table.
+///
+/// Kept here rather than shared with `crate::accounts::client`: that module's
+/// helpers carry launch-specific error context (whether the environment line
+/// had already been typed) that `login` has no use for.
+fn pane_process_info(pane_id: &str) -> Result<PaneProcessInfo, String> {
+    let response = crate::cli::send_request(&Request {
+        id: "cli:accounts:login:process_info".into(),
+        method: Method::PaneProcessInfo(PaneProcessInfoParams {
+            pane_id: Some(pane_id.to_owned()),
+        }),
+    })
+    .map_err(|err| format!("pane.process_info failed: {err}"))?;
+    if let Some(error) = response.get("error") {
+        return Err(format!("pane.process_info failed: {error}"));
+    }
+    serde_json::from_value(response["result"]["process_info"].clone())
+        .map_err(|err| format!("pane.process_info returned an unreadable process table: {err}"))
+}
+
+/// Why a line could not be submitted, and whether it may have reached the pane.
+///
+/// The same distinction `crate::accounts::client::apply_env` draws: a request
+/// the server rejected wrote nothing to the pty, while a transport failure may
+/// have delivered the text and lost only the reply. Only the caller can say
+/// what a pane that may be holding an export line means for the user.
+struct SendLineError {
+    detail: String,
+    may_have_landed: bool,
+}
+
+impl std::fmt::Display for SendLineError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "pane.send_text failed: {}", self.detail)
+    }
+}
+
+/// Submit one line at the pane's prompt.
+fn send_line(pane_id: &str, line: &str) -> Result<(), SendLineError> {
+    let response = crate::cli::send_request(&Request {
+        id: "cli:accounts:login:send_text".into(),
+        method: Method::PaneSendText(PaneSendTextParams {
+            pane_id: pane_id.to_owned(),
+            text: format!("{line}\r"),
+        }),
+    })
+    .map_err(|err| SendLineError {
+        detail: err.to_string(),
+        // The request never reached the server, or its reply never came back.
+        // Assuming nothing was typed would understate what the pane holds.
+        may_have_landed: true,
+    })?;
+    match response.get("error") {
+        // The server rejected the call (no such pane, bad text), so nothing
+        // was written to the pty.
+        Some(error) => Err(SendLineError {
+            detail: error.to_string(),
+            may_have_landed: false,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Poll until the pane's own shell holds the foreground again.
+///
+/// `false` means the budget ran out; the caller refuses rather than typing into
+/// whatever is there.
+fn wait_for_prompt(pane_id: &str, shell_pid: u32) -> bool {
+    std::thread::sleep(LOGIN_SETTLE_GRACE);
+    let deadline = std::time::Instant::now() + LOGIN_SETTLE_TIMEOUT;
+    loop {
+        let settled = pane_process_info(pane_id)
+            .ok()
+            .and_then(|info| pane_shell_at_prompt(&info).ok())
+            .is_some_and(|shell| shell.pid == shell_pid);
+        if settled {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(LOGIN_SETTLE_POLL.min(remaining));
+    }
+}
+
 fn rows_for(profiles: &Profiles) -> Vec<AccountListRow> {
     let default = profiles
         .default_profile()
@@ -1104,12 +1588,70 @@ mod tests {
     }
 
     #[test]
+    fn status_parses_its_optional_name_and_flag() {
+        let parse =
+            |args: &[&str]| parse_status(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+
+        assert_eq!(parse(&[]).expect("bare"), (None, false));
+        assert_eq!(parse(&["--json"]).expect("json"), (None, true));
+        assert_eq!(
+            parse(&["work", "--json"]).expect("named"),
+            (Some("work".to_string()), true)
+        );
+        assert_eq!(
+            parse(&["--json", "work"]).expect("either order"),
+            (Some("work".to_string()), true)
+        );
+
+        for bad in [
+            vec!["work", "extra"],
+            vec!["--unknown"],
+            vec!["--json", "--json"],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn login_parses_its_name_and_pane() {
+        let parse =
+            |args: &[&str]| parse_login(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+
+        assert_eq!(parse(&["work"]).expect("bare"), ("work".to_string(), None));
+        assert_eq!(
+            parse(&["work", "--pane", "%1.1"]).expect("pane"),
+            ("work".to_string(), Some("%1.1".to_string()))
+        );
+        assert_eq!(
+            parse(&["--pane", "%1.1", "work"]).expect("either order"),
+            ("work".to_string(), Some("%1.1".to_string()))
+        );
+
+        for bad in [
+            // No name: `login` must never guess which account to sign in.
+            vec![],
+            vec!["--pane", "%1.1"],
+            vec!["work", "other"],
+            vec!["work", "--unknown"],
+            // A flag swallowed as a pane id would send the export line to
+            // whichever pane herdr happens to focus.
+            vec!["work", "--pane"],
+            vec!["work", "--pane", "--json"],
+            vec!["work", "--pane", "%1.1", "--pane", "%1.2"],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
     fn usage_documents_every_subcommand() {
         for line in [
             "herdr account list",
             "herdr account add",
             "herdr account remove",
             "herdr account default",
+            "herdr account status",
+            "herdr account login",
         ] {
             assert!(ACCOUNT_USAGE.contains(line), "{line}");
         }
