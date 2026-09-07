@@ -148,10 +148,10 @@ still wins):
 
 ```console
 $ target/debug/herdr --version
-herdr 0.8.2-fork
+herdr 0.9.0-fork
 ```
 
-The suffix is the upstream `x.y.z-<channel>` shape (`0.8.2-fork.<id>` when
+The suffix is the upstream `x.y.z-<channel>` shape (`0.9.0-fork.<id>` when
 `HERDR_BUILD_ID` is set). It is what keeps upstream's release machinery away
 from a fork binary:
 
@@ -171,15 +171,15 @@ is only ever replaced by rebuilding it.
 
 Two consequences worth knowing:
 
-- `0.8.2-fork` is not a parseable `x.y.z`: `Version::parse` returns `None` for
+- `0.9.0-fork` is not a parseable `x.y.z`: `Version::parse` returns `None` for
   it, so a numeric comparison silently degrades to a `false` branch instead of
   failing loudly. Compare with `Version::current()` (the base version), or drop
   the `-<channel>` suffix first the way `src/release_notes.rs`'s own
   (module-private) `comparable_version` does — never
   `Version::parse(build_info::version())`.
 - Against a stock server, `herdr status --json` reports
-  `server_binary_stale: true` — a plain string comparison of `0.8.2` against
-  `0.8.2-fork`. The server really is a different binary; nothing is wrong.
+  `server_binary_stale: true` — a plain string comparison of `0.9.0` against
+  `0.9.0-fork`. The server really is a different binary; nothing is wrong.
   Actual `--remote` compatibility is decided by the endpoint generation, not by
   the version string (see
   [ADR 0001](./decisions/0001-servers-stay-stock-ssh-transport.md)).
@@ -312,7 +312,7 @@ $ ssh -F "$HERDR_SSH_LAB_SSH_CONFIG" -o BatchMode=yes herdr-ssh-lab \
     'echo $HOME; command -v herdr; herdr --session lab-1 status server --json'
 /tmp/herdr-fleet-lab/ssh/home
 /tmp/herdr-fleet-lab/ssh/home/.local/bin/herdr
-{"status":"running","running":true,"version":"0.8.2-fork","protocol":22,…,"session":"lab-1",…}
+{"status":"running","running":true,"version":"0.9.0-fork","protocol":22,…,"session":"lab-1",…}
 ```
 
 A fleet host pointing at it is then just:
@@ -382,12 +382,12 @@ session = "agents"    # named session on that host; required for kind = "local"
 
 ```console
 $ herdr fleet status
-client 0.8.2-fork  active host: none
+client 0.9.0-fork  active host: none
 
 HOST     KIND   STATE        VERSION     BLOCKED  WORKING  DONE  IDLE  UNKNOWN
 local    local  unavailable  -           0        0        0     0     0
-lab-ssh  ssh    connected    0.8.2-fork  0        0        0     0     0
-lab-2    local  connected    0.8.2-fork  0        0        0     0     0
+lab-ssh  ssh    connected    0.9.0-fork  0        0        0     0     0
+lab-2    local  connected    0.9.0-fork  0        0        0     0     0
   ! local: no herdr server for session default at /tmp/herdr-fleet-lab/xdg/herdr-dev/herdr-client.sock
 
 no agents

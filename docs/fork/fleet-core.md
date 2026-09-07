@@ -291,12 +291,12 @@ target nothing listens on) and `spare` (a host with `enabled = false`).
 
 ```console
 $ herdr fleet status --timeout-ms 30000
-client 0.8.2-fork  active host: none
+client 0.9.0-fork  active host: none
 
 HOST     KIND   STATE        VERSION     BLOCKED  WORKING  DONE  IDLE  UNKNOWN
 local    local  unavailable  -           0        0        0     0     0
-lab-ssh  ssh    connected    0.8.2-fork  0        0        0     0     0
-lab-2    local  connected    0.8.2-fork  0        0        0     0     0
+lab-ssh  ssh    connected    0.9.0-fork  0        0        0     0     0
+lab-2    local  connected    0.9.0-fork  0        0        0     0     0
 nowhere  ssh    unavailable  -           0        0        0     0     0
 spare    local  unavailable  -           0        0        0     0     0
   ! local: no herdr server for session default at /tmp/herdr-fleet-lab/xdg/herdr-dev/herdr-client.sock
@@ -313,7 +313,7 @@ pins:
 
 ```text
 HOST     KIND   STATE        VERSION     BLOCKED  WORKING  DONE  IDLE  UNKNOWN
-local    local  connected    0.8.2-fork  1        0        0     0     0
+local    local  connected    0.9.0-fork  1        0        0     0     0
 workbox  local  unavailable  -           0        0        0     0     0
   ! workbox: connection refused
 
@@ -336,7 +336,7 @@ unknown `connection.state` or `agent_status` (both decode to `unknown`).
 $ herdr fleet status --timeout-ms 30000 --json
 {
   "schema": "herdr.fleet.status.v1",
-  "client_version": "0.8.2-fork",
+  "client_version": "0.9.0-fork",
   "active_host": null,
   "hosts": [
     {
@@ -363,7 +363,7 @@ $ herdr fleet status --timeout-ms 30000 --json
       "enabled": true,
       "connection": {
         "state": "connected",
-        "server_version": "0.8.2-fork"
+        "server_version": "0.9.0-fork"
       },
       "boot_id": "1613778-1788644429866237637",
       "revision": 1,
@@ -410,7 +410,7 @@ two hosts are elided, for length. Nothing else is edited.)
 | Field | Notes |
 | --- | --- |
 | `schema` | Always `herdr.fleet.status.v1`. |
-| `client_version` | Version of the client that produced the report (`0.8.2-fork`). |
+| `client_version` | Version of the client that produced the report (`0.9.0-fork`). |
 | `active_host` | `null` for `herdr fleet status`; a long-lived consumer that installs one host's surfaces sets it. |
 | `hosts[]` | Every configured host, in config order, `local` first. |
 | `hosts[].kind` | `"local"` or `"ssh"`; treat an unknown value as a transport you cannot use. |
@@ -446,7 +446,7 @@ $ herdr fleet status --timeout-ms 30000 --watch --json
 {"kind":"host_connection","host":"lab-ssh","connection":{"state":"connecting","attempt":4}}
 {"kind":"host_connection","host":"lab-ssh","connection":{"state":"unavailable","reason":"remote platform detection failed: ssh: Could not resolve hostname herdr-ssh-lab: Temporary failure in name resolution","retry_in_ms":8000}}
 {"kind":"host_connection","host":"lab-ssh","connection":{"state":"connecting","attempt":5}}
-{"kind":"host_connection","host":"lab-ssh","connection":{"state":"connected","server_version":"0.8.2-fork"}}
+{"kind":"host_connection","host":"lab-ssh","connection":{"state":"connected","server_version":"0.9.0-fork"}}
 {"kind":"snapshot","host":"lab-ssh","boot_id":"1613778-1788644429866237637","revision":1}
 ```
 

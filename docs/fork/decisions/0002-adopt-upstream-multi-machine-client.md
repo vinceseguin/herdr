@@ -159,3 +159,56 @@ asked for; E3 may adopt it.
 
 Upstream syncs remain a merge commit (`gh pr merge --merge`), so upstream's
 history stays in the fork's `master`.
+
+### Upstream sync 2026-09-07 (`chore: sync upstream master through a9f3ad5f`)
+
+The second sync merged upstream `e366a05f..a9f3ad5f` — eleven commits, including
+the **v0.9.0 release** (`b99002ac`) and its published artefacts. Upstream's
+version moves `0.8.2 → 0.9.0`, so the fork binary now reports `0.9.0-fork`; the
+version examples in `../README.md`, `../fleet-core.md` and `../gateway.md` were
+refreshed to match. The wiring table in `../README.md` did not change.
+
+**One file conflicted:** `src/config.rs`, in the single `pub use model::{…}`
+list — upstream added `PaneBordersConfig` (the three-state `ui.pane_borders`
+mode, #3234), the fork side carries `FleetConfig`, `FleetHostConfig`,
+`FleetHostKind` and `FLEET_LOCAL_HOST_NAME`. Resolved as the union of both, per
+the "both sides" rule for config plumbing. The gateway re-exports live in a
+separate, feature-gated block and were untouched. Everything else merged
+automatically, including `Cargo.toml`/`Cargo.lock` (the fork's `[features]`
+block and its five optional gateway dependencies survived alongside upstream's
+0.9.0 bump), `src/config/model.rs`, `src/main.rs`, `src/app/mod.rs`,
+`tests/api_ping.rs` and — notably — `src/remote/attach.rs`.
+
+**E1's hooks needed no manual re-application.** Upstream's only `attach.rs`
+change in the range was `702aa1e4` (*require explicit consent for remote server
+replacement*), which touches `prepare_saved_ssh`, `prepare_remote_herdr` and the
+two confirmation prompts; none of them are on the fleet's path, so git merged
+upstream's hunks around the fork's `pub(crate)` widenings, `start_with`,
+`local_forward_socket_path_scoped`, `BridgeErrorSink` and `discover_remote_herdr`
+cleanly. **Still no upstream reusable bridge was adopted** — the reasoning of
+the 2026-09-06 entry is unchanged, and `702aa1e4` in fact moves upstream's
+saved-machine path *further* from the fleet's contract (it now passes
+`allow_install = false` and requires an interactive `y/N` before replacing a
+remote server). The fleet remains discovery-only, install-never: its
+`SshTransport` calls only `discover_remote_herdr`, whose probe is a generation
+match, and `tests` in `src/fleet/transport/ssh.rs` still assert the transport
+"must never install or inspect the server". Validated live: the gateway's ssh
+host connects with no prompt and no stall, over an `ssh -o BatchMode=yes -o
+NumberOfPasswordPrompts=0 … remote-client-bridge` child.
+
+`src/detect/manifests/claude.toml` took upstream's side whole (`4b5e9bda`, bash
+permission prompts at every cursor position): the `bash_permission_prompt` rule's
+`all` gate is now a five-branch `any` of `❯?`-prefixed line regexes. The fork has
+no local edits there. **E9's planned `usage_limit` rule must be written against
+that new shape**, not the pre-0.9.0 two-branch one.
+
+Nothing in upstream's release artefacts (`distribution/latest.json`,
+`docs/versions/0.9.0/**`, `CHANGELOG.md`, `README.md`, `skills/herdr/SKILL.md`)
+re-enables an upstream workflow on the fork or repoints the fork's updater: the
+range contains no `.github/**` change at all, and the fork-channel guard still
+refuses (`herdr update` → exit 1, `self-update is disabled for fork builds`).
+`git diff upstream/master -- src/protocol src/server src/api tests/fixtures` is
+empty, as it must stay.
+
+Both gates green on the merged tree with no test, lint or fixture weakened:
+`gate.sh … ` → `EXIT=0`, `gate.sh … ci-no-default` → `EXIT=0`.

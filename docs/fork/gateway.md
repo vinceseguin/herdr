@@ -522,7 +522,7 @@ content-length: 11
 
 ```console
 $ curl -s -H "Authorization: Bearer $READ" http://127.0.0.1:7788/api/gateway
-{"client_version":"0.8.2-fork","features":["fleet","events","terminal","pairing"],
+{"client_version":"0.9.0-fork","features":["fleet","events","terminal","pairing"],
  "loopback":true,"public_url":"","schema":"herdr.gateway.info.v1","scope":"read","via":"bearer"}
 ```
 
@@ -543,7 +543,7 @@ lab, two local hosts, abbreviated after the first host:
 ```json
 {
   "schema": "herdr.fleet.status.v1",
-  "client_version": "0.8.2-fork",
+  "client_version": "0.9.0-fork",
   "active_host": null,
   "hosts": [
     {
@@ -552,7 +552,7 @@ lab, two local hosts, abbreviated after the first host:
       "target": null,
       "session": "lab-1",
       "enabled": true,
-      "connection": { "state": "connected", "server_version": "0.8.2-fork" },
+      "connection": { "state": "connected", "server_version": "0.9.0-fork" },
       "boot_id": "245261-1788738396437057666",
       "revision": 1,
       "counts": { "blocked": 0, "working": 0, "done": 0, "idle": 0, "unknown": 0 },
@@ -721,8 +721,8 @@ in both and never in neither.
 ```console
 $ python3 scripts/fork/ws-client.py ws://127.0.0.1:7788/api/events \
     -H "Authorization: Bearer $READ" --max-messages 2
-text {"kind":"hello","schema":"herdr.fleet.events.v1","client_version":"0.8.2-fork","scope":"read"}
-text {"kind":"fleet","report":{"schema":"herdr.fleet.status.v1","client_version":"0.8.2-fork","active_host":null,"hosts":[…]}}
+text {"kind":"hello","schema":"herdr.fleet.events.v1","client_version":"0.9.0-fork","scope":"read"}
+text {"kind":"fleet","report":{"schema":"herdr.fleet.status.v1","client_version":"0.9.0-fork","active_host":null,"hosts":[…]}}
 ```
 
 Then one message per change, each a newline-free JSON object tagged by `kind`:
