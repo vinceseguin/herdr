@@ -348,7 +348,7 @@ implementation starts only after E3 is ✅.
 | 2 | feat(accounts): herdr account add, remove and default with seeded profile directories | A · Foundations | 1 | ✅ |
 | 3 | feat(accounts): herdr account status and login | B · CLI | 2 | ✅ |
 | 4 | feat(accounts): launch claude under a profile with herdr agent start --account | B · CLI | 1 | ✅ |
-| 5 | feat(accounts): switch a running claude agent to another profile keeping its session | B · CLI | 4 | ⬜ |
+| 5 | feat(accounts): switch a running claude agent to another profile keeping its session | B · CLI | 4 | ✅ |
 | 6 | feat(fleet): fleet report and change stream carry agent metadata tokens | C · Fleet | 1 | ⬜ |
 | 7 | feat(accounts): tui account picker to start claude in a pane | D · TUI | 4 | ⬜ |
 | 8 | feat(accounts): tui switch-account action with confirmation | D · TUI | 5, 7 | ⬜ |
@@ -1238,6 +1238,115 @@ background thread with the same `Observation`/`Action` types; PR 9 adds a
 preflight hint (`limit`) through `SwitchInput.limit: Option<UsageLimit>`
 without changing phases.
 
+**As built (PR 5, merged).** The protocol is decision (i) as specified, with
+one phase added. The shapes below are what PRs 8, 9 and 10 must code against,
+and they win over the prose above.
+
+- **The CLI lives in `src/cli/agent.rs`, not `src/cli/account.rs`.** PR 3 owns
+  `src/cli/account.rs` and landed in the same wave, so `agent_switch_account`
+  went into the file that already owns the `agent` subcommand table. The plan's
+  "the implementation lives in `src/cli/account.rs`" line is superseded.
+- **`switch_account` takes two closures, not an `ApiClient`.**
+  `client::switch_account(input, &mut confirm, &mut launch) -> Result<
+  SwitchOutcome, Box<SwitchFailure>>`, where `confirm: FnMut(&str) ->
+  client::Confirmation {Yes, No, Unavailable}` and `launch:
+  FnMut(&LaunchRequest) -> Result<AppliedLine, SwitchError>`. Asking a human is
+  the caller's business (a TTY prompt in the CLI, a modal in PR 8's TUI), and
+  the relaunch has to run the stock `agent.start` retry loop that lives in
+  `crate::cli::agent`, which `src/accounts/client.rs` must not import.
+  `SwitchOutcome { result: SwitchResult, warnings: Vec<String> }`.
+- **`agent_start`'s start-and-wait sequence was factored out** into
+  `crate::cli::agent::start_managed_agent(name, kind, expected_kind, pane_id,
+  args, timeout_ms) -> io::Result<Result<Value, AgentStartRefusal>>` (a verbatim
+  move of the `agent_pane_busy` retry, the terminal-id pinning and the
+  readiness wait). PR 4's *As built* said that retry was not factored out; it is
+  now, and the switch relaunch runs exactly that code rather than a second copy.
+  This is E9's one behaviour-preserving reshape of an upstream file.
+- **There is a `Recheck` phase between the confirmation and `/exit`.** A human
+  can take minutes over `[y/N]`, and `agent.prompt` accepts a prompt from a
+  *working* agent, so an agent that was idle at preflight could be mid-tool-call
+  by the time `/exit` lands. After `Confirmed(true)` the pinned pane is read
+  again and must still hold the same terminal, the same managed name and the
+  same session id; a now-working agent is refused without `--interrupt`; and the
+  *rechecked* status decides Escape-vs-`/exit`. Anything else is
+  `SwitchError::AgentChanged` with nothing sent. PR 8 must drive this phase too.
+- **`SwitchOptions` has no `yes` field.** Whether a confirmation can be answered
+  is the driver's business, so the machine always emits `AskConfirm` and can
+  never be built in a mode that skips it. `Observation::ConfirmUnavailable` is
+  the "nobody to ask" answer and fails with `ConfirmationRequired`.
+- **Exit codes are the contract that matters when this fails:** `0` the agent
+  runs under the new profile with the same session; **`2` refused before a byte
+  reached the pane**, so the agent is exactly as it was; **`1` the protocol had
+  started** — the message says what the pane holds. `touched_pane` flips on
+  *delivery* (`Observation::Sent`, or a transport-level rejection), not on the
+  decision to send, so a key the server refused still exits 2. A graded
+  `mismatch` is a *result* (the token is written so every surface shows it) that
+  exits 1.
+- **`SwitchFailure { error, touched_pane, pane_id, session_id, warnings }`**
+  plus `recovery_hint() -> Option<String>`. Every failure after the launch still
+  grades and records the relaunched agent — it really is running under the new
+  profile, and saying nothing would leave a running agent with no account at all
+  — and carries that as a warning the CLI prints. Every failure that leaves the
+  pane at a shell names `claude --resume <id>`.
+- **The preflight refusals, in order:** not a Claude agent → no managed name
+  (`agent.start` needs one, and inventing one could collide, so
+  `herdr agent rename <pane> <name>` first) → no `agent_session` → a session
+  from another integration → a session id that is not an `Id`, starts with `-`,
+  or that `crate::agent_resume::plan` will not turn into argv → target profile
+  directory missing → target logged out (unless `--force`) → already on that
+  account (unless `--force`) → `working` without `--interrupt`. All exit 2 with
+  nothing sent.
+- **The resume argv comes from `crate::agent_resume::plan`** with `argv[0]`
+  dropped, so herdr resumes Claude exactly the way its own restore path does
+  rather than through a second hardcoded `["--resume", id]`.
+- **`AwaitShell` needs two independent facts**, polled every 250 ms:
+  `launch::pane_shell_at_prompt` over `pane.process_info` (the Claude process is
+  gone) *and* `agent.get <pane id>` returning `agent_not_found` (the server has
+  released the terminal, which is what `agent.start` checks before it will
+  accept the pane at all). Waiting on only the first relaunches into a pane the
+  server still calls busy — after the environment line has been typed.
+  `PaneReading::Released` carries a **required** `terminal_id: String`: a pane
+  whose identity cannot be read is `Unreadable` and retried, never launched
+  into.
+- **A stale session id cannot be mistaken for a resume.**
+  `src/terminal/state.rs` clears `persisted_agent_session` in the same mutation
+  that releases the agent name when the process exits, and
+  `persisted_session_from_launch_args` is Codex-only so `--resume` does not
+  pre-seed one either. `AwaitSession` therefore accepts an equal id **reported
+  by `herdr:claude`/`claude`** as proof, and a *different* id fails immediately
+  with `SessionMismatch` — the resume did not take and the original conversation
+  is still on disk.
+- **The pane is pinned at preflight** (`pane_id` + `terminal_id`) and every key,
+  prompt, poll and launch afterwards addresses it.
+  `SwitchMachine::agent_target()` is the user's target only until preflight has
+  run. A terminal id that differs from the pinned one — in `AwaitShell` or in
+  `AwaitSession` — fails with `PaneReplaced` instead of typing.
+- **No `duplicate_name` on relaunch.** The server clears the managed name when
+  the Claude process exits, and `AwaitShell` waits for exactly that, so the
+  relaunch reuses the agent's own name; the `agent.rename` fallback the plan
+  allowed for is not needed.
+- **`herdr:claude` cannot report an agent state.**
+  `crate::agent_resume::is_reserved_native_state_source` makes
+  `pane.report-agent --source herdr:claude` record only the session ref
+  (`src/app/actions.rs::HookStateReported`), so a `working` agent cannot be
+  faked that way in a test. `scripts/fork/fake-claude.sh` grew `/work`, which
+  sets the braille-spinner OSC title `osc_title_working` matches, and the
+  integration tests drive herdr's real screen detection instead. PR 9 should
+  reuse that route for the usage-limit rule rather than a state report.
+- **The stub grew knobs** the switch tests need and later PRs may reuse:
+  `FAKE_CLAUDE_BUSY=1` (refuses `/exit`), `FAKE_CLAUDE_NO_SESSION=1` (reports no
+  session id, like a profile with no hook installed),
+  `FAKE_CLAUDE_RESUME={ok,new,fail}` (resume succeeds / starts a different
+  conversation / refuses to start), the `/work` input above, and a `✳ ` idle
+  OSC title so a relaunch after `/work` is detected idle again.
+- **Lab labels must stay short.** `tests/support/accounts_lab.rs` roots are
+  `/tmp/…/acct-<label>-…`, and the lab refuses a root whose unix socket path
+  would exceed 104 bytes — `up` dies immediately. Keep new labels under about
+  ten characters.
+- **`--timeout` is the budget for each waiting stage** (default 20 s, max
+  600 s), and is also passed to the relaunch's readiness wait when the server
+  would accept it, so one flag governs the whole command.
+
 ### PR 6 — feat(fleet): fleet report and change stream carry agent metadata tokens · deps: 1
 
 **Goal.** `herdr fleet status --json` (and therefore E3's `/api/fleet` and
@@ -1368,6 +1477,26 @@ sidebar reflects the new account.
 - `src/accounts/client.rs`: `switch_account_with_progress(…, on_event:
   impl FnMut(SwitchEvent))` (shared by CLI `--verbose` and the TUI).
 
+**What PR 5 shipped that this drives** (see its *As built*): the machine is
+`accounts::switch::SwitchMachine::new(SwitchInput { target, to:
+AccountProfile, to_inspection: ProfileInspection, options: SwitchOptions
+{interrupt, force, timeout_ms} })`, started with `start()` and stepped with
+`next(now_millis, Observation) -> Action`. There is a **`Recheck` phase after
+the confirmation**: the overlay's confirm answer produces
+`Observation::Confirmed(true)`, and the machine then asks for one more
+`PollAgent` before anything is sent — an agent that started working, was
+renamed, moved terminal or changed session id in the meantime is
+`SwitchError::AgentChanged` with nothing typed. `SwitchOptions` has no `yes`
+field: the machine always emits `Action::AskConfirm(text)`, which is exactly
+the modal's body text. `Observation::Pane(PaneReading::Released {
+terminal_id: String })` requires a readable terminal id; a pane whose identity
+cannot be read is `Unreadable`. Failures come back as `SwitchFailure { error,
+touched_pane, pane_id, session_id, warnings }` with `recovery_hint()`:
+`touched_pane == false` means the agent is exactly as it was (that is the
+"nothing was typed" the overlay should say), and `warnings` must be shown —
+they are how the user learns that a relaunched agent *was* recorded under the
+new account even though the switch did not finish.
+
 **Shapes/approach.** The confirm step is mandatory (no config to skip it).
 The job thread owns its own `ApiClient`; the overlay only folds events. If
 the user closes the overlay while a job runs, the job continues to a
@@ -1436,6 +1565,17 @@ verbatim with `account_state_known`. `jq '.[] | .agents[]? | .limit'` — the
   only).
 - `scripts/fork/fake-claude.sh`: `FAKE_CLAUDE_LIMIT=1` prints the fixture
   then idles.
+
+**What PR 5 shipped that this builds on** (see its *As built*): a state
+report from `herdr:claude` is ignored — `agent_resume::is_reserved_native_
+state_source` makes `pane.report-agent --source herdr:claude` record only the
+session ref — so a `blocked`/limited agent cannot be faked with a state report
+in a test. Drive the real detection path instead, the way
+`scripts/fork/fake-claude.sh` does for `working` (`/work` sets the
+braille-spinner OSC title): print the captured limit fixture from the stub and
+let the manifest match it. `SwitchInput` gains `limit: Option<UsageLimit>` with
+no phase change; the preflight hint belongs before `Phase::Confirm`, in the
+`AskConfirm` text.
 
 **Shapes/approach.** Evidence loop per `AGENTS.md`: with the stub printing
 the fixture, `herdr agent read <pane> --source detection --format text`
@@ -1657,6 +1797,22 @@ plan's *As built* notes):
 - `/exit` from `agent.prompt` exits cleanly from idle, blocked (after
   `Escape`) and the usage-limit screen; the resumed session reports
   `session_start_source = "resume"` with the same id through the hook.
+- **(PR 5) The exit half of the switch, against a real Claude.** `/exit`
+  submitted through `agent.prompt` must exit cleanly from an idle screen, from
+  a blocked one after `Escape`, and from the usage-limit screen; the pane must
+  return to its own shell prompt inside the 20 s default budget (time it and
+  raise `DEFAULT_TIMEOUT_MS` if a real transcript flush is slower), and
+  `agent.get <pane>` must then report `agent_not_found`. Confirm that a Claude
+  in the middle of a tool call is *not* asked to exit without `--interrupt`,
+  and that `Escape` interrupts rather than kills.
+- **(PR 5) The resume half.** `claude --resume <id>` under the new profile must
+  report the *same* session id through the hook with
+  `session_start_source = "resume"`, and the switch must then read the new
+  profile's directory out of the relaunched process's `/proc` environment
+  (`account_state: "ok"`). Also check the case the fork can only fake: a
+  `--resume` of an id the new profile cannot see (transcripts not shared)
+  starts a *new* conversation — herdr must report `SessionMismatch` and name
+  the original id, and the original transcript must still be on disk.
 - The `usage_limit` rule against the real screen (capture with `herdr agent
   read <pane> --source detection --format text` and `--format ansi`), the
   reset-time wording, and that permission prompts never match it.
