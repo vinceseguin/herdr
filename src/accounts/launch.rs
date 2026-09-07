@@ -14,11 +14,11 @@
 //! under the wrong account without saying so, which is the one outcome this
 //! epic must never produce.
 
-// This module is the syntax half of the two-step launch. Its first production
-// callers are `herdr account login` (PR 3) and `herdr agent start --account`
-// (PR 4); it ships here, fully tested, because both must type the *same* line
-// and the quoting rules are the part that must not be reinvented per caller.
-#![allow(dead_code)]
+use std::path::PathBuf;
+
+use crate::accounts::layout::ProfileInspection;
+use crate::accounts::profile::AccountProfile;
+use crate::api::schema::PaneProcessInfo;
 
 /// The assignment syntax families herdr's accepted pane shells fall into.
 ///
@@ -60,6 +60,14 @@ pub enum LaunchError {
     InvalidVariable { name: String },
     /// The value cannot be written safely in this shell's syntax.
     UnquotableValue { family: ShellFamily, reason: String },
+    /// The pane is not sitting at its shell prompt, so typing an assignment
+    /// would send it to whatever *is* running there.
+    PaneNotAtPrompt { pane_id: String, detail: String },
+    /// The profile's directory is not there. Launching anyway would make
+    /// Claude create and use an empty, logged-out directory.
+    ProfileDirectoryMissing { name: String, dir: PathBuf },
+    /// The directory cannot be written as text, so it cannot be typed.
+    UnrepresentableDirectory { name: String, dir: PathBuf },
 }
 
 impl std::fmt::Display for LaunchError {
@@ -78,6 +86,23 @@ impl std::fmt::Display for LaunchError {
                 formatter,
                 "cannot set this value in a {} shell: {reason}",
                 family.as_str()
+            ),
+            Self::PaneNotAtPrompt { pane_id, detail } => write!(
+                formatter,
+                "pane {pane_id} is not at its shell prompt ({detail}); nothing was typed. \
+                 Wait for the pane to return to its prompt, or use --account none"
+            ),
+            Self::ProfileDirectoryMissing { name, dir } => write!(
+                formatter,
+                "account profile {name:?} points at {}, which does not exist; \
+                 run `herdr account add {name}` or fix its config_dir",
+                dir.display()
+            ),
+            Self::UnrepresentableDirectory { name, dir } => write!(
+                formatter,
+                "account profile {name:?} has a config_dir that is not valid UTF-8 ({:?}) \
+                 and cannot be typed at a shell prompt",
+                dir
             ),
         }
     }
@@ -268,9 +293,160 @@ fn doubled_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// The interactive shell a pane is sitting at, once the pane is known to be
+/// idle at its prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneShell {
+    pub pid: u32,
+    pub name: String,
+    pub family: ShellFamily,
+}
+
+/// Identify the pane's shell, and refuse unless the pane is idle at its prompt.
+///
+/// This is the gate in front of every `pane.send_text` the account tooling
+/// does. The server decides the same thing the same way before it types an
+/// agent's command line (`available_pane_shell_from_job`): the foreground
+/// process group has to *be* the shell, and nothing else may be in it. Typing
+/// an `export` line into a pane where something else is running would feed it
+/// to that program instead — and then the agent would start under whatever
+/// account the shell already had, silently.
+pub fn pane_shell_at_prompt(info: &PaneProcessInfo) -> Result<PaneShell, LaunchError> {
+    let not_at_prompt = |detail: &str| LaunchError::PaneNotAtPrompt {
+        pane_id: info.pane_id.clone(),
+        detail: detail.to_string(),
+    };
+
+    let Some(shell_pid) = info.shell_pid else {
+        return Err(not_at_prompt(
+            "herdr does not know the pane's shell process",
+        ));
+    };
+    if info.foreground_process_group_id != Some(shell_pid) {
+        return Err(not_at_prompt("another program holds the foreground"));
+    }
+    if info
+        .foreground_processes
+        .iter()
+        .any(|process| process.pid != shell_pid)
+    {
+        return Err(not_at_prompt("another program is running in the pane"));
+    }
+    let Some(process) = info
+        .foreground_processes
+        .iter()
+        .find(|process| process.pid == shell_pid)
+    else {
+        return Err(not_at_prompt("the pane reported no foreground process"));
+    };
+
+    // `name` is what the OS calls the process; `argv[0]` is what it was
+    // launched as. The server accepts either, so both are tried here, and the
+    // reported name is whichever one answered.
+    let candidates = std::iter::once(process.name.as_str()).chain(
+        process
+            .argv
+            .as_deref()
+            .and_then(|argv| argv.first())
+            .map(String::as_str),
+    );
+    for candidate in candidates {
+        if let Some(family) = ShellFamily::from_process_name(candidate) {
+            return Ok(PaneShell {
+                pid: shell_pid,
+                name: candidate.to_string(),
+                family,
+            });
+        }
+    }
+    Err(LaunchError::UnknownShell {
+        name: process.name.clone(),
+    })
+}
+
+/// Everything the two-step launch needs, decided before anything is typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchPlan {
+    pub pane_id: String,
+    /// The managed agent name `agent.start` will register.
+    pub name: String,
+    /// The agent kind, always `claude` while decision (c) holds.
+    pub kind: &'static str,
+    pub args: Vec<String>,
+    /// The profile this launch applies.
+    pub profile: AccountProfile,
+    pub shell: PaneShell,
+    /// The exact line to type at the prompt, with no trailing newline.
+    pub line: String,
+    /// The directory the launched process must report back.
+    pub expected_config_dir: String,
+    /// Non-fatal problems worth telling the user about. A missing hook is the
+    /// one that matters: without it Claude never reports its session id, so
+    /// `herdr agent switch-account` cannot keep the conversation.
+    pub warnings: Vec<String>,
+}
+
+/// Decide the whole launch from data: no I/O, no server, no shell.
+///
+/// Every refusal here happens *before* a byte is typed into the pane, which is
+/// the property that keeps a bad plan from becoming a launch under the wrong
+/// account.
+pub fn plan_launch(
+    profile: &AccountProfile,
+    inspection: &ProfileInspection,
+    pane_id: &str,
+    name: &str,
+    args: &[String],
+    shell: PaneShell,
+) -> Result<LaunchPlan, LaunchError> {
+    if !inspection.dir_exists {
+        return Err(LaunchError::ProfileDirectoryMissing {
+            name: profile.name.clone(),
+            dir: profile.config_dir.clone(),
+        });
+    }
+    let Some(config_dir) = profile.config_dir.to_str() else {
+        return Err(LaunchError::UnrepresentableDirectory {
+            name: profile.name.clone(),
+            dir: profile.config_dir.clone(),
+        });
+    };
+    let line = env_assignment_line(shell.family, profile.agent.config_dir_env_var(), config_dir)?;
+
+    let mut warnings = Vec::new();
+    if !inspection.hook_installed {
+        warnings.push(format!(
+            "account profile {:?} has no herdr session hook installed, so Claude will not report \
+             its session id; `herdr agent switch-account` cannot keep the conversation until you \
+             run `herdr account add`/`herdr integration install claude` for it",
+            profile.name
+        ));
+    }
+    if !inspection.logged_in {
+        warnings.push(format!(
+            "account profile {:?} has no credentials file; Claude will ask you to log in \
+             (`herdr account login {}`)",
+            profile.name, profile.name
+        ));
+    }
+
+    Ok(LaunchPlan {
+        pane_id: pane_id.to_string(),
+        name: name.to_string(),
+        kind: profile.agent.as_str(),
+        args: args.to_vec(),
+        profile: profile.clone(),
+        shell,
+        line,
+        expected_config_dir: config_dir.to_string(),
+        warnings,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::schema::PaneProcessInfoProcess;
 
     const VAR: &str = "CLAUDE_CONFIG_DIR";
 
@@ -576,6 +752,207 @@ mod tests {
         }
     }
 
+    fn process(pid: u32, name: &str, argv: Option<&[&str]>) -> PaneProcessInfoProcess {
+        PaneProcessInfoProcess {
+            pid,
+            name: name.to_string(),
+            argv0: None,
+            argv: argv.map(|argv| argv.iter().map(|arg| (*arg).to_string()).collect()),
+            cmdline: None,
+            cwd: None,
+        }
+    }
+
+    fn pane_at_prompt(shell: &str) -> PaneProcessInfo {
+        PaneProcessInfo {
+            pane_id: "w1:p1".to_string(),
+            shell_pid: Some(42),
+            foreground_process_group_id: Some(42),
+            tty: None,
+            foreground_processes: vec![process(42, shell, Some(&["/usr/bin/bash"]))],
+        }
+    }
+
+    fn profile(dir: &str) -> AccountProfile {
+        AccountProfile {
+            name: "work".to_string(),
+            agent: crate::accounts::profile::AccountAgent::Claude,
+            config_dir: PathBuf::from(dir),
+            default: false,
+            origin: crate::accounts::profile::ProfileOrigin::Store,
+        }
+    }
+
+    fn healthy() -> ProfileInspection {
+        ProfileInspection {
+            dir_exists: true,
+            logged_in: true,
+            credentials_mode_ok: Some(true),
+            identity: None,
+            hook_installed: true,
+            broken_links: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_pane_idle_at_its_shell_prompt_is_identified() {
+        let shell = pane_shell_at_prompt(&pane_at_prompt("bash")).expect("a shell");
+        assert_eq!(
+            shell,
+            PaneShell {
+                pid: 42,
+                name: "bash".to_string(),
+                family: ShellFamily::Posix,
+            }
+        );
+    }
+
+    /// The name the OS reports can be anything; `argv[0]` is the other thing
+    /// the server accepts, so a pane whose comm is truncated still resolves.
+    #[test]
+    fn argv0_answers_when_the_process_name_does_not() {
+        let mut info = pane_at_prompt("bash");
+        info.foreground_processes = vec![process(42, "some-wrapper", Some(&["/usr/bin/zsh"]))];
+        let shell = pane_shell_at_prompt(&info).expect("a shell");
+        assert_eq!(shell.family, ShellFamily::Posix);
+        assert_eq!(shell.name, "/usr/bin/zsh");
+    }
+
+    /// The refusal that matters most: an assignment typed while something else
+    /// holds the foreground goes to *that* program, and the agent would then
+    /// start under whatever account the shell already had.
+    #[test]
+    fn a_busy_pane_is_refused_before_anything_is_typed() {
+        let mut info = pane_at_prompt("bash");
+        info.foreground_process_group_id = Some(99);
+        info.foreground_processes = vec![process(99, "claude", None)];
+        assert!(matches!(
+            pane_shell_at_prompt(&info),
+            Err(LaunchError::PaneNotAtPrompt { .. })
+        ));
+
+        // Foreground group is the shell's, but a child is still in it.
+        let mut info = pane_at_prompt("bash");
+        info.foreground_processes.push(process(43, "sleep", None));
+        assert!(matches!(
+            pane_shell_at_prompt(&info),
+            Err(LaunchError::PaneNotAtPrompt { .. })
+        ));
+    }
+
+    #[test]
+    fn a_pane_that_reports_no_shell_is_refused() {
+        for info in [
+            PaneProcessInfo {
+                shell_pid: None,
+                ..pane_at_prompt("bash")
+            },
+            PaneProcessInfo {
+                foreground_processes: Vec::new(),
+                ..pane_at_prompt("bash")
+            },
+        ] {
+            assert!(matches!(
+                pane_shell_at_prompt(&info),
+                Err(LaunchError::PaneNotAtPrompt { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_shell_herdr_cannot_write_an_assignment_for_is_refused_by_name() {
+        let mut info = pane_at_prompt("bash");
+        info.foreground_processes = vec![process(42, "weirdsh", Some(&["/usr/local/bin/weirdsh"]))];
+        assert_eq!(
+            pane_shell_at_prompt(&info),
+            Err(LaunchError::UnknownShell {
+                name: "weirdsh".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_plan_carries_the_exact_line_and_the_directory_to_verify() {
+        let profile = profile("/p/work");
+        let shell = pane_shell_at_prompt(&pane_at_prompt("bash")).expect("a shell");
+        let plan = plan_launch(
+            &profile,
+            &healthy(),
+            "w1:p1",
+            "a1",
+            &["--resume".to_string(), "abc".to_string()],
+            shell,
+        )
+        .expect("a plan");
+        assert_eq!(plan.line, " export CLAUDE_CONFIG_DIR='/p/work'");
+        assert_eq!(plan.expected_config_dir, "/p/work");
+        assert_eq!(plan.kind, "claude");
+        assert_eq!(plan.args, vec!["--resume".to_string(), "abc".to_string()]);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    /// A directory that is not there would make Claude create an empty,
+    /// logged-out one and quietly use it.
+    #[test]
+    fn a_missing_profile_directory_is_refused() {
+        let profile = profile("/p/work");
+        let shell = pane_shell_at_prompt(&pane_at_prompt("bash")).expect("a shell");
+        let inspection = ProfileInspection {
+            dir_exists: false,
+            ..healthy()
+        };
+        assert_eq!(
+            plan_launch(&profile, &inspection, "w1:p1", "a1", &[], shell),
+            Err(LaunchError::ProfileDirectoryMissing {
+                name: "work".to_string(),
+                dir: PathBuf::from("/p/work"),
+            })
+        );
+    }
+
+    /// Missing hook and missing credentials are warnings: the launch is still
+    /// correct, the user just loses switching or has to log in.
+    #[test]
+    fn a_profile_without_a_hook_or_credentials_still_launches_with_warnings() {
+        let profile = profile("/p/work");
+        let shell = pane_shell_at_prompt(&pane_at_prompt("bash")).expect("a shell");
+        let inspection = ProfileInspection {
+            hook_installed: false,
+            logged_in: false,
+            ..healthy()
+        };
+        let plan = plan_launch(&profile, &inspection, "w1:p1", "a1", &[], shell).expect("a plan");
+        assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
+        assert!(
+            plan.warnings[0].contains("session hook"),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.warnings[1].contains("account login"),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    /// PR 1 refused `!` for csh and tcsh because history expansion runs before
+    /// quoting, so the assignment would silently never happen. A launch must
+    /// degrade to a refusal, never to a launch under the ambient account.
+    #[test]
+    fn a_csh_pane_refuses_a_directory_it_cannot_quote_rather_than_launching() {
+        let profile = profile("/p/work!1");
+        let mut info = pane_at_prompt("tcsh");
+        info.foreground_processes = vec![process(42, "tcsh", Some(&["/usr/bin/tcsh"]))];
+        let shell = pane_shell_at_prompt(&info).expect("a shell");
+        assert!(matches!(
+            plan_launch(&profile, &healthy(), "w1:p1", "a1", &[], shell),
+            Err(LaunchError::UnquotableValue {
+                family: ShellFamily::Csh,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn errors_explain_what_to_do() {
         let unknown = LaunchError::UnknownShell {
@@ -589,5 +966,21 @@ mod tests {
         }
         .to_string()
         .contains("cmd"));
+
+        let busy = LaunchError::PaneNotAtPrompt {
+            pane_id: "w1:p1".to_string(),
+            detail: "another program is running in the pane".to_string(),
+        }
+        .to_string();
+        assert!(busy.contains("w1:p1"), "{busy}");
+        assert!(busy.contains("nothing was typed"), "{busy}");
+
+        let missing = LaunchError::ProfileDirectoryMissing {
+            name: "work".to_string(),
+            dir: PathBuf::from("/p/work"),
+        }
+        .to_string();
+        assert!(missing.contains("/p/work"), "{missing}");
+        assert!(missing.contains("herdr account add work"), "{missing}");
     }
 }

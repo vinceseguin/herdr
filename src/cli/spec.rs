@@ -553,6 +553,9 @@ fn agent_command() -> Command {
                     option("timeout", "MS")
                         .help("Wait for interactive readiness (default: 30000; max: 300000)"),
                 )
+                .arg(option("account", "NAME").help(
+                    "Claude account profile to run under, or none to opt out (claude only)",
+                ))
                 .arg(
                     Arg::new("agent_args")
                         .value_name("AGENT_ARG")
@@ -560,7 +563,7 @@ fn agent_command() -> Command {
                         .last(true),
                 )
                 .after_help(
-                    "The pane must be at its interactive shell prompt. Success means the expected agent was detected in the same terminal and is ready for input.\n\nnext: herdr agent prompt <TARGET> <TEXT> --wait",
+                    "The pane must be at its interactive shell prompt. Success means the expected agent was detected in the same terminal and is ready for input.\n\n--account applies one of the profiles from `herdr account list` by exporting CLAUDE_CONFIG_DIR in the pane's shell before the agent is started; without it the default profile is used when one is configured. The response adds account and account_state, and account_state is only ok when the launched process's own environment was read and names that profile; a launch that ended up somewhere else reports mismatch and exits 1. --account none starts the agent exactly as a stock herdr would, so a pane whose shell already exports CLAUDE_CONFIG_DIR keeps using it and no account is claimed.\n\nnext: herdr agent prompt <TARGET> <TEXT> --wait",
                 ),
         )
         .subcommand(

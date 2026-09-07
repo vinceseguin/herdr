@@ -670,3 +670,315 @@ fn account_remove_refuses_to_delete_the_ambient_directory() {
     assert!(ambient.is_dir());
     assert_eq!(rows(&lab.herdr(&["account", "list", "--json"])).len(), 2);
 }
+
+// ---------------------------------------------------------------------------
+// PR 4 — `herdr agent start --account`
+//
+// The launch is a two-step: the client types `export CLAUDE_CONFIG_DIR=…` into
+// the pane's shell, then runs the stock `agent.start`. These tests assert the
+// end of that chain — what the *launched process* actually got — rather than
+// what herdr says it sent, because "reported ok without evidence" is the one
+// failure mode that would silently bill the wrong Claude account.
+// ---------------------------------------------------------------------------
+
+fn json_of(output: &std::process::Output) -> serde_json::Value {
+    serde_json::from_str(&stdout_of(output)).unwrap_or_else(|err| {
+        panic!(
+            "expected JSON: {err}\nstdout: {}\nstderr: {}",
+            stdout_of(output),
+            stderr_of(output)
+        )
+    })
+}
+
+/// What the fake `claude` recorded about its own launch.
+fn last_launch(lab: &Lab, profile: &str) -> serde_json::Value {
+    let path = lab.profile_dir(profile).join("last-launch.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("no last-launch.json at {path:?}: {err}"));
+    serde_json::from_str(&text).expect("last-launch.json is JSON")
+}
+
+fn start_agent(lab: &Lab, name: &str, extra: &[&str]) -> std::process::Output {
+    let pane = lab.pane_id();
+    let mut args = vec!["agent", "start", name, "--kind", "claude", "--pane"];
+    args.push(&pane);
+    args.extend_from_slice(extra);
+    lab.herdr(&args)
+}
+
+#[test]
+fn agent_start_with_account_exports_the_profile_dir() {
+    let mut lab = Lab::new("start-account");
+    assert!(lab.up().status.success());
+
+    let output = start_agent(&lab, "a1", &["--account", SECOND_PROFILE]);
+    assert!(
+        output.status.success(),
+        "agent start failed: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+
+    let response = json_of(&output);
+    assert_eq!(response["result"]["account"], SECOND_PROFILE);
+    assert_eq!(
+        response["result"]["account_state"], "ok",
+        "on Linux the launched process's environment is readable, so the state \
+         must be evidence-backed: {response:#?}"
+    );
+    assert_eq!(response["result"]["agent"]["name"], "a1");
+
+    // The launched process itself, not herdr's account of it.
+    let launch = last_launch(&lab, SECOND_PROFILE);
+    assert_eq!(
+        launch["config_dir"].as_str(),
+        lab.profile_dir(SECOND_PROFILE).to_str()
+    );
+    assert!(
+        !lab.profile_dir(DEFAULT_PROFILE)
+            .join("last-launch.json")
+            .exists(),
+        "the default profile must not have been used"
+    );
+
+    // And the token every other surface reads.
+    let agent = json_of(&lab.herdr(&["agent", "get", "a1"]));
+    assert_eq!(
+        agent["result"]["agent"]["tokens"]["account"],
+        SECOND_PROFILE
+    );
+    assert_eq!(agent["result"]["agent"]["tokens"]["account_state"], "ok");
+    assert!(
+        agent["result"]["agent"]["agent_session"]["value"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "the stub reported its session id like the real hook: {agent:#?}"
+    );
+}
+
+#[test]
+fn agent_start_uses_the_default_profile() {
+    let mut lab = Lab::new("start-default");
+    assert!(lab.up().status.success());
+
+    let output = start_agent(&lab, "a1", &[]);
+    assert!(
+        output.status.success(),
+        "agent start failed: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let response = json_of(&output);
+    assert_eq!(response["result"]["account"], DEFAULT_PROFILE);
+    assert_eq!(response["result"]["account_state"], "ok");
+    assert_eq!(
+        last_launch(&lab, DEFAULT_PROFILE)["config_dir"].as_str(),
+        lab.profile_dir(DEFAULT_PROFILE).to_str()
+    );
+}
+
+#[test]
+fn agent_start_account_none_is_the_stock_launch() {
+    let mut lab = Lab::new("start-none");
+    assert!(lab.up().status.success());
+
+    let output = start_agent(&lab, "a1", &["--account", "none"]);
+    assert!(
+        output.status.success(),
+        "agent start failed: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let response = json_of(&output);
+    assert!(
+        response["result"]["account"].is_null(),
+        "--account none must add no keys: {response:#?}"
+    );
+    assert!(
+        response["result"]["account_state"].is_null(),
+        "{response:#?}"
+    );
+
+    for profile in [DEFAULT_PROFILE, SECOND_PROFILE] {
+        assert!(
+            !lab.profile_dir(profile).join("last-launch.json").exists(),
+            "{profile} must not have been launched into"
+        );
+    }
+    // The lab pins the ambient directory inside its own root, so a launch that
+    // applied no profile lands there and never near a real ~/.claude.
+    assert!(
+        lab.ambient_dir().join("last-launch.json").is_file(),
+        "the stock launch inherits the pane's own CLAUDE_CONFIG_DIR"
+    );
+
+    let agent = json_of(&lab.herdr(&["agent", "get", "a1"]));
+    assert!(
+        agent["result"]["agent"]["tokens"]["account"].is_null(),
+        "no profile was applied, so no account may be claimed: {agent:#?}"
+    );
+}
+
+#[test]
+fn agent_start_refuses_an_unknown_account_without_touching_the_pane() {
+    let mut lab = Lab::new("start-unknown");
+    assert!(lab.up().status.success());
+
+    let output = start_agent(&lab, "a1", &["--account", "nosuch"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("unknown account profile"),
+        "{}",
+        stderr_of(&output)
+    );
+
+    let pane = lab.pane_id();
+    let screen = stdout_of(&lab.herdr(&["pane", "read", &pane, "--source", "recent"]));
+    assert!(
+        !screen.contains("CLAUDE_CONFIG_DIR"),
+        "nothing may be typed for a profile that does not exist: {screen}"
+    );
+}
+
+/// A pane with something else in the foreground must be refused *before* a
+/// byte is typed: an `export` line sent there would land in that program, and
+/// the agent would then start under whatever account the shell already had.
+#[test]
+fn agent_start_refuses_a_busy_pane_before_typing_anything() {
+    let mut lab = Lab::new("start-busy");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    let busy = lab.herdr(&["pane", "send-text", &pane, "sleep 30\r"]);
+    assert!(busy.status.success(), "{}", stderr_of(&busy));
+
+    // Wait for `sleep` to actually take the foreground.
+    let mut taken = false;
+    for _ in 0..40 {
+        let info = json_of(&lab.herdr(&["pane", "process-info", "--pane", &pane]));
+        let group = info["result"]["process_info"]["foreground_process_group_id"].as_u64();
+        let shell = info["result"]["process_info"]["shell_pid"].as_u64();
+        if group.is_some() && group != shell {
+            taken = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(taken, "the pane never became busy");
+
+    let output = start_agent(&lab, "a1", &["--account", SECOND_PROFILE]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("not at its shell prompt"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("nothing was typed"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        !lab.profile_dir(SECOND_PROFILE)
+            .join("last-launch.json")
+            .exists(),
+        "nothing may have been launched"
+    );
+}
+
+/// The contract that makes the whole epic trustworthy: when the environment
+/// line does *not* reach the launched agent, herdr says so and fails, instead
+/// of reporting the requested account and billing another one.
+///
+/// The pane is put at a `read` builtin, which leaves the shell itself in the
+/// foreground — so the pane still looks idle to every gate herdr has — but
+/// makes it swallow the next line typed at it. `claude` then starts without
+/// the profile, under whatever directory the pane already had.
+#[test]
+fn agent_start_reports_a_mismatch_when_the_shell_swallows_the_environment_line() {
+    let mut lab = Lab::new("swallow");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    // `printf` and `read` are both builtins, so nothing but the shell is ever
+    // in the pane's foreground; the marker tells us `read` is now running.
+    // The markers are assembled by `printf` so the shell's echo of the typed
+    // line cannot be mistaken for its output: the screen only ever shows
+    // `SWALLOWREADY` or `ATEIT=` once the command has actually run.
+    let sent = lab.herdr(&[
+        "pane",
+        "send-text",
+        &pane,
+        "printf 'SWALLOW%s\\n' READY; read swallowed; printf 'ATE%s=%s\\n' IT \"$swallowed\"\r",
+    ]);
+    assert!(sent.status.success(), "{}", stderr_of(&sent));
+
+    let mut ready = false;
+    for _ in 0..80 {
+        let screen = stdout_of(&lab.herdr(&["pane", "read", &pane, "--source", "recent"]));
+        if screen.contains("SWALLOWREADY") {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(ready, "the pane never reached the read builtin");
+
+    let output = start_agent(&lab, "a1", &["--account", SECOND_PROFILE]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a launch that missed its profile must fail: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let response = json_of(&output);
+    assert_eq!(
+        response["result"]["account_state"], "mismatch",
+        "{response:#?}"
+    );
+    assert_eq!(response["result"]["account"], SECOND_PROFILE);
+    assert!(
+        stderr_of(&output).contains("is not running under account"),
+        "{}",
+        stderr_of(&output)
+    );
+
+    // The shell really did eat the line, and the agent really did run
+    // somewhere else — the lab's ambient directory, not the profile.
+    let screen = stdout_of(&lab.herdr(&["pane", "read", &pane, "--source", "recent"]));
+    assert!(
+        screen.contains("ATEIT="),
+        "the read builtin should have consumed the export line: {screen}"
+    );
+    assert!(
+        !lab.profile_dir(SECOND_PROFILE)
+            .join("last-launch.json")
+            .exists(),
+        "the profile must not have been launched into"
+    );
+    assert!(
+        lab.ambient_dir().join("last-launch.json").is_file(),
+        "the agent ran under the pane's ambient directory"
+    );
+
+    // And the mismatch is recorded where every other surface reads it.
+    let agent = json_of(&lab.herdr(&["agent", "get", "a1"]));
+    assert_eq!(
+        agent["result"]["agent"]["tokens"]["account_state"], "mismatch",
+        "{agent:#?}"
+    );
+}
