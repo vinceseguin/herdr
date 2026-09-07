@@ -1372,3 +1372,445 @@ fn account_login_refuses_a_profile_it_cannot_address() {
     let usage = lab.herdr(&["account", "login"]);
     assert_eq!(usage.status.code(), Some(2), "{}", stderr_of(&usage));
 }
+
+// ---------------------------------------------------------------------------
+// PR 5 — `herdr agent switch-account`.
+//
+// The dangerous command of the epic: it stops somebody's Claude and starts it
+// again. Every test below asserts on two things the user would care about if
+// this went wrong — the conversation (the session id must be the *same* one
+// before and after) and the account (the relaunched process's own environment
+// must name the new profile) — plus, for every refusal, that nothing at all
+// was typed into the pane.
+// ---------------------------------------------------------------------------
+
+/// A second pane in the lab's workspace, at its own shell prompt.
+fn split_pane(lab: &Lab) -> String {
+    let pane = lab.pane_id();
+    let output = lab.herdr(&["pane", "split", &pane, "--direction", "right", "--no-focus"]);
+    assert!(
+        output.status.success(),
+        "pane split failed: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    json_of(&output)["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("pane split reported no pane id: {}", stdout_of(&output)))
+        .to_string()
+}
+
+fn agent_of(lab: &Lab, target: &str) -> serde_json::Value {
+    json_of(&lab.herdr(&["agent", "get", target]))["result"]["agent"].clone()
+}
+
+fn session_id_of(lab: &Lab, target: &str) -> String {
+    agent_of(lab, target)["agent_session"]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("agent {target} has no session id"))
+        .to_string()
+}
+
+/// Wait until the pane's own shell holds the foreground again, so a line typed
+/// into it has finished running before the next one is sent.
+fn wait_for_prompt(lab: &Lab, pane: &str) {
+    for _ in 0..80 {
+        let info = json_of(&lab.herdr(&["pane", "process-info", "--pane", pane]))["result"]
+            ["process_info"]
+            .clone();
+        let shell = info["shell_pid"].as_u64();
+        let foreground = info["foreground_processes"]
+            .as_array()
+            .map(|processes| processes.len())
+            .unwrap_or(0);
+        if shell.is_some()
+            && info["foreground_process_group_id"].as_u64() == shell
+            && foreground == 1
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("pane {pane} never came back to its shell prompt");
+}
+
+/// Start an agent in `pane`, after optionally exporting knobs for the stub.
+///
+/// Each export is followed by a marker the shell only prints once it has run
+/// the line, because polling the process table alone races: the pane still
+/// looks idle in the moment between `pane.send_text` returning and the pty
+/// delivering the line.
+fn start_agent_in(lab: &Lab, name: &str, pane: &str, exports: &[&str], extra: &[&str]) {
+    for (index, export) in exports.iter().enumerate() {
+        let marker = format!("EXPORT{index}");
+        let line = format!("export {export}; printf 'EXPORT%s\\n' {index}\r");
+        let sent = lab.herdr(&["pane", "send-text", pane, &line]);
+        assert!(sent.status.success(), "{}", stderr_of(&sent));
+        let mut ran = false;
+        for _ in 0..80 {
+            if screen(lab, pane).contains(&marker) {
+                ran = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(ran, "the pane never ran `export {export}`");
+        wait_for_prompt(lab, pane);
+    }
+    let mut args = vec!["agent", "start", name, "--kind", "claude", "--pane", pane];
+    args.extend_from_slice(extra);
+    let output = lab.herdr(&args);
+    assert!(
+        output.status.success(),
+        "agent start {name} failed: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+}
+
+/// What the pane's screen shows, for the assertions about what was typed.
+fn screen(lab: &Lab, pane: &str) -> String {
+    stdout_of(&lab.herdr(&["pane", "read", pane, "--source", "recent"]))
+}
+
+/// The whole point of the command: the conversation survives.
+#[test]
+fn switch_account_resumes_the_same_session_under_the_new_profile() {
+    let mut lab = Lab::new("switch-ok");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    start_agent_in(&lab, "a1", &pane, &[], &["--account", DEFAULT_PROFILE]);
+    let before = session_id_of(&lab, "a1");
+    assert_eq!(agent_of(&lab, "a1")["tokens"]["account"], DEFAULT_PROFILE);
+
+    let output = lab.herdr(&[
+        "agent",
+        "switch-account",
+        "a1",
+        SECOND_PROFILE,
+        "--yes",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "switch-account failed: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let result = json_of(&output);
+    assert_eq!(result["name"], "a1");
+    assert_eq!(result["from"], DEFAULT_PROFILE);
+    assert_eq!(result["to"], SECOND_PROFILE);
+    assert_eq!(
+        result["session_id"].as_str(),
+        Some(before.as_str()),
+        "the switch must keep the conversation: {result:#?}"
+    );
+    assert_eq!(
+        result["account_state"], "ok",
+        "on Linux the relaunched process's environment is readable, so the \
+         account must be evidence-backed: {result:#?}"
+    );
+
+    // The agent herdr reports, not the report herdr wrote.
+    let after = agent_of(&lab, "a1");
+    assert_eq!(
+        after["agent_session"]["value"].as_str(),
+        Some(before.as_str()),
+        "the same session id before and after: {after:#?}"
+    );
+    assert_eq!(after["tokens"]["account"], SECOND_PROFILE);
+    assert_eq!(after["tokens"]["account_state"], "ok");
+
+    // And the launched process itself: it was resumed, into the new profile.
+    let launch = last_launch(&lab, SECOND_PROFILE);
+    assert_eq!(
+        launch["config_dir"].as_str(),
+        lab.profile_dir(SECOND_PROFILE).to_str()
+    );
+    assert_eq!(launch["session_start_source"], "resume");
+    assert_eq!(launch["session_id"].as_str(), Some(before.as_str()));
+    let argv: Vec<String> = serde_json::from_value(launch["argv"].clone()).expect("argv");
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "--resume" && pair[1] == before),
+        "the relaunch must pass --resume <id>: {argv:?}"
+    );
+
+    let screen = screen(&lab, &pane);
+    assert!(screen.contains("/exit"), "{screen}");
+    assert!(
+        screen.contains(&format!("resumed {before}")),
+        "the stub must report the resume on screen: {screen}"
+    );
+}
+
+/// The refusal that protects a conversation herdr could not bring back.
+#[test]
+fn switch_account_refuses_an_agent_without_a_session_id() {
+    let mut lab = Lab::new("switch-nosess");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    start_agent_in(
+        &lab,
+        "a1",
+        &pane,
+        &["FAKE_CLAUDE_NO_SESSION=1"],
+        &["--account", DEFAULT_PROFILE],
+    );
+    assert!(
+        agent_of(&lab, "a1")["agent_session"].is_null(),
+        "the stub was told not to report a session"
+    );
+
+    let before = screen(&lab, &pane);
+    let output = lab.herdr(&[
+        "agent",
+        "switch-account",
+        "a1",
+        SECOND_PROFILE,
+        "--yes",
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a refusal that touched nothing must exit 2: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("no Claude session id"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("nothing was sent"),
+        "{}",
+        stderr_of(&output)
+    );
+
+    // Nothing typed, nothing launched, nothing claimed.
+    assert_eq!(
+        screen(&lab, &pane),
+        before,
+        "a refused switch must not touch the pane"
+    );
+    assert!(
+        !lab.profile_dir(SECOND_PROFILE)
+            .join("last-launch.json")
+            .exists(),
+        "the target profile must not have been launched into"
+    );
+    assert_eq!(agent_of(&lab, "a1")["tokens"]["account"], DEFAULT_PROFILE);
+}
+
+/// A Claude that may be mid-tool-call is never interrupted by default.
+#[test]
+fn switch_account_refuses_a_working_agent_without_interrupt() {
+    let mut lab = Lab::new("switch-working");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    start_agent_in(&lab, "a1", &pane, &[], &["--account", DEFAULT_PROFILE]);
+
+    // The stub sets the same braille-spinner OSC title a busy Claude sets, so
+    // this goes through herdr's own screen detection rather than a faked state
+    // report — `herdr:claude` is a reserved native state source and cannot
+    // report a state at all.
+    let prompted = lab.herdr(&["agent", "prompt", "a1", "/work"]);
+    assert!(prompted.status.success(), "{}", stderr_of(&prompted));
+    let mut working = false;
+    for _ in 0..60 {
+        if agent_of(&lab, "a1")["agent_status"] == "working" {
+            working = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(working, "the stub never looked working to herdr");
+
+    let before = screen(&lab, &pane);
+    let output = lab.herdr(&["agent", "switch-account", "a1", SECOND_PROFILE, "--yes"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("is working"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert_eq!(
+        screen(&lab, &pane),
+        before,
+        "a working agent must not be interrupted without --interrupt"
+    );
+}
+
+/// Automation has to say `--yes`; a pipe is not a person.
+#[test]
+fn switch_account_requires_yes_when_not_a_tty() {
+    let mut lab = Lab::new("switch-tty");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    start_agent_in(&lab, "a1", &pane, &[], &["--account", DEFAULT_PROFILE]);
+    let before = screen(&lab, &pane);
+
+    let output = lab.herdr(&["agent", "switch-account", "a1", SECOND_PROFILE]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("--yes"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert_eq!(screen(&lab, &pane), before, "nothing may be sent");
+}
+
+/// A Claude that will not leave is left alone: the command gives up, says what
+/// the pane holds, and kills nothing.
+#[test]
+fn switch_account_never_kills_an_agent_that_will_not_exit() {
+    let mut lab = Lab::new("switch-stuck");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    start_agent_in(
+        &lab,
+        "a1",
+        &pane,
+        &["FAKE_CLAUDE_BUSY=1"],
+        &["--account", DEFAULT_PROFILE],
+    );
+    let session = session_id_of(&lab, "a1");
+
+    let output = lab.herdr(&[
+        "agent",
+        "switch-account",
+        "a1",
+        SECOND_PROFILE,
+        "--yes",
+        "--timeout",
+        "2000",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the protocol had started, so this is a 1: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let message = stderr_of(&output);
+    assert!(message.contains("did not exit"), "{message}");
+    assert!(message.contains("nothing was killed"), "{message}");
+
+    // Still there, still the same conversation, still on the old account.
+    let after = agent_of(&lab, "a1");
+    assert_eq!(after["agent_session"]["value"].as_str(), Some(&*session));
+    assert_eq!(after["tokens"]["account"], DEFAULT_PROFILE);
+    assert!(
+        screen(&lab, &pane).contains("refusing to exit"),
+        "the stub is still running: {}",
+        screen(&lab, &pane)
+    );
+    assert!(
+        !lab.profile_dir(SECOND_PROFILE)
+            .join("last-launch.json")
+            .exists(),
+        "nothing may have been launched under the target profile"
+    );
+}
+
+/// Everything the switch does is addressed to one pane. A second agent, in a
+/// second pane, must not see a single keystroke of it.
+#[test]
+fn switch_account_leaves_another_pane_untouched() {
+    let mut lab = Lab::new("switch-other");
+    assert!(lab.up().status.success());
+
+    let first = lab.pane_id();
+    let second = split_pane(&lab);
+    start_agent_in(&lab, "a1", &first, &[], &["--account", DEFAULT_PROFILE]);
+    start_agent_in(&lab, "a2", &second, &[], &["--account", DEFAULT_PROFILE]);
+
+    let other_session = session_id_of(&lab, "a2");
+    let other_before = screen(&lab, &second);
+
+    let output = lab.herdr(&[
+        "agent",
+        "switch-account",
+        "a1",
+        SECOND_PROFILE,
+        "--yes",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "switch-account failed: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert_eq!(json_of(&output)["pane_id"].as_str(), Some(first.as_str()));
+
+    let other = agent_of(&lab, "a2");
+    assert_eq!(other["tokens"]["account"], DEFAULT_PROFILE);
+    assert_eq!(
+        other["agent_session"]["value"].as_str(),
+        Some(&*other_session)
+    );
+    assert_eq!(
+        screen(&lab, &second),
+        other_before,
+        "the other pane must not have been typed into"
+    );
+}
+
+/// The target profile is checked before the agent is asked to leave, so a
+/// broken target can never cost anybody a running Claude.
+#[test]
+fn switch_account_refuses_a_missing_target_profile_before_touching_the_pane() {
+    let mut lab = Lab::new("switch-gone");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    start_agent_in(&lab, "a1", &pane, &[], &["--account", DEFAULT_PROFILE]);
+    let before = screen(&lab, &pane);
+
+    std::fs::remove_dir_all(lab.profile_dir(SECOND_PROFILE)).expect("remove the target profile");
+    let output = lab.herdr(&["agent", "switch-account", "a1", SECOND_PROFILE, "--yes"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("does not exist"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert_eq!(screen(&lab, &pane), before);
+
+    // …and an account nobody configured is refused the same way.
+    let output = lab.herdr(&["agent", "switch-account", "a1", "nosuch", "--yes"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("unknown account profile"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert_eq!(screen(&lab, &pane), before);
+}

@@ -602,6 +602,34 @@ fn agent_command() -> Command {
                 ),
         )
         .subcommand(
+            Command::new("switch-account")
+                .about("Move a running Claude agent to another account profile")
+                .override_usage("herdr agent switch-account <TARGET> <ACCOUNT> [OPTIONS]")
+                .arg(required("target", "TARGET"))
+                .arg(required("account", "ACCOUNT"))
+                .arg(
+                    Arg::new("yes")
+                        .short('y')
+                        .long("yes")
+                        .action(ArgAction::SetTrue)
+                        .help("Answer the confirmation, for automation"),
+                )
+                .arg(
+                    flag("interrupt")
+                        .help("Allow moving an agent that is currently working, interrupting it"),
+                )
+                .arg(flag("force").help(
+                    "Switch even when the agent already claims the account, or the profile is logged out",
+                ))
+                .arg(option("timeout", "MS").help(
+                    "Budget for each waiting stage (default: 20000; max: 600000)",
+                ))
+                .arg(json_flag())
+                .after_help(
+                    "The agent is never killed. herdr reads its Claude session id, sends Escape if it is blocked, submits /exit, waits for the pane's own shell to come back, then starts Claude again under the new profile with --resume <id>. It refuses before touching the pane when the agent has no session id (its conversation could not be resumed), when it is working without --interrupt, when the target profile is missing or logged out, or when there is no terminal to confirm with and no --yes.\n\nExit codes: 0 the agent runs under the new profile with the same session; 2 refused before anything was sent, so the agent is untouched; 1 the protocol had started - the message says what the pane holds. On a timeout waiting for the exit, nothing further is sent and the agent keeps running with its conversation.\n\nnext: herdr agent get <TARGET>",
+                ),
+        )
+        .subcommand(
             Command::new("explain")
                 .about("Explain agent detection state")
                 .arg(Arg::new("target").value_name("TARGET"))

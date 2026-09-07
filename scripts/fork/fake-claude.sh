@@ -18,7 +18,13 @@
 #     `.claude.json`, so `herdr account status` has an identity to show;
 #   * with FAKE_CLAUDE_LIMIT=1 prints a usage-limit screen (from
 #     $FAKE_CLAUDE_LIMIT_FILE when set) instead of going idle;
-#   * shows a `❯ ` prompt and exits on `/exit`.
+#   * with FAKE_CLAUDE_BUSY=1 ignores `/exit` and never returns the pane to its
+#     shell, which is how `herdr agent switch-account` is proved to time out
+#     without killing anything;
+#   * shows a `❯ ` prompt and exits on `/exit`;
+#   * on the input `/work` sets the same braille-spinner OSC title a busy Claude
+#     sets, so herdr's own screen detection reports the agent as working — the
+#     state `herdr agent switch-account` must refuse without --interrupt.
 #
 # Safety: the stub writes into CLAUDE_CONFIG_DIR, so it never guesses one. With
 # the variable unset it runs with no directory at all (printing an empty
@@ -35,6 +41,9 @@
 #   HERDR_PANE_ID          set by herdr in the pane; no report without it
 #   FAKE_CLAUDE_LIMIT      1 to print the usage-limit screen
 #   FAKE_CLAUDE_LIMIT_FILE file to print instead of the built-in limit text
+#   FAKE_CLAUDE_BUSY       1 to refuse /exit and keep running
+#   FAKE_CLAUDE_NO_SESSION 1 to report no session id, like a profile whose
+#                          herdr hook is not installed
 
 set -u
 
@@ -168,8 +177,11 @@ if [ "$start_source" = "resume" ]; then
     printf 'resumed %s\n' "$session_id"
 fi
 
-# The same report the real hook makes from <CLAUDE_CONFIG_DIR>/hooks.
-if [ -n "${HERDR_PANE_ID:-}" ]; then
+# The same report the real hook makes from <CLAUDE_CONFIG_DIR>/hooks. A profile
+# without the hook installed reports nothing, which is what
+# FAKE_CLAUDE_NO_SESSION imitates: herdr then has no id to resume, and
+# `switch-account` must refuse rather than end the conversation.
+if [ -n "${HERDR_PANE_ID:-}" ] && [ "${FAKE_CLAUDE_NO_SESSION:-0}" != "1" ]; then
     "$herdr_bin" pane report-agent-session "$HERDR_PANE_ID" \
         --source herdr:claude --agent claude \
         --agent-session-id "$session_id" \
@@ -194,8 +206,22 @@ while :; do
     fi
     case "$line" in
         /exit | /quit)
+            # A Claude that will not leave: the switch protocol must give up
+            # after its timeout, say what the pane holds, and kill nothing.
+            if [ "${FAKE_CLAUDE_BUSY:-0}" = "1" ]; then
+                printf 'fake-claude: refusing to exit (FAKE_CLAUDE_BUSY=1)\n'
+                continue
+            fi
             printf 'fake-claude: exiting\n'
             exit 0
+            ;;
+        /work)
+            # The 2.1.228 busy spinner, as an OSC title: `osc_title_working` in
+            # src/detect/manifests/claude.toml matches a braille or half-circle
+            # glyph followed by a space, so herdr sees a working agent through
+            # its real detection path rather than a faked report.
+            printf '\033]0;⠋ Working…\007'
+            printf 'fake-claude: working\n'
             ;;
         "")
             ;;
