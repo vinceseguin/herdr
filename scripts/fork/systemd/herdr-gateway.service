@@ -1,0 +1,43 @@
+# Herdr Fleet gateway as a `systemd --user` service.
+#
+# Install (E8 will do this for you):
+#   mkdir -p ~/.config/systemd/user
+#   cp scripts/fork/systemd/herdr-gateway.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now herdr-gateway
+#   systemctl --user status herdr-gateway
+#   journalctl --user -u herdr-gateway -f
+#
+# Everything the gateway needs is in `config.toml`'s `[gateway]` and `[fleet]`
+# sections, so this unit sets no `Environment=` of its own. Add
+# `Environment=HERDR_LOG=herdr=info,gateway=debug` for a verbose log.
+#
+# `linger` matters: without `loginctl enable-linger $USER` a user service stops
+# when your last login session ends, so the gateway would only run while you are
+# logged in.
+
+[Unit]
+Description=Herdr Fleet gateway (HTTP + WebSocket over the fleet)
+Documentation=https://github.com/vinceseguin/herdr/blob/master/docs/fork/gateway.md
+# Deliberately no `After=network-online.target`: the systemd *user* manager has
+# no such target, so ordering against it would be a no-op that only logs. The
+# default bind is loopback, and the fleet connector retries a host with backoff,
+# so the gateway does not need to wait for the network anyway.
+
+[Service]
+Type=simple
+# `%h` is the user's home directory, so this unit is machine-independent.
+ExecStart=%h/.local/bin/herdr gateway
+Restart=on-failure
+RestartSec=5
+# The gateway drains for at most 5 s on SIGTERM before it returns; give it a
+# little more than that before systemd escalates to SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+# `herdr gateway` logs to stderr, which the journal already captures.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=herdr-gateway
+
+[Install]
+WantedBy=default.target
