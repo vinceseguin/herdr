@@ -59,6 +59,61 @@ impl Default for AccountsStore {
     }
 }
 
+impl AccountsStore {
+    /// Record a new profile.
+    ///
+    /// Refuses a name or a directory the store already uses; the caller has
+    /// already checked the merged view, and this is the last guard before two
+    /// entries could point at one credentials directory.
+    pub fn add(&mut self, entry: AccountProfileConfig) -> Result<(), String> {
+        crate::accounts::config::validate_name(&entry.name)?;
+        if self.profiles.iter().any(|stored| stored.name == entry.name) {
+            return Err(format!(
+                "account profile {:?} is already in the account store",
+                entry.name
+            ));
+        }
+        let key = crate::accounts::config::dir_key(std::path::Path::new(&entry.config_dir));
+        if let Some(clash) = self.profiles.iter().find(|stored| {
+            crate::accounts::config::dir_key(std::path::Path::new(&stored.config_dir)) == key
+        }) {
+            return Err(format!(
+                "account profile {:?} already uses {}; two profiles must not share a directory",
+                clash.name,
+                key.display()
+            ));
+        }
+        self.profiles.push(entry);
+        Ok(())
+    }
+
+    /// Drop a profile, clearing the stored default if it named that profile.
+    pub fn remove(&mut self, name: &str) -> Result<AccountProfileConfig, String> {
+        let Some(index) = self.profiles.iter().position(|stored| stored.name == name) else {
+            return Err(format!(
+                "account profile {name:?} is not in the account store"
+            ));
+        };
+        let removed = self.profiles.remove(index);
+        if self.default.as_deref() == Some(name) {
+            self.default = None;
+        }
+        Ok(removed)
+    }
+
+    /// Name the default profile.
+    ///
+    /// The name may belong to a `[[accounts]]` entry: the store's `default`
+    /// key is how `herdr account default` chooses between *any* two configured
+    /// profiles without rewriting `config.toml`. The caller checks that the
+    /// name resolves; `resolve` reports it as a diagnostic if it later stops.
+    pub fn set_default(&mut self, name: &str) -> Result<(), String> {
+        crate::accounts::config::validate_name(name)?;
+        self.default = Some(name.to_string());
+        Ok(())
+    }
+}
+
 /// Where the store lives for the current config directory.
 pub fn store_path() -> PathBuf {
     crate::config::config_dir()
@@ -145,15 +200,13 @@ fn load_from(path: &std::path::Path) -> (AccountsStore, Vec<String>) {
 
 /// Write the store atomically, creating `<config>/accounts` if needed.
 ///
-/// No production caller until `herdr account add|remove|default` lands in
-/// PR 2; it ships here with the schema it writes so the two halves of the file
-/// format cannot drift apart. Its tests do exercise it.
-#[allow(dead_code)] // Production caller arrives with `herdr account add` (PR 2).
+/// Callers must have loaded the store without diagnostics first: `load`
+/// degrades an unreadable file to an empty store, and saving that would delete
+/// profiles herdr merely failed to parse.
 pub fn save(store: &AccountsStore) -> io::Result<()> {
     save_to(&store_path(), store)
 }
 
-#[allow(dead_code)] // Only reachable from `save`, which PR 2 starts calling.
 fn save_to(path: &std::path::Path, store: &AccountsStore) -> io::Result<()> {
     let rendered = render(store).map_err(io::Error::other)?;
     let Some(parent) = path.parent() else {
@@ -171,9 +224,28 @@ fn save_to(path: &std::path::Path, store: &AccountsStore) -> io::Result<()> {
 
     // Same directory, so the rename is atomic on every filesystem herdr runs on.
     let temporary = path.with_extension(format!("toml.{}.tmp", std::process::id()));
-    std::fs::write(&temporary, rendered.as_bytes())?;
+    {
+        use std::io::Write as _;
+
+        // Opened at the final mode rather than written-then-narrowed: the
+        // store lists every account's credentials directory.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(STORE_FILE_MODE);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(rendered.as_bytes())?;
+        // The rename below publishes this file; a crash must not leave the
+        // store renamed but empty.
+        file.sync_all()?;
+    }
     #[cfg(unix)]
     {
+        // `mode` applies at creation only, so a leftover temporary from a
+        // crashed run is narrowed here.
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(STORE_FILE_MODE))?;
     }
@@ -253,6 +325,86 @@ mod tests {
             "{diagnostics:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_refuses_a_duplicate_name_or_a_shared_directory() {
+        let mut store = AccountsStore::default();
+        store
+            .add(AccountProfileConfig {
+                name: "work".to_string(),
+                agent: "claude".to_string(),
+                config_dir: "/home/u/.claude-work".to_string(),
+                default: false,
+            })
+            .expect("first add");
+
+        let duplicate_name = store
+            .add(AccountProfileConfig {
+                name: "work".to_string(),
+                config_dir: "/home/u/.claude-other".to_string(),
+                ..AccountProfileConfig::default()
+            })
+            .expect_err("duplicate name");
+        assert!(duplicate_name.contains("already in the account store"));
+
+        // Spelled differently, same credentials directory.
+        let duplicate_dir = store
+            .add(AccountProfileConfig {
+                name: "other".to_string(),
+                config_dir: "/home/u/./.claude-work/".to_string(),
+                ..AccountProfileConfig::default()
+            })
+            .expect_err("duplicate directory");
+        assert!(
+            duplicate_dir.contains("must not share a directory"),
+            "{duplicate_dir}"
+        );
+
+        let bad_name = store
+            .add(AccountProfileConfig {
+                name: "../escape".to_string(),
+                config_dir: "/home/u/.claude-escape".to_string(),
+                ..AccountProfileConfig::default()
+            })
+            .expect_err("bad name");
+        assert!(!bad_name.is_empty());
+
+        assert_eq!(store.profiles.len(), 1);
+    }
+
+    #[test]
+    fn remove_drops_the_entry_and_clears_a_default_that_named_it() {
+        let mut store = AccountsStore::default();
+        store
+            .add(AccountProfileConfig {
+                name: "work".to_string(),
+                config_dir: "/home/u/.claude-work".to_string(),
+                ..AccountProfileConfig::default()
+            })
+            .expect("add");
+        store.set_default("work").expect("set default");
+
+        assert!(store.remove("nope").is_err());
+        let removed = store.remove("work").expect("remove");
+        assert_eq!(removed.name, "work");
+        assert!(store.profiles.is_empty());
+        assert_eq!(
+            store.default, None,
+            "a default naming a removed profile must not survive"
+        );
+    }
+
+    #[test]
+    fn set_default_accepts_a_config_profile_but_never_an_impossible_name() {
+        let mut store = AccountsStore::default();
+        // The name may belong to a [[accounts]] entry: that is how `herdr
+        // account default` chooses one without rewriting config.toml.
+        store.set_default("perso").expect("config-origin default");
+        assert_eq!(store.default.as_deref(), Some("perso"));
+        assert!(store.set_default("..").is_err());
+        assert!(store.set_default("a b").is_err());
+        assert_eq!(store.default.as_deref(), Some("perso"));
     }
 
     #[test]

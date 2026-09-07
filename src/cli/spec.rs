@@ -199,6 +199,72 @@ fn account_command() -> Command {
                 )
                 .arg(json_flag().help("Print the profiles as JSON")),
         )
+        .subcommand(
+            Command::new("add")
+                .about(
+                    "Create a profile directory seeded from an existing one and record it. \
+                     Transcripts are shared by symlink and settings are copied with the \
+                     identity keys removed; credentials are never copied, so the new profile \
+                     is logged out until `herdr account login`.",
+                )
+                .arg(Arg::new("name").required(true).help("Profile name"))
+                .arg(
+                    Arg::new("config-dir")
+                        .long("config-dir")
+                        .value_name("PATH")
+                        .help("Directory for the new profile (default ~/.claude-<name>)"),
+                )
+                .arg(
+                    Arg::new("from")
+                        .long("from")
+                        .value_name("PROFILE")
+                        .help("Profile to seed from (default: the default profile)"),
+                )
+                .arg(
+                    Arg::new("dry-run")
+                        .long("dry-run")
+                        .action(ArgAction::SetTrue)
+                        .help("Print what would be seeded and write nothing"),
+                )
+                .arg(
+                    Arg::new("force")
+                        .long("force")
+                        .action(ArgAction::SetTrue)
+                        .help("Seed into a directory that is not empty"),
+                )
+                .arg(
+                    Arg::new("print-config")
+                        .long("print-config")
+                        .action(ArgAction::SetTrue)
+                        .help("Print the [[accounts]] block instead of writing the account store"),
+                )
+                .arg(
+                    Arg::new("no-hook")
+                        .long("no-hook")
+                        .action(ArgAction::SetTrue)
+                        .help("Skip installing the herdr session-start hook into the profile"),
+                )
+                .arg(json_flag().help("Print the result as JSON")),
+        )
+        .subcommand(
+            Command::new("remove")
+                .about(
+                    "Remove a profile from the account store. Profiles declared as \
+                     [[accounts]] in config.toml must be removed there instead.",
+                )
+                .arg(Arg::new("name").required(true).help("Profile name"))
+                .arg(
+                    Arg::new("delete-dir")
+                        .long("delete-dir")
+                        .action(ArgAction::SetTrue)
+                        .help("Also delete the profile directory and its credentials"),
+                ),
+        )
+        .subcommand(
+            Command::new("default")
+                .about("Choose the profile used when no --account is given")
+                .arg(Arg::new("name").required(true).help("Profile name")),
+        )
 }
 
 fn config_command() -> Command {
