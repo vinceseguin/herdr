@@ -345,7 +345,7 @@ implementation starts only after E3 is ✅.
 | # | Title | Group | Depends on | Status |
 | --- | --- | --- | --- | --- |
 | 1 | feat(accounts): account profiles config, pure resolution, herdr account list and the accounts lab | A · Foundations | — | ✅ |
-| 2 | feat(accounts): herdr account add, remove and default with seeded profile directories | A · Foundations | 1 | ⬜ |
+| 2 | feat(accounts): herdr account add, remove and default with seeded profile directories | A · Foundations | 1 | ✅ |
 | 3 | feat(accounts): herdr account status and login | B · CLI | 2 | ⬜ |
 | 4 | feat(accounts): launch claude under a profile with herdr agent start --account | B · CLI | 1 | ⬜ |
 | 5 | feat(accounts): switch a running claude agent to another profile keeping its session | B · CLI | 4 | ⬜ |
@@ -737,20 +737,121 @@ exists without `oauthAccount`, `work/.credentials.json` does **not** exist,
 `SessionStart` hook (the lab exports `HERDR_BIN` so the child process is the
 test binary).
 
-**Real-server validation.** Lab up; `herdr --session accounts-lab account
-add third --dry-run` prints the plan; `… account add third` then `ls -la
-$HERDR_ACCOUNTS_LAB_ROOT/profiles/third` shows the links/copies, no
-`.credentials.json`, `hooks/herdr-agent-state.sh` present;
+**Real-server validation.** Lab up; every `account add` passes
+`--config-dir "$HERDR_ACCOUNTS_LAB_ROOT/profiles/<name>"` — the default
+`config_dir` is `~/.claude-<name>` in the *developer's* home and the lab does
+not override `HOME`. `herdr --session accounts-lab account add third
+--config-dir …/profiles/third --dry-run` prints the plan and writes nothing;
+the same without `--dry-run` then `ls -la …/profiles/third` shows the
+links/copies, no `.credentials.json`, `hooks/herdr-agent-state.sh` present;
 `grep SessionStart …/third/settings.json`; `account list --json` shows
 `third` with `origin: "store"`, `logged_in: false`; `account default third`
 then `list` shows the new default; `account remove third --delete-dir`
 cleans up; `account remove perso` (config origin) exits 1 with the message.
-Verify `stat -c %a` of the new dir is `700`.
+Verify `stat -c %a` of the new dir is `700`, that the source profile's
+`.credentials.json` mtime is unchanged, and that the three crafted-source
+refusals fire (a `--config-dir` spelled through `..` or a symlink, a
+`.claude.json` symlinked at `.credentials.json`, a `projects` link pointing
+at a config directory).
 
 **Downstream.** `hook_installed` from PR 1's `inspect(profile,
 InspectOptions::health())` is what PR 4's preflight warns on ("session ids will not be reported; switching will not
 work") — it must never block a launch. The seed list is documentation
 source for PR 11.
+
+**As built (PR 2, merged).** Everything the *As built (PR 1)* corrections say
+still holds; the additions below are what PRs 3, 4 and 11 must code against.
+
+- **`SeedPlan` carries named entries, not tuples.** `links` and `copies` are
+  `Vec<SeedEntry { entry: String, source: PathBuf, target: PathBuf }>` so the
+  `--dry-run` printout and the `--json` output can name the entry; `scrub` is
+  `Vec<PathBuf>` (the subset of `copies` whose identity keys are removed) and
+  `skipped: Vec<String>` carries a reason per entry. `apply_seed(&SeedPlan,
+  force: bool) -> io::Result<SeedReport>`, and `SeedReport { created, linked,
+  copied, scrubbed, warnings }`.
+- **`plan_seed` refuses more than a missing source.** Same directory as the
+  source (after `config::dir_key`), a target nested inside the source or vice
+  versa, and a source that is not a directory are all errors. A `SHARED_ENTRIES`
+  entry that is itself a symlink in the source is `canonicalize`d and the new
+  profile links to the *final* target, so a profile seeded from a seeded
+  profile never chains.
+- **`guard_no_credentials` runs twice** — once when the plan is built and again
+  before it is applied — over the source *and* target of every link and copy
+  and over `scrub`. A plan naming `.credentials.json` on any of them is an
+  error, not a skip. `PRIVATE_ENTRIES` still reach `skipped`, which is how
+  `--dry-run` shows the user that credentials are deliberately left behind.
+- **Non-destructive by construction.** An entry that already exists in the
+  target is left exactly as it is and reported as a warning; copied files are
+  written with `create_new` at `0600` on unix and the directory is `0700`;
+  `--force` only relaxes the refusal to seed into a non-empty directory and
+  **never** relaxes the refusal to seed into one that already holds
+  `.credentials.json`. A `.claude.json` this build cannot scrub (not JSON, not
+  an object, too large) is **not copied at all** — a warning, never a
+  passthrough.
+- **`scrub_claude_json` is top-level only**, by decision (a): a nested MCP
+  server's own credentials are the user's, not the account's, and dropping
+  them would break the settings the copy exists to carry over. `is_scrubbed_key`
+  is the shared predicate (`SCRUBBED_IDENTITY_KEYS` case-insensitively, plus
+  any key containing a `SCRUBBED_KEY_SUBSTRINGS` needle).
+- **The seed source falls back through `CLAUDE_CONFIG_DIR`.** `--from`, else
+  the default profile when its directory exists, else the *ambient* Claude
+  directory — `CLAUDE_CONFIG_DIR` when set, otherwise `~/.claude` — mirroring
+  the private `crate::integration::env::claude_dir`. Nothing is guessed: when
+  none of the three exists, `add` fails and names `--from`.
+- **The default `config_dir` is `~/.claude-<name>` in the *user's* home**, so
+  the plan's original validation recipe (`account add third` then `ls
+  $HERDR_ACCOUNTS_LAB_ROOT/profiles/third`) does not work: every lab command
+  and every test passes `--config-dir "$HERDR_ACCOUNTS_LAB_ROOT/profiles/…"`.
+  The lab does not override `HOME`.
+- **The store is never overwritten with a store herdr could not read.**
+  `store::load()` degrades a bad file to an empty store, so every writer goes
+  through `cli::account::store_for_write`, which refuses when `load` reported
+  any diagnostic. `AccountsStore::remove` clears `default` when it named the
+  removed profile; `AccountsStore::set_default` accepts a `[[accounts]]` name
+  (that is how `herdr account default` chooses without rewriting
+  `config.toml`) and the CLI checks the name resolves in the merged view first.
+- **`--delete-dir` refuses** a symlink, a non-directory, a filesystem root, a
+  home directory, the ambient Claude directory, and a directory another profile
+  also uses. The last branch is unreachable through the merged view — `resolve`
+  already drops a second profile with the same `dir_key` — and is kept as
+  defence in depth for a future caller.
+- **The hook is installed by subprocess**: `std::env::current_exe()` with
+  `["integration","install","claude"]` and `CLAUDE_CONFIG_DIR=<target>`, output
+  captured so it cannot corrupt `--json` stdout. A failure is a warning naming
+  the command to rerun; `--no-hook` warns too, because a profile without the
+  hook can be launched but never switched.
+- **Flags:** only `add` takes `--json`; `remove` and `default` print one line.
+  `add` exits 0 (warnings on stderr), 1 for an operation failure, 2 for usage.
+- **`profile::home_dir` and `profile::expand` are now `pub`** so the CLI
+  expands `--config-dir` exactly the way `resolve` will read it back. Windows
+  sharing uses `symlink_dir`/`symlink_file` with no junction fallback: a link
+  that cannot be made is a warning and the profile simply starts without that
+  entry.
+
+**Hardening found during PR 2's review** (all fixed in the same PR; PRs 3–5
+and 7–10 inherit the helpers):
+
+- `config::dir_key` is **lexical**: it keeps `..` and cannot see a symlink, so
+  `--config-dir <dir>/../work` and `--config-dir <symlink>/work` both passed
+  every same-directory check and would have registered a second "account" on
+  one login. `layout::resolved_key(&Path)` (longest existing prefix
+  canonicalized, remainder appended, `.`/`..` collapsed) is the companion key;
+  **every check that must not be walked around compares both spellings.** Reuse
+  it, do not re-derive it.
+- `plan_seed` resolves a `COPIED_ENTRIES` symlink *before* classifying it: a
+  `.claude.json` symlinked at `.credentials.json` would otherwise have been
+  read and copied under an innocent name, and its `claudeAiOauth` key matches
+  none of `SCRUBBED_KEY_SUBSTRINGS`.
+- `guard_no_credentials` also refuses a **link source** that holds a
+  credentials file (existence only) or that contains either profile directory,
+  so a `projects -> .` in a crafted source cannot put one account's login
+  inside another profile.
+- `may_delete_dir`'s home and ambient checks are **containment** checks over
+  both spellings, because `remove_dir_all` resolves symlinked ancestors that
+  the lexical path never revealed.
+- Known and accepted: two concurrent `herdr account add` runs can lose one
+  store entry (load–modify–save, no lock file). Both directories are still
+  created.
 
 ### PR 3 — feat(accounts): herdr account status and login · deps: 2
 
