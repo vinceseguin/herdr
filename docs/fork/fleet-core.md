@@ -326,6 +326,17 @@ Hosts that are not connected get a `!` line with the reason underneath the
 table, and the agent table is replaced by `no agents` when the merged list is
 empty.
 
+The agent table grows one more column, `ACCOUNT`, when — and only when — at
+least one merged agent carries an `account` metadata token, so a fleet that
+does not use account profiles renders exactly the four columns
+above. An agent with no such token shows `-` in it:
+
+```text
+AGENT        STATUS   WORKSPACE  NAME      ACCOUNT
+local/w1:p1  blocked  repo       reviewer  work
+lab-2/w1:p1  idle     lab-2      builder   -
+```
+
 ### JSON
 
 `--json` prints one `herdr.fleet.status.v1` document. It is an **additive**
@@ -420,6 +431,8 @@ two hosts are elided, for length. Nothing else is edited.)
 | `agents[]` | The **merged** agent list: blocked → working → done → idle → unknown, then most recently changed first, then host order, then pane id. |
 | `agents[].fleet_change_seq` | Fleet-wide recency, comparable across hosts. |
 | `agents[].state_change_seq` | The host's own counter — only comparable within one host boot. |
+| `agents[].tokens` | The agent's metadata tokens on its host (`pane.report_metadata`), as a `{name: value}` object sorted by name. Absent keys mean the host reported none; the object is omitted entirely by a client older than this field, so read it as empty when missing. `account` is the profile an agent was launched under and `account_state` how well that is known (`herdr account`); any other integration's tokens ride the same field. |
+| `agents[].state_labels` | Per-status label overrides on its host, `{status: label}` sorted by status. A client that renders a status word may substitute the label for the matching status; one that does not may ignore the whole object. |
 | `counts` | Totals across every contributing host (`blocked`, `working`, `done`, `idle`, `unknown`). |
 
 Only a **connected host with a snapshot** contributes agents and counts. When a
@@ -473,7 +486,13 @@ snapshot lab-ssh boot 1613778-1788644429866237637 revision 1
 | `agent_added` | `agent + <ref> <status> <workspace>` | An agent joined the merged list, or rejoined it. Treat it as an upsert keyed by `ref`: a reconnecting host re-announces every agent it still has. |
 | `agent_removed` | `agent - <ref>` | An agent left, or its host stopped contributing. |
 | `agent_status` | `agent ~ <ref> <from> -> <to>` | Status transition. |
+| `agent_metadata` | `agent * <ref> <name>=<value>… <status>:<label>…`, or `agent * <ref> cleared` | An agent already in the merged list changed its `tokens` or `state_labels`. Both maps are the **whole** metadata after the change, never a patch: a token that disappeared is simply absent, and both empty means everything was cleared. An agent that has just joined carries its metadata on its `agent_added` instead, so this kind never duplicates one. |
 | `active_host` | `active host <id>` / `active host none` | The active host changed (a consumer called `set_active`). |
+
+New kinds are appended to this vocabulary as the fork grows, so **a reader must
+skip a `kind` it does not know** rather than fail on it — a reducer treats it as
+a no-op and keeps the state it has. The same rule holds for a new field inside a
+kind it does know.
 
 Every line is flushed as it is written, so `herdr fleet status --watch --json |
 jq` works live. A closed pipe (`| head`) ends the watch: like every herdr CLI

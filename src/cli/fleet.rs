@@ -213,6 +213,23 @@ fn render_change(change: &FleetChange) -> String {
             status_name(*from),
             status_name(*to)
         ),
+        FleetChange::AgentMetadata {
+            pane,
+            tokens,
+            state_labels,
+        } => {
+            let mut line = format!("agent * {pane}");
+            for (key, value) in tokens {
+                line.push_str(&format!(" {key}={value}"));
+            }
+            for (status, label) in state_labels {
+                line.push_str(&format!(" {status}:{label}"));
+            }
+            if tokens.is_empty() && state_labels.is_empty() {
+                line.push_str(" cleared");
+            }
+            line
+        }
         FleetChange::ActiveHost { host } => match host {
             Some(host) => format!("active host {host}"),
             None => "active host none".to_string(),
@@ -330,6 +347,29 @@ mod tests {
         assert_eq!(
             render_change(&FleetChange::ActiveHost { host: None }),
             "active host none"
+        );
+        let pane = FleetPaneRef::new(host("lab-1"), "w1:p1".to_string());
+        assert_eq!(
+            render_change(&FleetChange::AgentMetadata {
+                pane: pane.clone(),
+                tokens: std::collections::BTreeMap::from([
+                    ("account".to_string(), "work".to_string()),
+                    ("account_state".to_string(), "ok".to_string()),
+                ]),
+                state_labels: std::collections::BTreeMap::from([(
+                    "blocked".to_string(),
+                    "limit".to_string()
+                )]),
+            }),
+            "agent * lab-1/w1:p1 account=work account_state=ok blocked:limit"
+        );
+        assert_eq!(
+            render_change(&FleetChange::AgentMetadata {
+                pane,
+                tokens: std::collections::BTreeMap::new(),
+                state_labels: std::collections::BTreeMap::new(),
+            }),
+            "agent * lab-1/w1:p1 cleared"
         );
     }
 

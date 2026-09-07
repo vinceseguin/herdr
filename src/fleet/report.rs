@@ -8,8 +8,11 @@
 //! Pure: no sockets, no async, no ratatui — the report is derived from
 //! [`FleetState`] and nothing else.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
+use crate::accounts::tokens::ACCOUNT_TOKEN;
 use crate::api::schema::AgentStatus;
 use crate::fleet::hosts::HostId;
 use crate::fleet::refs::{FleetPaneRef, FleetWorkspaceRef};
@@ -195,6 +198,16 @@ pub struct AgentReport {
     /// Fleet-wide recency, comparable across hosts.
     pub fleet_change_seq: u64,
     pub focused: bool,
+    /// The agent's metadata tokens on its host (`pane.report_metadata`),
+    /// sorted by key. `account` is the fork's Claude-profile token.
+    ///
+    /// Appended to a shipped schema, so `#[serde(default)]`: a report written
+    /// before this field existed still decodes.
+    #[serde(default)]
+    pub tokens: BTreeMap<String, String>,
+    /// Per-status label overrides on its host, sorted by status.
+    #[serde(default)]
+    pub state_labels: BTreeMap<String, String>,
 }
 
 impl From<&MergedAgent> for AgentReport {
@@ -214,8 +227,21 @@ impl From<&MergedAgent> for AgentReport {
             state_change_seq: agent.state_change_seq,
             fleet_change_seq: agent.fleet_change_seq,
             focused: agent.focused,
+            tokens: agent.tokens.clone(),
+            state_labels: agent.state_labels.clone(),
         }
     }
+}
+
+/// Whether the agent table should carry an `ACCOUNT` column.
+///
+/// Pure and cheap: the column only appears once something in the fleet
+/// actually reports an account, so a fleet that never uses account profiles
+/// renders exactly the table it rendered before.
+fn account_column(agents: &[AgentReport]) -> bool {
+    agents
+        .iter()
+        .any(|agent| agent.tokens.contains_key(ACCOUNT_TOKEN))
 }
 
 impl FleetStatusReport {
@@ -292,14 +318,19 @@ impl FleetStatusReport {
             out.push_str("no agents\n");
             return out;
         }
-        let mut rows = vec![vec![
+        let accounts = account_column(&self.agents);
+        let mut header = vec![
             "AGENT".to_string(),
             "STATUS".to_string(),
             "WORKSPACE".to_string(),
             "NAME".to_string(),
-        ]];
+        ];
+        if accounts {
+            header.push("ACCOUNT".to_string());
+        }
+        let mut rows = vec![header];
         for agent in &self.agents {
-            rows.push(vec![
+            let mut row = vec![
                 agent.r#ref.to_string(),
                 agent_status_name(agent.agent_status).to_string(),
                 agent.workspace_label.clone(),
@@ -308,7 +339,17 @@ impl FleetStatusReport {
                     .clone()
                     .or_else(|| agent.title.clone())
                     .unwrap_or_else(|| "-".to_string()),
-            ]);
+            ];
+            if accounts {
+                row.push(
+                    agent
+                        .tokens
+                        .get(ACCOUNT_TOKEN)
+                        .cloned()
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+            }
+            rows.push(row);
         }
         out.push_str(&render_table(&rows));
         out
@@ -657,5 +698,112 @@ local/w1:p1  blocked  repo       reviewer
         let text = report.render_text();
         assert!(text.ends_with("no agents\n"), "{text}");
         assert!(text.contains("local    local  connecting"), "{text}");
+    }
+    #[test]
+    fn an_agent_report_carries_the_metadata_of_its_merged_agent() {
+        let mut state = two_hosts_on_the_frozen_snapshot();
+        let mut merged = state
+            .merged_agents()
+            .first()
+            .cloned()
+            .expect("the frozen snapshot has one agent per host");
+        merged.tokens = std::collections::BTreeMap::from([
+            ("account".to_string(), "work".to_string()),
+            ("account_state".to_string(), "ok".to_string()),
+        ]);
+        merged.state_labels =
+            std::collections::BTreeMap::from([("blocked".to_string(), "limit".to_string())]);
+
+        let report = AgentReport::from(&merged);
+        assert_eq!(report.tokens, merged.tokens);
+        assert_eq!(report.state_labels, merged.state_labels);
+
+        let value = serde_json::to_value(&report).expect("agent report is json");
+        assert_eq!(value["tokens"]["account"], "work");
+        assert_eq!(value["state_labels"]["blocked"], "limit");
+    }
+
+    #[test]
+    fn a_report_written_before_the_metadata_fields_still_decodes() {
+        let mut state = two_hosts_on_the_frozen_snapshot();
+        let report = FleetStatusReport::from_state(&mut state, "0.8.2-test");
+        let mut value = serde_json::to_value(&report).expect("report is json");
+        for agent in value["agents"]
+            .as_array_mut()
+            .expect("agents array")
+            .iter_mut()
+        {
+            let agent = agent.as_object_mut().expect("agent object");
+            agent.remove("tokens");
+            agent.remove("state_labels");
+        }
+
+        let decoded: FleetStatusReport =
+            serde_json::from_value(value).expect("an older report must still decode");
+        assert!(decoded
+            .agents
+            .iter()
+            .all(|agent| agent.tokens.is_empty() && agent.state_labels.is_empty()));
+        // Schema stays v1: the fields are additive, not a new contract.
+        assert_eq!(decoded.schema, FLEET_STATUS_SCHEMA);
+    }
+
+    #[test]
+    fn the_account_column_appears_only_when_an_agent_reports_one() {
+        let mut state = FleetState::test_new();
+        let local = HostId::local();
+        connected(&mut state, &local);
+        state.apply(&local, HostEvent::Snapshot(frozen_snapshot()));
+        let mut report = FleetStatusReport::from_state(&mut state, "0.8.2-test");
+        report.hosts.retain(|host| host.id == local);
+
+        assert!(!account_column(&report.agents));
+        assert!(
+            !report.render_text().contains("ACCOUNT"),
+            "{}",
+            report.render_text()
+        );
+
+        report.agents[0].tokens =
+            std::collections::BTreeMap::from([("account".to_string(), "work".to_string())]);
+        assert!(account_column(&report.agents));
+        assert_eq!(report.render_text(), EXPECTED_ACCOUNT_TEXT);
+    }
+
+    const EXPECTED_ACCOUNT_TEXT: &str = "\
+client 0.8.2-test  active host: local
+
+HOST   KIND   STATE      VERSION     BLOCKED  WORKING  DONE  IDLE  UNKNOWN
+local  local  connected  0.8.2-fork  1        0        0     0     0
+
+AGENT        STATUS   WORKSPACE  NAME      ACCOUNT
+local/w1:p1  blocked  repo       reviewer  work
+";
+
+    #[test]
+    fn an_agent_without_the_account_token_shows_a_dash_in_the_column() {
+        let mut state = FleetState::test_new();
+        let local = HostId::local();
+        let workbox = HostId::new("workbox").expect("valid host name");
+        connected(&mut state, &local);
+        connected(&mut state, &workbox);
+        state.apply(&local, HostEvent::Snapshot(frozen_snapshot()));
+        state.apply(&workbox, HostEvent::Snapshot(frozen_snapshot()));
+        let mut report = FleetStatusReport::from_state(&mut state, "0.8.2-test");
+        assert_eq!(report.agents.len(), 2);
+        report.agents[0].tokens =
+            std::collections::BTreeMap::from([("account".to_string(), "work".to_string())]);
+
+        let text = report.render_text();
+        let rows = text
+            .lines()
+            .filter(|line| line.starts_with("workbox/") || line.starts_with("local/"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "{text}");
+        assert!(rows[0].ends_with("work"), "{text}");
+        assert!(
+            rows[1].ends_with('-'),
+            "an agent with no account token gets a dash, not a blank: {text}"
+        );
     }
 }
