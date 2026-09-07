@@ -7,6 +7,8 @@ use std::sync::{Mutex, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Driver for `scripts/fork/accounts-lab.sh`, shared by the fork account tests.
+pub mod accounts_lab;
 /// Driver for `scripts/fork/fleet-lab.sh`, shared by the fork lab tests.
 pub mod fleet_lab;
 /// Driver for a real `herdr gateway` process, shared by the fork gateway tests.

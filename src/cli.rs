@@ -22,6 +22,7 @@ macro_rules! println {
     }};
 }
 
+mod account;
 mod agent;
 mod api;
 mod completion;
@@ -119,6 +120,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "gateway" => crate::gateway::run_gateway_command(&args[2..])?,
         "channel" => run_channel_command(&args[2..])?,
         "machine" => machine::run_machine_command(&args[2..])?,
+        "account" => account::run_account_command(&args[2..])?,
         "workspace" => workspace::run_workspace_command(&args[2..])?,
         "worktree" => worktree::run_worktree_command(&args[2..])?,
         "tab" => tab::run_tab_command(&args[2..])?,

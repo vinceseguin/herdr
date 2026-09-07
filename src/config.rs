@@ -138,6 +138,7 @@ impl Config {
             .chain(self.invalid_headless_size_diagnostic())
             .chain(self.fleet.diagnostics())
             .chain(self.gateway.diagnostics())
+            .chain(crate::accounts::config::diagnostics(&self.accounts))
             .collect()
     }
 

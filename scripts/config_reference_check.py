@@ -35,7 +35,10 @@ ROOT_STRUCT = "Config"
 # website config reference.
 # `[gateway]` is fork-owned for the same reason: it configures `herdr gateway`,
 # which only fork builds have, and is documented in docs/fork/gateway.md.
-SKIPPED_SUBTREES = ("keys.command", "fleet", "gateway")
+# `[[accounts]]` is fork-owned too: it is a top-level array of tables whose
+# entry type lives in src/accounts, outside this checker's model root, and is
+# documented in prose under docs/fork/.
+SKIPPED_SUBTREES = ("keys.command", "fleet", "gateway", "accounts")
 
 FIELD_RE = re.compile(r"^\s*pub ([a-z_][a-z0-9_]*):\s*(.+?),?\s*$")
 STRUCT_RE = re.compile(r"^\s*pub(?:\(crate\))? struct ([A-Za-z0-9_]+)\s*\{\s*$")
@@ -235,10 +238,14 @@ def collect_entries(model: Model, struct_name: str = ROOT_STRUCT, prefix: str = 
     entries: list[dict] = []
     for struct_field in model.structs[struct_name]:
         dotted = f"{prefix}{struct_field.name}"
+        # Checked before the type is resolved: a skipped subtree may be typed
+        # outside this checker's model root (the fork's `[[accounts]]` entry
+        # type lives in src/accounts), in which case it would otherwise be
+        # mistaken for a leaf key that the reference must enumerate.
+        if dotted in SKIPPED_SUBTREES:
+            continue
         inner, is_vec = strip_wrappers(struct_field.rust_type)
         if inner in model.structs:
-            if dotted in SKIPPED_SUBTREES:
-                continue
             if is_vec:
                 raise ValueError(
                     f"{dotted} is an open-ended array of tables; add it to "
