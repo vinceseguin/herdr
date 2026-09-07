@@ -606,6 +606,14 @@ fn agent_switch_account(args: &[String]) -> std::io::Result<i32> {
         }
         Err(failure) => {
             eprintln!("error: {failure}");
+            // Above all: a relaunched agent that was recorded under the new
+            // account even though the protocol did not finish.
+            for warning in &failure.warnings {
+                eprintln!("warning: {warning}");
+            }
+            if let Some(hint) = failure.recovery_hint() {
+                eprintln!("{hint}");
+            }
             // The one fact a caller needs to act on: whether the agent was
             // touched at all.
             Ok(if failure.touched_pane { 1 } else { 2 })
@@ -649,7 +657,11 @@ fn relaunch_under_account(
     request: &crate::accounts::switch::LaunchRequest,
     timeout_ms: Option<u64>,
 ) -> Result<crate::accounts::client::AppliedLine, crate::accounts::switch::SwitchError> {
-    let launch_error = |detail: String| crate::accounts::switch::SwitchError::Launch { detail };
+    let launch_error = |detail: String| crate::accounts::switch::SwitchError::Launch {
+        pane_id: request.pane_id.clone(),
+        session_id: request.session_id.clone(),
+        detail,
+    };
 
     let plan =
         crate::accounts::client::prepare(profile, &request.pane_id, &request.name, &request.args)

@@ -11,7 +11,10 @@
 //!    *before anything is typed*: exiting it would destroy the conversation
 //!    this command exists to preserve.
 //! 2. **Confirm.** Always. Nothing here happens implicitly — read is safe,
-//!    control is explicit.
+//!    control is explicit. Then look again: a person may take minutes over
+//!    the question, and the agent that was idle may be working by the time
+//!    they answer, so the pinned pane is re-read and anything other than the
+//!    confirmed agent, in the confirmed state, is a refusal.
 //! 3. **Ask it to leave.** `Escape` first when the agent is blocked (or when
 //!    a working agent is being interrupted on purpose), then `/exit`. Never a
 //!    signal, never a kill: a Claude in the middle of a tool call is left to
@@ -61,6 +64,12 @@ pub const ESCAPE_SETTLE_MS: Millis = 300;
 /// still reports the agent as blocked. Bounded so a permanently blocked agent
 /// fails with a message instead of being poked forever.
 const MAX_EXIT_ATTEMPTS: u8 = 3;
+
+/// The rejection code a driver reports when a send never got an answer. A
+/// server that *refused* a send wrote nothing to the pane; a request that was
+/// lost in transit may or may not have, so the machine counts the pane as
+/// touched from then on.
+pub const TRANSPORT_ERROR_CODE: &str = "transport_error";
 
 /// The knobs the user turned. `--yes` is deliberately absent: whether a
 /// confirmation can be answered is the driver's business, so the machine
@@ -126,8 +135,10 @@ pub enum PaneReading {
     /// The pane's own shell holds the foreground *and* the server no longer
     /// holds an agent on that terminal. Both halves matter: the first says the
     /// Claude process is gone, the second that `agent.start` will accept the
-    /// pane again.
-    Released { terminal_id: Option<String> },
+    /// pane again. `terminal_id` is the terminal the pane holds *now*; a
+    /// driver that cannot read it reports [`PaneReading::Unreadable`] instead,
+    /// because a launch is never allowed on a pane whose identity is unknown.
+    Released { terminal_id: String },
     /// Something is still running there.
     Busy { detail: String },
     /// The pane could not be read at all.
@@ -269,6 +280,13 @@ pub enum SwitchError {
     AgentWorking {
         name: String,
     },
+    /// Between the first look and the moment something was about to be sent
+    /// (a human may take minutes over the confirmation) the agent on the
+    /// pinned pane stopped being the one the user confirmed. Nothing was sent.
+    AgentChanged {
+        pane_id: String,
+        detail: String,
+    },
     /// Not a terminal, and no `--yes`.
     ConfirmationRequired,
     Declined,
@@ -289,9 +307,12 @@ pub enum SwitchError {
         pane_id: String,
         seconds: u64,
     },
-    /// The pane is no longer the pane the switch started on.
+    /// The pane is no longer the terminal the switch started on. Claude had
+    /// already exited when this was noticed, so the message says how to get
+    /// the conversation back.
     PaneReplaced {
         pane_id: String,
+        session_id: String,
     },
     PaneUnreadable {
         pane_id: String,
@@ -308,7 +329,12 @@ pub enum SwitchError {
         expected: String,
         actual: String,
     },
+    /// The relaunch did not put a ready agent back. Claude had exited, so the
+    /// pane is at its shell (or holds a Claude herdr could not see become
+    /// ready) and the conversation is on disk.
     Launch {
+        pane_id: String,
+        session_id: String,
         detail: String,
     },
     Api {
@@ -372,6 +398,11 @@ impl std::fmt::Display for SwitchError {
                 "agent {name:?} is working; it may be in the middle of a tool call. Wait for it, \
                  or pass --interrupt to send Escape first"
             ),
+            Self::AgentChanged { pane_id, detail } => write!(
+                formatter,
+                "the agent in pane {pane_id} changed while the switch was being confirmed: \
+                 {detail}; nothing was sent to the pane. Look at it and retry"
+            ),
             Self::ConfirmationRequired => write!(
                 formatter,
                 "switching an account stops and restarts the agent, so it needs a confirmation; \
@@ -400,10 +431,14 @@ impl std::fmt::Display for SwitchError {
                  and nothing was killed. It is still running in pane {pane_id} with its \
                  conversation intact — finish what it is doing and retry"
             ),
-            Self::PaneReplaced { pane_id } => write!(
+            Self::PaneReplaced {
+                pane_id,
+                session_id,
+            } => write!(
                 formatter,
                 "pane {pane_id} is no longer the terminal this switch started on; stopping rather \
-                 than typing into it"
+                 than typing into it. Claude had already exited: its conversation is still on \
+                 disk, and `claude --resume {session_id}` in a pane recovers it"
             ),
             Self::PaneUnreadable { pane_id, detail } => write!(
                 formatter,
@@ -426,19 +461,37 @@ impl std::fmt::Display for SwitchError {
                  did not take. The original conversation is still on disk; exit this one and run \
                  `claude --resume {expected}` in the pane"
             ),
-            Self::Launch { detail } => write!(formatter, "could not restart the agent: {detail}"),
+            Self::Launch {
+                pane_id,
+                session_id,
+                detail,
+            } => write!(
+                formatter,
+                "could not restart the agent in pane {pane_id}: {detail}. Claude had exited; read \
+                 the pane, and if it is at its shell, `claude --resume {session_id}` there \
+                 recovers the conversation, which is still on disk"
+            ),
             Self::Api { method, detail } => write!(formatter, "{method} failed: {detail}"),
         }
     }
 }
 
-/// A failure plus the one fact that decides how loud it is: whether anything
-/// had already been sent to the pane when it happened.
+/// A failure plus the facts that decide how loud it is and what to say next:
+/// whether anything had already been sent to the pane when it happened, and
+/// which pane and conversation that was.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwitchFailure {
     pub error: SwitchError,
     /// `false` means the agent was never touched, so it is exactly as it was.
     pub touched_pane: bool,
+    /// The pinned pane, once preflight has run.
+    pub pane_id: Option<String>,
+    /// The conversation the switch was preserving, once preflight has run.
+    pub session_id: Option<String>,
+    /// Things the driver did on the way out that the user must hear about —
+    /// above all, that a relaunched agent was recorded under the new account
+    /// even though the protocol did not finish.
+    pub warnings: Vec<String>,
 }
 
 impl std::fmt::Display for SwitchFailure {
@@ -447,11 +500,57 @@ impl std::fmt::Display for SwitchFailure {
     }
 }
 
+impl SwitchFailure {
+    /// What to do about the pane, for the errors whose own message cannot say
+    /// it. Only a failure that touched the pane needs one: before that the
+    /// agent is exactly as it was. Errors that already spell out the pane's
+    /// state and the recovery command (a timeout, a lost or mismatched
+    /// session, a failed relaunch, a replaced pane) get `None`.
+    pub fn recovery_hint(&self) -> Option<String> {
+        if !self.touched_pane {
+            return None;
+        }
+        let (Some(pane_id), Some(session_id)) = (&self.pane_id, &self.session_id) else {
+            return None;
+        };
+        match &self.error {
+            SwitchError::KeysRefused { .. }
+            | SwitchError::ExitRefused { .. }
+            | SwitchError::PaneUnreadable { .. }
+            | SwitchError::Api { .. } => Some(format!(
+                "read pane {pane_id} with `herdr pane read {pane_id}`: if Claude is still running \
+                 there it still has its conversation; if the pane is at its shell, \
+                 `claude --resume {session_id}` there recovers it"
+            )),
+            SwitchError::AgentNotFound { .. }
+            | SwitchError::NotClaude { .. }
+            | SwitchError::Unnamed { .. }
+            | SwitchError::NoSession { .. }
+            | SwitchError::ForeignSession { .. }
+            | SwitchError::UnusableSession { .. }
+            | SwitchError::AlreadyOnAccount { .. }
+            | SwitchError::ProfileDirectoryMissing { .. }
+            | SwitchError::ProfileLoggedOut { .. }
+            | SwitchError::AgentWorking { .. }
+            | SwitchError::AgentChanged { .. }
+            | SwitchError::ConfirmationRequired
+            | SwitchError::Declined
+            | SwitchError::AgentStillRunning { .. }
+            | SwitchError::PaneReplaced { .. }
+            | SwitchError::SessionNotReported { .. }
+            | SwitchError::SessionMismatch { .. }
+            | SwitchError::Launch { .. } => None,
+        }
+    }
+}
+
 /// What the machine is doing. Deadlines are absolute, on the driver's clock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Phase {
     Preflight,
     Confirm,
+    /// Confirmed; the agent is being read once more before anything is sent.
+    Recheck,
     /// `Escape` has been sent; `attempts` counts the `/exit` tries so far.
     Escape {
         attempts: u8,
@@ -551,6 +650,7 @@ impl SwitchMachine {
         match std::mem::replace(&mut self.phase, Phase::Done) {
             Phase::Preflight => self.on_preflight(now, observation),
             Phase::Confirm => self.on_confirm(observation),
+            Phase::Recheck => self.on_recheck(observation),
             Phase::Escape { attempts } => self.on_escape(attempts, observation),
             Phase::EscapeSettle { attempts } => self.on_escape_settle(attempts, observation),
             Phase::Exit { attempts } => self.on_exit(now, attempts, observation),
@@ -562,6 +662,18 @@ impl SwitchMachine {
                 method: "switch".into(),
                 detail: "the switch has already finished".into(),
             }),
+        }
+    }
+
+    /// Wrap an error with what the driver's caller needs to report it: whether
+    /// the pane was touched, and which pane and conversation this was about.
+    pub fn failure(&self, error: SwitchError) -> SwitchFailure {
+        SwitchFailure {
+            error,
+            touched_pane: self.touched_pane(),
+            pane_id: (!self.pane_id.is_empty()).then(|| self.pane_id.clone()),
+            session_id: (!self.session_id.is_empty()).then(|| self.session_id.clone()),
+            warnings: Vec::new(),
         }
     }
 
@@ -710,19 +822,78 @@ impl SwitchMachine {
 
     fn on_confirm(&mut self, observation: Observation) -> Action {
         match observation {
-            Observation::Confirmed(true) => self.begin_exit(),
+            // A person may have taken minutes over the question, and the
+            // server accepts a prompt for a working agent. So the agent is
+            // read once more, on the pinned pane, before a byte is sent.
+            Observation::Confirmed(true) => {
+                self.phase = Phase::Recheck;
+                Action::PollAgent
+            }
             Observation::Confirmed(false) => self.fail(SwitchError::Declined),
             Observation::ConfirmUnavailable => self.fail(SwitchError::ConfirmationRequired),
             _ => self.out_of_order("confirmation"),
         }
     }
 
+    /// The agent must still be the one that was confirmed: same terminal, same
+    /// name, same conversation, and not working unless that was agreed to.
+    /// Its status is taken from this read, not the first one, because that is
+    /// what decides whether `/exit` needs an `Escape` in front of it.
+    fn on_recheck(&mut self, observation: Observation) -> Action {
+        let Observation::Agent(agent) = observation else {
+            return self.out_of_order("recheck");
+        };
+        let changed = |detail: String| SwitchError::AgentChanged {
+            pane_id: self.pane_id.clone(),
+            detail,
+        };
+        let Some(agent) = *agent else {
+            return self.fail(changed("there is no agent on that pane any more".into()));
+        };
+        if agent.terminal_id != self.terminal_id {
+            return self.fail(changed("the pane is now another terminal".into()));
+        }
+        if agent.name.as_deref() != Some(self.name.as_str()) {
+            return self.fail(changed(format!(
+                "it is now named {}, not {:?}",
+                agent
+                    .name
+                    .as_ref()
+                    .map(|name| format!("{name:?}"))
+                    .unwrap_or_else(|| "nothing".to_string()),
+                self.name
+            )));
+        }
+        match agent.session.as_ref() {
+            Some(session) if session.value == self.session_id => {}
+            Some(session) => {
+                return self.fail(changed(format!(
+                    "its session id is now {:?}, not {:?}",
+                    session.value, self.session_id
+                )));
+            }
+            None => {
+                return self.fail(changed("it no longer reports a session id".into()));
+            }
+        }
+        if agent.status == AgentStatus::Working && !self.input.options.interrupt {
+            return self.fail(SwitchError::AgentWorking {
+                name: self.name.clone(),
+            });
+        }
+        self.status = agent.status;
+        self.begin_exit()
+    }
+
     /// Escape first when the agent cannot read a prompt (blocked), or when a
     /// working agent is being interrupted on purpose. Otherwise `/exit` goes
     /// straight in: an idle Claude needs no interruption, and sending Escape
     /// to one is input it did not ask for.
+    ///
+    /// The pane counts as touched once a send is *delivered* (or lost in
+    /// transit), not when it is decided: a server that refuses the send wrote
+    /// nothing, and the agent is exactly as it was.
     fn begin_exit(&mut self) -> Action {
-        self.touched_pane = true;
         match self.status {
             AgentStatus::Blocked => {
                 self.phase = Phase::Escape { attempts: 0 };
@@ -742,10 +913,12 @@ impl SwitchMachine {
     fn on_escape(&mut self, attempts: u8, observation: Observation) -> Action {
         match observation {
             Observation::Sent => {
+                self.touched_pane = true;
                 self.phase = Phase::EscapeSettle { attempts };
                 Action::Wait(ESCAPE_SETTLE_MS)
             }
             Observation::SendRejected { code, detail } => {
+                self.touched_pane |= code == TRANSPORT_ERROR_CODE;
                 self.fail(SwitchError::KeysRefused { code, detail })
             }
             _ => self.out_of_order("interrupt"),
@@ -765,6 +938,7 @@ impl SwitchMachine {
     fn on_exit(&mut self, now: Millis, attempts: u8, observation: Observation) -> Action {
         match observation {
             Observation::Sent => {
+                self.touched_pane = true;
                 self.phase = Phase::AwaitShell {
                     deadline: now.saturating_add(self.input.options.timeout_ms),
                 };
@@ -775,6 +949,7 @@ impl SwitchMachine {
             // number of retries goes back through Escape rather than failing on
             // a timing artefact.
             Observation::SendRejected { code, detail } => {
+                self.touched_pane |= code == TRANSPORT_ERROR_CODE;
                 if code == "agent_blocked" && attempts + 1 < MAX_EXIT_ATTEMPTS {
                     self.phase = Phase::Escape {
                         attempts: attempts + 1,
@@ -797,9 +972,10 @@ impl SwitchMachine {
         let expired = now >= deadline;
         match observation {
             Observation::Pane(PaneReading::Released { terminal_id }) => {
-                if terminal_id.is_some_and(|id| id != self.terminal_id) {
+                if terminal_id != self.terminal_id {
                     return self.fail(SwitchError::PaneReplaced {
                         pane_id: self.pane_id.clone(),
+                        session_id: self.session_id.clone(),
                     });
                 }
                 self.phase = Phase::Relaunch;
@@ -861,17 +1037,33 @@ impl SwitchMachine {
         match observation {
             Observation::Agent(agent) => {
                 // The server clears the persisted session when the Claude
-                // process exits, so any session visible now was reported by the
-                // process this switch started.
-                if let Some(session) = agent.as_ref().as_ref().and_then(|a| a.session.as_ref()) {
-                    if session.value == self.session_id {
-                        self.phase = Phase::Grade;
-                        return Action::Grade;
+                // process exits (`TerminalState::set_detected_state_with_
+                // screen_signals_at`, on `process_exited`, in the same mutation
+                // that releases the agent name — which `AwaitShell` waited
+                // for), and a Claude launch with `--resume` seeds nothing, so
+                // any session visible now was reported by the process this
+                // switch started. Only Claude's own hook counts as that
+                // report: another integration's session on the pane is not
+                // evidence either way.
+                if let Some(agent) = agent.as_ref() {
+                    if agent.terminal_id != self.terminal_id {
+                        return self.fail(SwitchError::PaneReplaced {
+                            pane_id: self.pane_id.clone(),
+                            session_id: self.session_id.clone(),
+                        });
                     }
-                    return self.fail(SwitchError::SessionMismatch {
-                        expected: self.session_id.clone(),
-                        actual: session.value.clone(),
-                    });
+                    if let Some(session) = agent.session.as_ref().filter(|session| {
+                        session.source == APPLIES_TO_SOURCE && session.agent == AGENT_LABEL
+                    }) {
+                        if session.value == self.session_id {
+                            self.phase = Phase::Grade;
+                            return Action::Grade;
+                        }
+                        return self.fail(SwitchError::SessionMismatch {
+                            expected: self.session_id.clone(),
+                            actual: session.value.clone(),
+                        });
+                    }
                 }
                 if expired {
                     return self.fail(SwitchError::SessionNotReported {
@@ -981,6 +1173,37 @@ mod tests {
         }
     }
 
+    /// Answer the confirmation, then pass the recheck with `snapshot` as what
+    /// the pinned pane shows now.
+    fn confirm_with(machine: &mut SwitchMachine, snapshot: AgentSnapshot) -> Action {
+        assert_eq!(
+            machine.next(0, Observation::Confirmed(true)),
+            Action::PollAgent,
+            "a confirmation is followed by a second look at the agent"
+        );
+        machine.next(0, Observation::agent(Some(snapshot)))
+    }
+
+    /// Preflight, confirm, recheck and `/exit` an idle agent, leaving the
+    /// machine waiting for the pane's shell.
+    fn exited(machine: &mut SwitchMachine) {
+        assert!(matches!(
+            machine.next(0, Observation::agent(Some(agent()))),
+            Action::AskConfirm(_)
+        ));
+        assert_eq!(
+            confirm_with(machine, agent()),
+            Action::Prompt("/exit".to_string())
+        );
+        assert_eq!(machine.next(0, Observation::Sent), Action::PollPane);
+    }
+
+    fn released() -> Observation {
+        Observation::Pane(PaneReading::Released {
+            terminal_id: "t-1".to_string(),
+        })
+    }
+
     /// The whole happy path, one observation at a time, with the exact actions
     /// a driver would carry out.
     #[test]
@@ -1003,14 +1226,23 @@ mod tests {
             "asking is not touching the agent's pane"
         );
 
-        // Idle: no Escape, straight to /exit.
+        // Confirmed: one more look, then — idle — no Escape, straight to /exit.
         assert_eq!(
             machine.next(1, Observation::Confirmed(true)),
+            Action::PollAgent
+        );
+        assert!(!machine.touched_pane(), "looking again is not touching");
+        assert_eq!(
+            machine.next(1, Observation::agent(Some(agent()))),
             Action::Prompt("/exit".to_string())
         );
-        assert!(machine.touched_pane());
+        assert!(
+            !machine.touched_pane(),
+            "deciding to send is not sending; the server may still refuse"
+        );
 
         assert_eq!(machine.next(2, Observation::Sent), Action::PollPane);
+        assert!(machine.touched_pane());
         assert_eq!(
             machine.next(
                 3,
@@ -1022,12 +1254,7 @@ mod tests {
         );
         assert_eq!(machine.next(4, Observation::Tick), Action::PollPane);
 
-        let action = machine.next(
-            5,
-            Observation::Pane(PaneReading::Released {
-                terminal_id: Some("t-1".to_string()),
-            }),
-        );
+        let action = machine.next(5, released());
         assert_eq!(
             action,
             Action::Launch(LaunchRequest {
@@ -1192,7 +1419,7 @@ mod tests {
             interrupt: true,
             ..SwitchOptions::default()
         });
-        let action = machine.next(0, Observation::agent(Some(working)));
+        let action = machine.next(0, Observation::agent(Some(working.clone())));
         let Action::AskConfirm(text) = &action else {
             panic!("expected a confirmation, got {action:?}");
         };
@@ -1201,13 +1428,15 @@ mod tests {
             "an interrupt must be spelled out in the confirmation: {text}"
         );
         assert_eq!(
-            machine.next(1, Observation::Confirmed(true)),
+            confirm_with(&mut machine, working),
             Action::SendKeys(vec!["esc".to_string()])
         );
+        assert!(!machine.touched_pane());
         assert_eq!(
             machine.next(2, Observation::Sent),
             Action::Wait(ESCAPE_SETTLE_MS)
         );
+        assert!(machine.touched_pane(), "the Escape was delivered");
         assert_eq!(
             machine.next(3, Observation::Tick),
             Action::Prompt("/exit".to_string())
@@ -1220,13 +1449,136 @@ mod tests {
         blocked.status = AgentStatus::Blocked;
         let mut machine = switching(SwitchOptions::default());
         assert!(matches!(
-            machine.next(0, Observation::agent(Some(blocked))),
+            machine.next(0, Observation::agent(Some(blocked.clone()))),
             Action::AskConfirm(_)
         ));
         assert_eq!(
-            machine.next(1, Observation::Confirmed(true)),
+            confirm_with(&mut machine, blocked),
             Action::SendKeys(vec!["esc".to_string()])
         );
+    }
+
+    /// The status that decides between Escape and a bare `/exit` is the one
+    /// seen *after* the confirmation, and anything that is not the confirmed
+    /// agent in an agreed state is refused with nothing sent.
+    #[test]
+    fn the_agent_is_read_again_after_the_confirmation() {
+        // Idle when asked, working by the time the answer came: refused.
+        let mut machine = switching(SwitchOptions::default());
+        machine.next(0, Observation::agent(Some(agent())));
+        let mut working = agent();
+        working.status = AgentStatus::Working;
+        let action = confirm_with(&mut machine, working.clone());
+        assert!(matches!(
+            error_of(&action),
+            SwitchError::AgentWorking { .. }
+        ));
+        assert!(!machine.touched_pane());
+
+        // …unless interrupting was agreed to, in which case Escape leads.
+        let mut machine = switching(SwitchOptions {
+            interrupt: true,
+            ..SwitchOptions::default()
+        });
+        machine.next(0, Observation::agent(Some(agent())));
+        assert_eq!(
+            confirm_with(&mut machine, working),
+            Action::SendKeys(vec!["esc".to_string()])
+        );
+
+        // Idle when asked, blocked now: Escape goes first.
+        let mut machine = switching(SwitchOptions::default());
+        machine.next(0, Observation::agent(Some(agent())));
+        let mut blocked = agent();
+        blocked.status = AgentStatus::Blocked;
+        assert_eq!(
+            confirm_with(&mut machine, blocked),
+            Action::SendKeys(vec!["esc".to_string()])
+        );
+
+        // A different conversation, a renamed agent, another terminal, or no
+        // agent at all: each is a refusal that names what changed.
+        let mut other_session = agent();
+        other_session.session = Some(session("sess-2"));
+        let mut renamed = agent();
+        renamed.name = Some("b2".to_string());
+        let mut moved = agent();
+        moved.terminal_id = "t-9".to_string();
+        let mut silent = agent();
+        silent.session = None;
+        for (changed, expected) in [
+            (Some(other_session), "sess-2"),
+            (Some(renamed), "b2"),
+            (Some(moved), "another terminal"),
+            (Some(silent), "no longer reports"),
+            (None, "no agent"),
+        ] {
+            let mut machine = switching(SwitchOptions::default());
+            machine.next(0, Observation::agent(Some(agent())));
+            assert_eq!(
+                machine.next(0, Observation::Confirmed(true)),
+                Action::PollAgent
+            );
+            let action = machine.next(0, Observation::agent(changed));
+            let SwitchError::AgentChanged { pane_id, detail } = error_of(&action) else {
+                panic!("expected AgentChanged, got {action:?}");
+            };
+            assert_eq!(pane_id, "1:2");
+            assert!(detail.contains(expected), "{detail}");
+            assert!(!machine.touched_pane());
+            assert!(
+                error_of(&action).to_string().contains("nothing was sent"),
+                "{action:?}"
+            );
+        }
+    }
+
+    /// A server that refuses a send wrote nothing to the pane, so the agent is
+    /// untouched; a request lost in transit may have, so it counts as touched.
+    #[test]
+    fn a_refused_send_leaves_the_pane_untouched_but_a_lost_one_does_not() {
+        let mut blocked = agent();
+        blocked.status = AgentStatus::Blocked;
+
+        let mut machine = switching(SwitchOptions::default());
+        machine.next(0, Observation::agent(Some(blocked.clone())));
+        confirm_with(&mut machine, blocked.clone());
+        let action = machine.next(
+            1,
+            Observation::SendRejected {
+                code: "agent_not_ready".to_string(),
+                detail: "not the foreground".to_string(),
+            },
+        );
+        assert!(matches!(error_of(&action), SwitchError::KeysRefused { .. }));
+        assert!(!machine.touched_pane());
+
+        let mut machine = switching(SwitchOptions::default());
+        machine.next(0, Observation::agent(Some(blocked.clone())));
+        confirm_with(&mut machine, blocked);
+        let action = machine.next(
+            1,
+            Observation::SendRejected {
+                code: TRANSPORT_ERROR_CODE.to_string(),
+                detail: "connection reset".to_string(),
+            },
+        );
+        assert!(matches!(error_of(&action), SwitchError::KeysRefused { .. }));
+        assert!(machine.touched_pane());
+
+        // The same for the exit prompt of an idle agent.
+        let mut machine = switching(SwitchOptions::default());
+        machine.next(0, Observation::agent(Some(agent())));
+        confirm_with(&mut machine, agent());
+        let action = machine.next(
+            1,
+            Observation::SendRejected {
+                code: "agent_not_ready".to_string(),
+                detail: "launch pending".to_string(),
+            },
+        );
+        assert!(matches!(error_of(&action), SwitchError::ExitRefused { .. }));
+        assert!(!machine.touched_pane());
     }
 
     /// The server rejects a prompt while the agent is still blocked, which can
@@ -1237,8 +1589,8 @@ mod tests {
         let mut blocked = agent();
         blocked.status = AgentStatus::Blocked;
         let mut machine = switching(SwitchOptions::default());
-        machine.next(0, Observation::agent(Some(blocked)));
-        machine.next(1, Observation::Confirmed(true));
+        machine.next(0, Observation::agent(Some(blocked.clone())));
+        confirm_with(&mut machine, blocked);
 
         let mut escapes = 1;
         let mut action = machine.next(2, Observation::Sent);
@@ -1372,9 +1724,7 @@ mod tests {
             timeout_ms: 1_000,
             ..SwitchOptions::default()
         });
-        machine.next(0, Observation::agent(Some(agent())));
-        machine.next(0, Observation::Confirmed(true));
-        machine.next(0, Observation::Sent);
+        exited(&mut machine);
 
         let busy = || {
             Observation::Pane(PaneReading::Busy {
@@ -1406,19 +1756,79 @@ mod tests {
     #[test]
     fn a_pane_that_became_another_terminal_is_never_typed_into() {
         let mut machine = switching(SwitchOptions::default());
-        machine.next(0, Observation::agent(Some(agent())));
-        machine.next(0, Observation::Confirmed(true));
-        machine.next(0, Observation::Sent);
+        exited(&mut machine);
         let action = machine.next(
             1,
             Observation::Pane(PaneReading::Released {
-                terminal_id: Some("t-9".to_string()),
+                terminal_id: "t-9".to_string(),
             }),
         );
         assert!(matches!(
             error_of(&action),
             SwitchError::PaneReplaced { .. }
         ));
+        let message = error_of(&action).to_string();
+        assert!(message.contains("claude --resume sess-1"), "{message}");
+
+        // The same after the relaunch, while waiting for the hook.
+        let mut machine = switching(SwitchOptions::default());
+        exited(&mut machine);
+        machine.next(1, released());
+        machine.next(2, Observation::launched(Ok(())));
+        let mut moved = agent();
+        moved.terminal_id = "t-9".to_string();
+        let action = machine.next(3, Observation::agent(Some(moved)));
+        assert!(matches!(
+            error_of(&action),
+            SwitchError::PaneReplaced { .. }
+        ));
+    }
+
+    /// A failure after the pane was touched must say how to get the
+    /// conversation back, even when the error itself is a bare API failure.
+    #[test]
+    fn a_failure_after_the_pane_was_touched_carries_a_recovery_hint() {
+        let mut machine = switching(SwitchOptions::default());
+        let api = || SwitchError::Api {
+            method: "agent.get".to_string(),
+            detail: "connection reset".to_string(),
+        };
+
+        // Before preflight nothing is known and nothing was touched.
+        let failure = machine.failure(api());
+        assert_eq!(failure.recovery_hint(), None);
+        assert_eq!(failure.pane_id, None);
+
+        // After the exit was delivered, a bare API failure names the pane and
+        // the resume command.
+        exited(&mut machine);
+        let failure = machine.failure(api());
+        assert!(failure.touched_pane);
+        assert_eq!(failure.pane_id.as_deref(), Some("1:2"));
+        assert_eq!(failure.session_id.as_deref(), Some("sess-1"));
+        let hint = failure
+            .recovery_hint()
+            .expect("a hint after touching the pane");
+        assert!(hint.contains("herdr pane read 1:2"), "{hint}");
+        assert!(hint.contains("claude --resume sess-1"), "{hint}");
+
+        // Errors that already say what the pane holds get no second hint.
+        let failure = machine.failure(SwitchError::AgentStillRunning {
+            name: "a1".to_string(),
+            pane_id: "1:2".to_string(),
+            seconds: 20,
+        });
+        assert_eq!(failure.recovery_hint(), None);
+        let failure = machine.failure(SwitchError::Launch {
+            pane_id: "1:2".to_string(),
+            session_id: "sess-1".to_string(),
+            detail: "pane busy".to_string(),
+        });
+        assert_eq!(failure.recovery_hint(), None);
+        assert!(
+            failure.to_string().contains("claude --resume sess-1"),
+            "{failure}"
+        );
     }
 
     #[test]
@@ -1427,9 +1837,7 @@ mod tests {
             timeout_ms: 500,
             ..SwitchOptions::default()
         });
-        machine.next(0, Observation::agent(Some(agent())));
-        machine.next(0, Observation::Confirmed(true));
-        machine.next(0, Observation::Sent);
+        exited(&mut machine);
         let unreadable = || {
             Observation::Pane(PaneReading::Unreadable {
                 detail: "transport closed".to_string(),
@@ -1449,18 +1857,13 @@ mod tests {
     #[test]
     fn a_failed_relaunch_ends_the_protocol() {
         let mut machine = switching(SwitchOptions::default());
-        machine.next(0, Observation::agent(Some(agent())));
-        machine.next(0, Observation::Confirmed(true));
-        machine.next(0, Observation::Sent);
-        machine.next(
-            1,
-            Observation::Pane(PaneReading::Released {
-                terminal_id: Some("t-1".to_string()),
-            }),
-        );
+        exited(&mut machine);
+        machine.next(1, released());
         let action = machine.next(
             2,
             Observation::launched(Err(SwitchError::Launch {
+                pane_id: "1:2".to_string(),
+                session_id: "sess-1".to_string(),
                 detail: "pane busy".to_string(),
             })),
         );
@@ -1471,15 +1874,8 @@ mod tests {
     #[test]
     fn a_resume_that_started_a_new_conversation_is_a_loud_failure() {
         let mut machine = switching(SwitchOptions::default());
-        machine.next(0, Observation::agent(Some(agent())));
-        machine.next(0, Observation::Confirmed(true));
-        machine.next(0, Observation::Sent);
-        machine.next(
-            1,
-            Observation::Pane(PaneReading::Released {
-                terminal_id: Some("t-1".to_string()),
-            }),
-        );
+        exited(&mut machine);
+        machine.next(1, released());
         machine.next(2, Observation::launched(Ok(())));
 
         let mut fresh = agent();
@@ -1494,21 +1890,42 @@ mod tests {
         assert!(message.contains("still on disk"), "{message}");
     }
 
+    /// Only Claude's own hook proves the resume. A session another
+    /// integration reported on the pane — even with the same value — is
+    /// neither proof nor a mismatch; the machine keeps waiting.
+    #[test]
+    fn a_session_from_another_integration_is_not_taken_as_the_resume() {
+        let mut machine = switching(SwitchOptions::default());
+        exited(&mut machine);
+        machine.next(1, released());
+        machine.next(2, Observation::launched(Ok(())));
+
+        let mut foreign = agent();
+        foreign.session = Some(AgentSessionInfo {
+            source: "herdr:codex".to_string(),
+            agent: "codex".to_string(),
+            kind: AgentSessionRefKind::Id,
+            value: "sess-1".to_string(),
+        });
+        assert_eq!(
+            machine.next(3, Observation::agent(Some(foreign))),
+            Action::Wait(POLL_INTERVAL_MS)
+        );
+        assert_eq!(machine.next(4, Observation::Tick), Action::PollAgent);
+        assert_eq!(
+            machine.next(5, Observation::agent(Some(agent()))),
+            Action::Grade
+        );
+    }
+
     #[test]
     fn a_resume_that_never_reports_fails_naming_what_to_do() {
         let mut machine = switching(SwitchOptions {
             timeout_ms: 1_000,
             ..SwitchOptions::default()
         });
-        machine.next(0, Observation::agent(Some(agent())));
-        machine.next(0, Observation::Confirmed(true));
-        machine.next(0, Observation::Sent);
-        machine.next(
-            1,
-            Observation::Pane(PaneReading::Released {
-                terminal_id: Some("t-1".to_string()),
-            }),
-        );
+        exited(&mut machine);
+        machine.next(1, released());
         machine.next(2, Observation::launched(Ok(())));
 
         let mut silent = agent();
@@ -1531,15 +1948,8 @@ mod tests {
     #[test]
     fn a_graded_mismatch_finishes_with_the_state_recorded() {
         let mut machine = switching(SwitchOptions::default());
-        machine.next(0, Observation::agent(Some(agent())));
-        machine.next(0, Observation::Confirmed(true));
-        machine.next(0, Observation::Sent);
-        machine.next(
-            1,
-            Observation::Pane(PaneReading::Released {
-                terminal_id: Some("t-1".to_string()),
-            }),
-        );
+        exited(&mut machine);
+        machine.next(1, released());
         machine.next(2, Observation::launched(Ok(())));
         machine.next(3, Observation::agent(Some(agent())));
         let action = machine.next(

@@ -1814,3 +1814,215 @@ fn switch_account_refuses_a_missing_target_profile_before_touching_the_pane() {
     );
     assert_eq!(screen(&lab, &pane), before);
 }
+
+/// A `--resume` Claude could not honour starts a *new* conversation. The
+/// switch must refuse to call that a success, tell the user how to get the
+/// old conversation back, and still record where the agent now runs.
+#[test]
+fn switch_account_fails_loudly_when_the_resume_starts_a_new_conversation() {
+    let mut lab = Lab::new("switch-new");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    start_agent_in(
+        &lab,
+        "a1",
+        &pane,
+        &["FAKE_CLAUDE_RESUME=new"],
+        &["--account", DEFAULT_PROFILE],
+    );
+    let before = session_id_of(&lab, "a1");
+
+    let output = lab.herdr(&[
+        "agent",
+        "switch-account",
+        "a1",
+        SECOND_PROFILE,
+        "--yes",
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a resume that did not take is a failure after the protocol started: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stdout_of(&output).is_empty(),
+        "no result may be printed for a lost conversation: {}",
+        stdout_of(&output)
+    );
+    let message = stderr_of(&output);
+    assert!(message.contains("did not take"), "{message}");
+    assert!(
+        message.contains(&format!("claude --resume {before}")),
+        "the message must name the recovery command: {message}"
+    );
+    assert!(
+        message.contains(&format!("running under account {SECOND_PROFILE:?}")),
+        "the relaunched agent's account must still be recorded and said: {message}"
+    );
+
+    // The agent that is there now: a different conversation, on the new
+    // account, and the token says so.
+    let after = agent_of(&lab, "a1");
+    let now = after["agent_session"]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the fresh Claude reports a session: {after:#?}"))
+        .to_string();
+    assert_ne!(now, before, "{after:#?}");
+    assert_eq!(after["tokens"]["account"], SECOND_PROFILE);
+    assert_eq!(after["tokens"]["account_state"], "ok");
+    let launch = last_launch(&lab, SECOND_PROFILE);
+    assert_eq!(launch["session_start_source"], "startup");
+    assert_eq!(launch["session_id"].as_str(), Some(now.as_str()));
+}
+
+/// The relaunch fails outright: Claude cannot find the transcript and exits.
+/// The pane must be left at its shell with the message naming the recovery
+/// command, the note about the exported profile, no agent and no account
+/// claimed — and the recovery it names must actually work, landing on the
+/// new profile because the shell still exports it.
+#[test]
+fn switch_account_leaves_the_shell_usable_when_the_relaunch_fails() {
+    let mut lab = Lab::new("switch-rl");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    start_agent_in(
+        &lab,
+        "a1",
+        &pane,
+        &["FAKE_CLAUDE_RESUME=fail"],
+        &["--account", DEFAULT_PROFILE],
+    );
+    let before = session_id_of(&lab, "a1");
+
+    let output = lab.herdr(&[
+        "agent",
+        "switch-account",
+        "a1",
+        SECOND_PROFILE,
+        "--yes",
+        "--timeout",
+        "5000",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let message = stderr_of(&output);
+    assert!(message.contains("could not restart"), "{message}");
+    assert!(
+        message.contains(&format!("claude --resume {before}")),
+        "{message}"
+    );
+    assert!(
+        message.contains("was already exported"),
+        "the note that the shell still exports the profile: {message}"
+    );
+    assert!(
+        !lab.profile_dir(SECOND_PROFILE)
+            .join("last-launch.json")
+            .exists(),
+        "the failed relaunch never got as far as running under the target profile"
+    );
+
+    // The pane is at its shell with no agent on it.
+    wait_for_prompt(&lab, &pane);
+    let mut released = false;
+    for _ in 0..50 {
+        let gone = lab.herdr(&["agent", "get", "a1"]);
+        if !gone.status.success() && stderr_of(&gone).contains("agent_not_found") {
+            released = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        released,
+        "the failed relaunch must not leave a named agent behind"
+    );
+
+    // Recovery by hand, exactly as the message says. The shell still exports
+    // the new profile, so the resumed Claude lands there.
+    let line = format!("FAKE_CLAUDE_RESUME=ok claude --resume {before}\r");
+    let sent = lab.herdr(&["pane", "send-text", &pane, &line]);
+    assert!(sent.status.success(), "{}", stderr_of(&sent));
+    let mut resumed = false;
+    for _ in 0..80 {
+        if screen(&lab, &pane).contains(&format!("resumed {before}")) {
+            resumed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        resumed,
+        "a hand-typed resume must recover the conversation: {}",
+        screen(&lab, &pane)
+    );
+    let launch = last_launch(&lab, SECOND_PROFILE);
+    assert_eq!(
+        launch["config_dir"].as_str(),
+        lab.profile_dir(SECOND_PROFILE).to_str(),
+        "the export line typed by the switch is still in effect"
+    );
+    assert_eq!(launch["session_id"].as_str(), Some(before.as_str()));
+}
+
+/// With `--interrupt` a working agent is moved: Escape first, then `/exit`,
+/// never a signal — and the conversation still comes back.
+#[test]
+fn switch_account_interrupts_a_working_agent_only_with_the_flag() {
+    let mut lab = Lab::new("switch-int");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    start_agent_in(&lab, "a1", &pane, &[], &["--account", DEFAULT_PROFILE]);
+    let before = session_id_of(&lab, "a1");
+
+    let prompted = lab.herdr(&["agent", "prompt", "a1", "/work"]);
+    assert!(prompted.status.success(), "{}", stderr_of(&prompted));
+    let mut working = false;
+    for _ in 0..60 {
+        if agent_of(&lab, "a1")["agent_status"] == "working" {
+            working = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(working, "the stub never looked working to herdr");
+
+    let output = lab.herdr(&[
+        "agent",
+        "switch-account",
+        "a1",
+        SECOND_PROFILE,
+        "--yes",
+        "--interrupt",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "switch-account --interrupt failed: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let result = json_of(&output);
+    assert_eq!(result["session_id"].as_str(), Some(before.as_str()));
+    assert_eq!(result["account_state"], "ok");
+
+    let screen = screen(&lab, &pane);
+    assert!(
+        screen.contains("fake-claude: interrupted"),
+        "Escape must have reached the agent before /exit: {screen}"
+    );
+    assert!(screen.contains("fake-claude: exiting"), "{screen}");
+    assert!(screen.contains(&format!("resumed {before}")), "{screen}");
+    assert_eq!(agent_of(&lab, "a1")["tokens"]["account"], SECOND_PROFILE);
+}

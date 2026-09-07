@@ -233,6 +233,15 @@ impl AppliedLine {
         &self.plan
     }
 
+    /// Let the guard go without grading, reporting or the notice, because the
+    /// shell that held the line is gone: the pane was replaced by another
+    /// terminal underneath. There is nothing left to warn about, and grading
+    /// a stranger's processes or recording an account on that pane would both
+    /// be claims about a shell that ran nothing of ours.
+    pub fn abandon(mut self) {
+        self.graded = true;
+    }
+
     /// Grade the launch and record it. Called once `agent.start` has reported
     /// the agent ready; taking `self` is what disarms the notice above.
     pub fn finish(mut self) -> LaunchOutcome {
@@ -508,7 +517,10 @@ pub fn switch_account(
     input: SwitchInput,
     confirm: &mut dyn FnMut(&str) -> Confirmation,
     launch: &mut dyn FnMut(&LaunchRequest) -> Result<AppliedLine, SwitchError>,
-) -> Result<SwitchOutcome, SwitchFailure> {
+    // Boxed: the failure carries the error, both ids and the warnings, and a
+    // fat `Err` on every `Result` in the loop is what clippy's
+    // `result_large_err` objects to.
+) -> Result<SwitchOutcome, Box<SwitchFailure>> {
     let mut machine = SwitchMachine::new(input);
     let clock = Instant::now();
     let mut applied: Option<AppliedLine> = None;
@@ -520,26 +532,7 @@ pub fn switch_account(
             Action::Finish(result) => {
                 return match *result {
                     Ok(result) => Ok(SwitchOutcome { result, warnings }),
-                    Err(error) => {
-                        // The relaunch succeeded but the protocol did not: the
-                        // agent really is running under the new profile, so
-                        // record that before failing. Saying nothing would
-                        // leave a running agent with no account at all, which
-                        // reads as "unknown" when it is in fact known.
-                        if let Some(applied) = applied.take() {
-                            let outcome = applied.finish();
-                            warnings.extend(outcome.warnings);
-                            warnings.push(format!(
-                                "the agent is running under account {:?} ({}); the switch failed \
-                                 after it started",
-                                outcome.account, outcome.account_state,
-                            ));
-                        }
-                        Err(SwitchFailure {
-                            error,
-                            touched_pane: machine.touched_pane(),
-                        })
-                    }
+                    Err(error) => Err(conclude(&machine, error, applied.take(), warnings)),
                 };
             }
             Action::AskConfirm(text) => match confirm(&text) {
@@ -551,12 +544,11 @@ pub fn switch_account(
             Action::Prompt(text) => submit_agent_prompt(machine.pane_id(), &text),
             Action::PollAgent => match read_agent(machine.agent_target()) {
                 Ok(snapshot) => Observation::agent(snapshot),
-                Err(error) => {
-                    return Err(SwitchFailure {
-                        error,
-                        touched_pane: machine.touched_pane(),
-                    })
-                }
+                // A read that failed outright (not "no such agent", which is
+                // an observation) ends the protocol the same way any other
+                // failure does, so a relaunched agent is still graded and
+                // recorded rather than forgotten with the guard's note.
+                Err(error) => return Err(conclude(&machine, error, applied.take(), warnings)),
             },
             Action::PollPane => Observation::Pane(read_pane(machine.pane_id())),
             Action::Wait(millis) => {
@@ -572,13 +564,11 @@ pub fn switch_account(
             },
             Action::Grade => {
                 let Some(line) = applied.take() else {
-                    return Err(SwitchFailure {
-                        error: SwitchError::Api {
-                            method: "switch".into(),
-                            detail: "nothing to verify: the relaunch left no record".into(),
-                        },
-                        touched_pane: machine.touched_pane(),
-                    });
+                    let error = SwitchError::Api {
+                        method: "switch".into(),
+                        detail: "nothing to verify: the relaunch left no record".into(),
+                    };
+                    return Err(conclude(&machine, error, None, warnings));
                 };
                 let outcome = line.finish();
                 warnings.extend(outcome.warnings.clone());
@@ -591,9 +581,44 @@ pub fn switch_account(
                 }
             }
         };
-        let now = clock.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let now = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
         action = machine.next(now, observation);
     }
+}
+
+/// Turn a protocol failure into what the caller reports, settling the pane's
+/// environment guard on the way.
+///
+/// When the relaunch had succeeded but the protocol did not (the hook never
+/// reported, or reported another conversation), the agent really is running
+/// under the new profile: it is graded and recorded exactly as a success would
+/// be, and the failure carries a warning saying so. Saying nothing would leave
+/// a running agent with no account at all, which reads as "unknown" when it is
+/// in fact known. The one exception is a pane that is no longer the terminal
+/// the switch started on: there is nothing of ours left to grade there, and
+/// recording an account on it would claim one for a shell that runs nothing.
+fn conclude(
+    machine: &SwitchMachine,
+    error: SwitchError,
+    applied: Option<AppliedLine>,
+    mut warnings: Vec<String>,
+) -> Box<SwitchFailure> {
+    if let Some(applied) = applied {
+        if matches!(error, SwitchError::PaneReplaced { .. }) {
+            applied.abandon();
+        } else {
+            let outcome = applied.finish();
+            warnings.extend(outcome.warnings);
+            warnings.push(format!(
+                "the agent is running under account {:?} ({}); the switch failed after it \
+                 started",
+                outcome.account, outcome.account_state,
+            ));
+        }
+    }
+    let mut failure = machine.failure(error);
+    failure.warnings = warnings;
+    Box::new(failure)
 }
 
 /// Read one agent by target. `Ok(None)` means the target resolves to no agent.
@@ -635,11 +660,13 @@ fn read_agent(target: &str) -> Result<Option<AgentSnapshot>, SwitchError> {
 /// at all. Waiting on only the first would relaunch into a pane the server
 /// still calls busy, after the environment line had already been typed.
 fn read_pane(pane_id: &str) -> PaneReading {
+    // `typed: false`: while the pane is being watched for its shell, nothing
+    // has been typed into it yet, and an error here must not say otherwise.
     let info = match pane_process_info(
         pane_id,
         "cli:accounts:switch:process_info",
         "pane.process_info",
-        true,
+        false,
     ) {
         Ok(info) => info,
         Err(error) => {
@@ -660,8 +687,14 @@ fn read_pane(pane_id: &str) -> PaneReading {
                 agent.agent.as_deref().unwrap_or("running")
             ),
         },
-        Ok(None) => PaneReading::Released {
-            terminal_id: pane_terminal_id(pane_id),
+        // Released only once the pane's identity is known too: a launch is
+        // never allowed on a pane that cannot prove it is still the terminal
+        // the switch started on.
+        Ok(None) => match pane_terminal_id(pane_id) {
+            Some(terminal_id) => PaneReading::Released { terminal_id },
+            None => PaneReading::Unreadable {
+                detail: "pane.get did not report the pane's terminal".to_string(),
+            },
         },
         Err(error) => PaneReading::Unreadable {
             detail: error.to_string(),
@@ -670,8 +703,7 @@ fn read_pane(pane_id: &str) -> PaneReading {
 }
 
 /// The terminal currently attached to a pane, for the check that the switch is
-/// still talking to the pane it started on. `None` when it cannot be read; the
-/// machine treats that as "no evidence of a change", never as a change.
+/// still talking to the pane it started on. `None` when it cannot be read.
 fn pane_terminal_id(pane_id: &str) -> Option<String> {
     let response = crate::cli::send_request(&Request {
         id: "cli:accounts:switch:pane_get".into(),
@@ -714,7 +746,7 @@ fn observation_of_send(response: std::io::Result<serde_json::Value>, method: &st
         // as a rejection to retry: retrying Escape at a server that is not
         // answering would only delay the failure.
         Err(err) => Observation::SendRejected {
-            code: "transport_error".to_string(),
+            code: crate::accounts::switch::TRANSPORT_ERROR_CODE.to_string(),
             detail: format!("{method}: {err}"),
         },
         Ok(response) => match response.get("error") {
