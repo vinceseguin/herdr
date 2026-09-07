@@ -26,6 +26,8 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "wait" => agent_wait(&args[1..]),
         "attach" => agent_attach(&args[1..]),
         "start" => agent_start(&args[1..]),
+        // Fork (E9): move a running Claude agent to another account profile.
+        "switch-account" => agent_switch_account(&args[1..]),
         "explain" => agent_explain(&args[1..]),
         "help" | "--help" | "-h" => {
             print_agent_help();
@@ -382,80 +384,16 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         Err(exit_code) => return Ok(exit_code),
     };
 
-    let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
-    let retryable_timeout = timeout > crate::app::AGENT_START_SETTLE_DELAY
-        && timeout <= crate::app::MAX_AGENT_START_TIMEOUT;
-    let pinned_terminal_id = pane_terminal_id(&pane_id)?;
-    let mut retry_deadline = None;
-    let mut previous_busy_response = None;
-    let mut response = loop {
-        if let Some(previous_busy_response) = previous_busy_response.as_ref() {
-            let retry_expired = retry_deadline.is_some_and(|deadline| Instant::now() >= deadline);
-            if retry_expired
-                || pane_terminal_id(&pane_id)? != pinned_terminal_id
-                || !pane_shell_is_initializing(&pane_id)?
-            {
-                return super::print_response(previous_busy_response);
-            }
-        }
-
-        let response = super::send_request(&Request {
-            id: "cli:agent:start".into(),
-            method: Method::AgentStart(AgentStartParams {
-                name: name.clone(),
-                kind: kind.clone(),
-                pane_id: pane_id.clone(),
-                args: agent_args.clone(),
-                timeout_ms,
-            }),
-        })?;
-        if response.get("error").is_none() {
-            break response;
-        }
-        if response["error"]["code"].as_str() != Some("agent_pane_busy")
-            || !retryable_timeout
-            || pinned_terminal_id.is_none()
-            || pane_terminal_id(&pane_id)? != pinned_terminal_id
-            || !pane_shell_is_initializing(&pane_id)?
-        {
-            return super::print_response(&response);
-        }
-
-        let deadline = *retry_deadline
-            .get_or_insert_with(|| Instant::now() + PANE_SHELL_READINESS_RETRY_TIMEOUT);
-        previous_busy_response = Some(response);
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            if let Some(previous_busy_response) = previous_busy_response.as_ref() {
-                return super::print_response(previous_busy_response);
-            }
-        }
-        std::thread::sleep(AGENT_START_POLL_INTERVAL.min(remaining));
-    };
-
-    let Some(expected_terminal_id) = response["result"]["agent"]["terminal_id"].as_str() else {
-        return super::print_response(&cli_agent_error(
-            "cli:agent:start",
-            "agent_start_failed",
-            "agent start response did not include terminal_id",
-        ));
-    };
-    if pinned_terminal_id
-        .as_deref()
-        .is_some_and(|pinned| pinned != expected_terminal_id)
-    {
-        return super::print_response(&agent_name_lost_error("cli:agent:start", name));
-    }
-    let waited = wait_for_named_agent(
+    let started = start_managed_agent(
         name,
-        &pane_id,
-        timeout,
+        &kind,
         &expected_kind,
-        expected_terminal_id,
-    );
-    match waited {
-        Ok(Ok(agent)) => {
-            response["result"]["agent"] = agent;
+        &pane_id,
+        &agent_args,
+        timeout_ms,
+    )?;
+    match started {
+        Ok(mut response) => {
             // Fork (E9): grade the launch against the process's own
             // environment and record `tokens.account`, then add the two
             // contract keys to the stock response.
@@ -482,10 +420,378 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             }
             Ok(exit_code)
         }
-        Ok(Err(error)) => super::print_response(&error),
-        Err(err) => {
+        Err(AgentStartRefusal::Response(response)) => super::print_response(&response),
+        Err(AgentStartRefusal::Transport(err)) => {
             print_agent_transport_error(err, "cli:agent:start", "agent_start_transport_failed")
         }
+    }
+}
+
+const SWITCH_ACCOUNT_USAGE: &str = "usage: herdr agent switch-account <target> <account> [--yes] [--interrupt] [--force] [--timeout MS] [--json]";
+
+/// Fork (E9): move a running Claude agent to another account profile, keeping
+/// its conversation.
+///
+/// The protocol lives in `crate::accounts::switch`; this function is the
+/// command line around it. Two things it owns and the machine deliberately
+/// does not: whether there is a human to confirm with, and how the relaunch is
+/// carried out (through the same `start_managed_agent` a stock `agent start`
+/// uses).
+///
+/// Exit codes are the contract that matters when this fails:
+///
+/// * `0` — the agent is running under the new profile with the same session;
+/// * `2` — refused before a single byte reached the pane, so the agent is
+///   exactly as it was;
+/// * `1` — the protocol had started; the message says what the pane holds now.
+fn agent_switch_account(args: &[String]) -> std::io::Result<i32> {
+    let mut positional: Vec<&String> = Vec::new();
+    let mut yes = false;
+    let mut interrupt = false;
+    let mut force = false;
+    let mut json = false;
+    let mut timeout_ms = crate::accounts::switch::DEFAULT_TIMEOUT_MS;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--yes" | "-y" => {
+                yes = true;
+                index += 1;
+            }
+            "--interrupt" => {
+                interrupt = true;
+                index += 1;
+            }
+            "--force" => {
+                force = true;
+                index += 1;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "--timeout" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --timeout");
+                    return Ok(2);
+                };
+                timeout_ms = match parse_timeout(value) {
+                    Ok(millis) => millis,
+                    Err(exit_code) => return Ok(exit_code),
+                };
+                if timeout_ms == 0 || timeout_ms > crate::accounts::switch::MAX_TIMEOUT_MS {
+                    eprintln!(
+                        "--timeout must be between 1 and {} ms",
+                        crate::accounts::switch::MAX_TIMEOUT_MS
+                    );
+                    return Ok(2);
+                }
+                index += 2;
+            }
+            "help" | "--help" | "-h" => {
+                eprintln!("{SWITCH_ACCOUNT_USAGE}");
+                return Ok(0);
+            }
+            value if value.starts_with('-') => {
+                eprintln!("unknown option: {value}");
+                return Ok(2);
+            }
+            _ => {
+                positional.push(&args[index]);
+                index += 1;
+            }
+        }
+    }
+
+    let [target, account] = positional.as_slice() else {
+        eprintln!("{SWITCH_ACCOUNT_USAGE}");
+        return Ok(2);
+    };
+    let (target, account) = ((*target).clone(), (*account).clone());
+    if account == crate::accounts::profile::NO_ACCOUNT {
+        eprintln!(
+            "switch-account needs a profile to switch to; `none` only means \"apply no profile\" \
+             at start time"
+        );
+        return Ok(2);
+    }
+
+    let config = crate::config::Config::load().config;
+    let (profiles, diagnostics) = crate::accounts::profile::load_profiles(&config);
+    for diagnostic in &diagnostics {
+        eprintln!("warning: {diagnostic}");
+    }
+    let Some(profile) = profiles.get(&account).cloned() else {
+        eprintln!(
+            "unknown account profile {account:?}; configured: {}",
+            if profiles.is_empty() {
+                "none".to_string()
+            } else {
+                profiles.names().join(", ")
+            }
+        );
+        return Ok(2);
+    };
+    let inspection = crate::accounts::layout::inspect(
+        &profile,
+        crate::accounts::layout::InspectOptions::health(),
+    );
+
+    // The readiness wait of the relaunch follows --timeout when the server
+    // would accept it, so one flag governs the whole command.
+    let start_timeout_ms = (timeout_ms > crate::app::AGENT_START_SETTLE_DELAY.as_millis() as u64
+        && timeout_ms <= crate::app::MAX_AGENT_START_TIMEOUT.as_millis() as u64)
+        .then_some(timeout_ms);
+
+    let input = crate::accounts::switch::SwitchInput {
+        target: target.clone(),
+        to: profile.clone(),
+        to_inspection: inspection,
+        options: crate::accounts::switch::SwitchOptions {
+            interrupt,
+            force,
+            timeout_ms,
+        },
+    };
+
+    let mut confirm = |question: &str| confirm_switch(question, yes);
+    let mut launch = |request: &crate::accounts::switch::LaunchRequest| {
+        relaunch_under_account(&profile, request, start_timeout_ms)
+    };
+
+    let outcome = crate::accounts::client::switch_account(input, &mut confirm, &mut launch);
+    match outcome {
+        Ok(outcome) => {
+            let result = &outcome.result;
+            if json {
+                let rendered = serde_json::json!({
+                    "pane_id": result.pane_id,
+                    "name": result.name,
+                    "from": result.from,
+                    "to": result.to,
+                    "session_id": result.session_id,
+                    "account_state": result.account_state.as_str(),
+                });
+                println!("{rendered}");
+            } else {
+                println!(
+                    "switched {} in pane {} from {} to {} ({}), same session {}",
+                    result.name,
+                    result.pane_id,
+                    result.from.as_deref().unwrap_or("no recorded account"),
+                    result.to,
+                    result.account_state,
+                    result.session_id,
+                );
+            }
+            for warning in &outcome.warnings {
+                eprintln!("warning: {warning}");
+            }
+            if result.account_state == crate::accounts::tokens::AccountState::Mismatch {
+                eprintln!(
+                    "error: agent {:?} resumed session {} but is not running under account {:?}: \
+                     {}. The account token records the mismatch.",
+                    result.name,
+                    result.session_id,
+                    result.to,
+                    result
+                        .mismatch_detail
+                        .as_deref()
+                        .unwrap_or("its environment disagrees"),
+                );
+                return Ok(1);
+            }
+            Ok(0)
+        }
+        Err(failure) => {
+            eprintln!("error: {failure}");
+            // Above all: a relaunched agent that was recorded under the new
+            // account even though the protocol did not finish.
+            for warning in &failure.warnings {
+                eprintln!("warning: {warning}");
+            }
+            if let Some(hint) = failure.recovery_hint() {
+                eprintln!("{hint}");
+            }
+            // The one fact a caller needs to act on: whether the agent was
+            // touched at all.
+            Ok(if failure.touched_pane { 1 } else { 2 })
+        }
+    }
+}
+
+/// Ask before stopping somebody's agent. `--yes` answers for automation; with
+/// no terminal and no `--yes` the answer is "there is nobody to ask", never
+/// an assumed yes.
+fn confirm_switch(question: &str, yes: bool) -> crate::accounts::client::Confirmation {
+    use std::io::{IsTerminal as _, Write as _};
+
+    if yes {
+        return crate::accounts::client::Confirmation::Yes;
+    }
+    if !std::io::stdin().is_terminal() {
+        return crate::accounts::client::Confirmation::Unavailable;
+    }
+    eprint!("{question}\nProceed? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return crate::accounts::client::Confirmation::Unavailable;
+    }
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => crate::accounts::client::Confirmation::Yes,
+        _ => crate::accounts::client::Confirmation::No,
+    }
+}
+
+/// The relaunch half of a switch: the same two-step launch `herdr agent start
+/// --account` performs, with `--resume <id>` in the arguments.
+///
+/// The returned guard owns the fact that the pane's shell now exports the new
+/// profile; the switch driver grades it once the resumed session is proven.
+/// Dropping it on any failure here is deliberate — it prints what the pane is
+/// left holding.
+fn relaunch_under_account(
+    profile: &crate::accounts::profile::AccountProfile,
+    request: &crate::accounts::switch::LaunchRequest,
+    timeout_ms: Option<u64>,
+) -> Result<crate::accounts::client::AppliedLine, crate::accounts::switch::SwitchError> {
+    let launch_error = |detail: String| crate::accounts::switch::SwitchError::Launch {
+        pane_id: request.pane_id.clone(),
+        session_id: request.session_id.clone(),
+        detail,
+    };
+
+    let plan =
+        crate::accounts::client::prepare(profile, &request.pane_id, &request.name, &request.args)
+            .map_err(|error| launch_error(error.to_string()))?;
+    let applied = crate::accounts::client::apply_env(plan)
+        .map_err(|error| launch_error(error.to_string()))?;
+
+    match start_managed_agent(
+        &request.name,
+        crate::accounts::tokens::AGENT_LABEL,
+        crate::accounts::tokens::AGENT_LABEL,
+        &request.pane_id,
+        &request.args,
+        timeout_ms,
+    ) {
+        Ok(Ok(_response)) => Ok(applied),
+        Ok(Err(AgentStartRefusal::Response(response))) => Err(launch_error(
+            response["error"]["message"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| response["error"].to_string()),
+        )),
+        Ok(Err(AgentStartRefusal::Transport(err))) => Err(launch_error(err.to_string())),
+        Err(err) => Err(launch_error(err.to_string())),
+    }
+}
+
+/// Why a managed start did not produce a ready agent.
+pub(crate) enum AgentStartRefusal {
+    /// A response to print; its `error` body says what the server refused.
+    Response(serde_json::Value),
+    /// The readiness wait lost the transport.
+    Transport(std::io::Error),
+}
+
+/// Start a managed agent in a pane and wait for it to become interactive.
+///
+/// This is the stock `agent.start` sequence — including the `agent_pane_busy`
+/// retry that covers a shell still running its rc files, and the terminal-id
+/// pinning that catches a pane replaced underneath — factored out so the
+/// fork's account switch (`herdr agent switch-account`) relaunches an agent
+/// through exactly this code instead of a second copy of the subtlest part of
+/// starting one.
+pub(crate) fn start_managed_agent(
+    name: &str,
+    kind: &str,
+    expected_kind: &str,
+    pane_id: &str,
+    agent_args: &[String],
+    timeout_ms: Option<u64>,
+) -> std::io::Result<Result<serde_json::Value, AgentStartRefusal>> {
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
+    let retryable_timeout = timeout > crate::app::AGENT_START_SETTLE_DELAY
+        && timeout <= crate::app::MAX_AGENT_START_TIMEOUT;
+    let pinned_terminal_id = pane_terminal_id(pane_id)?;
+    let mut retry_deadline = None;
+    let mut previous_busy_response: Option<serde_json::Value> = None;
+    let mut response = loop {
+        if let Some(previous_busy_response) = previous_busy_response.as_ref() {
+            let retry_expired = retry_deadline.is_some_and(|deadline| Instant::now() >= deadline);
+            if retry_expired
+                || pane_terminal_id(pane_id)? != pinned_terminal_id
+                || !pane_shell_is_initializing(pane_id)?
+            {
+                return Ok(Err(AgentStartRefusal::Response(
+                    previous_busy_response.clone(),
+                )));
+            }
+        }
+
+        let response = super::send_request(&Request {
+            id: "cli:agent:start".into(),
+            method: Method::AgentStart(AgentStartParams {
+                name: name.to_owned(),
+                kind: kind.to_owned(),
+                pane_id: pane_id.to_owned(),
+                args: agent_args.to_vec(),
+                timeout_ms,
+            }),
+        })?;
+        if response.get("error").is_none() {
+            break response;
+        }
+        if response["error"]["code"].as_str() != Some("agent_pane_busy")
+            || !retryable_timeout
+            || pinned_terminal_id.is_none()
+            || pane_terminal_id(pane_id)? != pinned_terminal_id
+            || !pane_shell_is_initializing(pane_id)?
+        {
+            return Ok(Err(AgentStartRefusal::Response(response)));
+        }
+
+        let deadline = *retry_deadline
+            .get_or_insert_with(|| Instant::now() + PANE_SHELL_READINESS_RETRY_TIMEOUT);
+        previous_busy_response = Some(response);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            if let Some(previous_busy_response) = previous_busy_response.as_ref() {
+                return Ok(Err(AgentStartRefusal::Response(
+                    previous_busy_response.clone(),
+                )));
+            }
+        }
+        std::thread::sleep(AGENT_START_POLL_INTERVAL.min(remaining));
+    };
+
+    let Some(expected_terminal_id) = response["result"]["agent"]["terminal_id"].as_str() else {
+        return Ok(Err(AgentStartRefusal::Response(cli_agent_error(
+            "cli:agent:start",
+            "agent_start_failed",
+            "agent start response did not include terminal_id",
+        ))));
+    };
+    if pinned_terminal_id
+        .as_deref()
+        .is_some_and(|pinned| pinned != expected_terminal_id)
+    {
+        return Ok(Err(AgentStartRefusal::Response(agent_name_lost_error(
+            "cli:agent:start",
+            name,
+        ))));
+    }
+    let waited = wait_for_named_agent(name, pane_id, timeout, expected_kind, expected_terminal_id);
+    match waited {
+        Ok(Ok(agent)) => {
+            response["result"]["agent"] = agent;
+            Ok(Ok(response))
+        }
+        Ok(Err(error)) => Ok(Err(AgentStartRefusal::Response(error))),
+        Err(err) => Ok(Err(AgentStartRefusal::Transport(err))),
     }
 }
 
@@ -1054,6 +1360,7 @@ fn print_agent_help() {
     eprintln!(
         "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
     );
+    eprintln!("  herdr agent switch-account <target> <account> [--yes] [--interrupt] [--force] [--timeout MS] [--json]");
     eprintln!("  herdr agent explain <target> [--json|--format text|json] [--verbose]");
     eprintln!(
         "  herdr agent explain --file PATH --agent LABEL [--json|--format text|json] [--verbose]"

@@ -38,13 +38,17 @@ use std::time::{Duration, Instant};
 use crate::accounts::launch::{pane_shell_at_prompt, plan_launch, LaunchError, LaunchPlan};
 use crate::accounts::layout::{inspect, InspectOptions};
 use crate::accounts::profile::{AccountProfile, Choice, ChoiceError, Profiles};
+use crate::accounts::switch::{
+    Action, AgentSnapshot, LaunchRequest, Observation, PaneReading, SwitchError, SwitchFailure,
+    SwitchInput, SwitchMachine, SwitchResult,
+};
 use crate::accounts::tokens::{
     AccountState, ACCOUNT_STATE_TOKEN, ACCOUNT_TOKEN, AGENT_LABEL, APPLIES_TO_SOURCE,
     METADATA_SOURCE,
 };
 use crate::api::schema::{
-    Method, PaneProcessInfo, PaneProcessInfoParams, PaneReportMetadataParams, PaneSendTextParams,
-    Request,
+    AgentInfo, AgentPromptParams, AgentSendKeysParams, AgentTarget, Method, PaneProcessInfo,
+    PaneProcessInfoParams, PaneReportMetadataParams, PaneSendTextParams, PaneTarget, Request,
 };
 use crate::platform::ProcessEnvVar;
 
@@ -227,6 +231,15 @@ impl AppliedLine {
     /// [`AppliedLine::finish`] consumes the guard.
     pub fn plan(&self) -> &LaunchPlan {
         &self.plan
+    }
+
+    /// Let the guard go without grading, reporting or the notice, because the
+    /// shell that held the line is gone: the pane was replaced by another
+    /// terminal underneath. There is nothing left to warn about, and grading
+    /// a stranger's processes or recording an account on that pane would both
+    /// be claims about a shell that ran nothing of ours.
+    pub fn abandon(mut self) {
+        self.graded = true;
     }
 
     /// Grade the launch and record it. Called once `agent.start` has reported
@@ -462,6 +475,290 @@ pub fn report(plan: &LaunchPlan, state: AccountState) -> Result<(), String> {
     match response.get("error") {
         Some(error) => Err(error.to_string()),
         None => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The switch driver (PR 5).
+//
+// `crate::accounts::switch` decides *what* to do; this half carries it out
+// against a stock server. Keeping the two apart is what makes every failure
+// path of a command that can lose a conversation testable without a pty.
+//
+// Two steps are handed back to the caller as closures rather than done here:
+// asking the user (only the CLI knows whether there is a terminal, and PR 8's
+// TUI will ask in a modal) and the relaunch itself (which has to run the stock
+// `agent.start` retry loop that lives in `crate::cli::agent`, rather than grow
+// a second copy of it here).
+// ---------------------------------------------------------------------------
+
+/// What the user said when asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirmation {
+    Yes,
+    No,
+    /// Nobody could be asked: not a terminal, and no `--yes`.
+    Unavailable,
+}
+
+/// A finished switch, plus anything worth telling the user that did not stop
+/// it (a profile with no hook, a metadata report the server refused).
+pub struct SwitchOutcome {
+    pub result: SwitchResult,
+    pub warnings: Vec<String>,
+}
+
+/// Run the switch protocol against the local server.
+///
+/// `confirm` is asked exactly once, before anything is sent. `launch` performs
+/// the two-step relaunch and hands back the guard that owns the pane's new
+/// environment; it is graded here, once the resumed session has been proven.
+pub fn switch_account(
+    input: SwitchInput,
+    confirm: &mut dyn FnMut(&str) -> Confirmation,
+    launch: &mut dyn FnMut(&LaunchRequest) -> Result<AppliedLine, SwitchError>,
+    // Boxed: the failure carries the error, both ids and the warnings, and a
+    // fat `Err` on every `Result` in the loop is what clippy's
+    // `result_large_err` objects to.
+) -> Result<SwitchOutcome, Box<SwitchFailure>> {
+    let mut machine = SwitchMachine::new(input);
+    let clock = Instant::now();
+    let mut applied: Option<AppliedLine> = None;
+    let mut warnings: Vec<String> = Vec::new();
+    let mut action = machine.start();
+
+    loop {
+        let observation = match action {
+            Action::Finish(result) => {
+                return match *result {
+                    Ok(result) => Ok(SwitchOutcome { result, warnings }),
+                    Err(error) => Err(conclude(&machine, error, applied.take(), warnings)),
+                };
+            }
+            Action::AskConfirm(text) => match confirm(&text) {
+                Confirmation::Yes => Observation::Confirmed(true),
+                Confirmation::No => Observation::Confirmed(false),
+                Confirmation::Unavailable => Observation::ConfirmUnavailable,
+            },
+            Action::SendKeys(keys) => send_agent_keys(machine.pane_id(), keys),
+            Action::Prompt(text) => submit_agent_prompt(machine.pane_id(), &text),
+            Action::PollAgent => match read_agent(machine.agent_target()) {
+                Ok(snapshot) => Observation::agent(snapshot),
+                // A read that failed outright (not "no such agent", which is
+                // an observation) ends the protocol the same way any other
+                // failure does, so a relaunched agent is still graded and
+                // recorded rather than forgotten with the guard's note.
+                Err(error) => return Err(conclude(&machine, error, applied.take(), warnings)),
+            },
+            Action::PollPane => Observation::Pane(read_pane(machine.pane_id())),
+            Action::Wait(millis) => {
+                std::thread::sleep(Duration::from_millis(millis));
+                Observation::Tick
+            }
+            Action::Launch(request) => match launch(&request) {
+                Ok(line) => {
+                    applied = Some(line);
+                    Observation::launched(Ok(()))
+                }
+                Err(error) => Observation::launched(Err(error)),
+            },
+            Action::Grade => {
+                let Some(line) = applied.take() else {
+                    let error = SwitchError::Api {
+                        method: "switch".into(),
+                        detail: "nothing to verify: the relaunch left no record".into(),
+                    };
+                    return Err(conclude(&machine, error, None, warnings));
+                };
+                let outcome = line.finish();
+                warnings.extend(outcome.warnings.clone());
+                Observation::Graded {
+                    state: outcome.account_state,
+                    detail: match outcome.account_state {
+                        AccountState::Mismatch => Some(outcome.mismatch_detail()),
+                        _ => None,
+                    },
+                }
+            }
+        };
+        let now = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+        action = machine.next(now, observation);
+    }
+}
+
+/// Turn a protocol failure into what the caller reports, settling the pane's
+/// environment guard on the way.
+///
+/// When the relaunch had succeeded but the protocol did not (the hook never
+/// reported, or reported another conversation), the agent really is running
+/// under the new profile: it is graded and recorded exactly as a success would
+/// be, and the failure carries a warning saying so. Saying nothing would leave
+/// a running agent with no account at all, which reads as "unknown" when it is
+/// in fact known. The one exception is a pane that is no longer the terminal
+/// the switch started on: there is nothing of ours left to grade there, and
+/// recording an account on it would claim one for a shell that runs nothing.
+fn conclude(
+    machine: &SwitchMachine,
+    error: SwitchError,
+    applied: Option<AppliedLine>,
+    mut warnings: Vec<String>,
+) -> Box<SwitchFailure> {
+    if let Some(applied) = applied {
+        if matches!(error, SwitchError::PaneReplaced { .. }) {
+            applied.abandon();
+        } else {
+            let outcome = applied.finish();
+            warnings.extend(outcome.warnings);
+            warnings.push(format!(
+                "the agent is running under account {:?} ({}); the switch failed after it \
+                 started",
+                outcome.account, outcome.account_state,
+            ));
+        }
+    }
+    let mut failure = machine.failure(error);
+    failure.warnings = warnings;
+    Box::new(failure)
+}
+
+/// Read one agent by target. `Ok(None)` means the target resolves to no agent.
+fn read_agent(target: &str) -> Result<Option<AgentSnapshot>, SwitchError> {
+    let response = crate::cli::send_request(&Request {
+        id: "cli:accounts:switch:agent_get".into(),
+        method: Method::AgentGet(AgentTarget {
+            target: target.to_owned(),
+        }),
+    })
+    .map_err(|err| SwitchError::Api {
+        method: "agent.get".into(),
+        detail: err.to_string(),
+    })?;
+    if let Some(error) = response.get("error") {
+        if error["code"].as_str() == Some("agent_not_found") {
+            return Ok(None);
+        }
+        return Err(SwitchError::Api {
+            method: "agent.get".into(),
+            detail: error.to_string(),
+        });
+    }
+    let info: AgentInfo =
+        serde_json::from_value(response["result"]["agent"].clone()).map_err(|err| {
+            SwitchError::Api {
+                method: "agent.get".into(),
+                detail: format!("unreadable agent: {err}"),
+            }
+        })?;
+    Ok(Some(AgentSnapshot::from_agent_info(&info)))
+}
+
+/// Is the pane back to being a plain shell herdr may start an agent in?
+///
+/// Two independent facts, and both are needed. The process table says the
+/// Claude process is gone; `agent.get` says the *server* has released the
+/// terminal, which is what `agent.start` checks before it will accept the pane
+/// at all. Waiting on only the first would relaunch into a pane the server
+/// still calls busy, after the environment line had already been typed.
+fn read_pane(pane_id: &str) -> PaneReading {
+    // `typed: false`: while the pane is being watched for its shell, nothing
+    // has been typed into it yet, and an error here must not say otherwise.
+    let info = match pane_process_info(
+        pane_id,
+        "cli:accounts:switch:process_info",
+        "pane.process_info",
+        false,
+    ) {
+        Ok(info) => info,
+        Err(error) => {
+            return PaneReading::Unreadable {
+                detail: error.to_string(),
+            }
+        }
+    };
+    if let Err(error) = pane_shell_at_prompt(&info) {
+        return PaneReading::Busy {
+            detail: error.to_string(),
+        };
+    }
+    match read_agent(pane_id) {
+        Ok(Some(agent)) => PaneReading::Busy {
+            detail: format!(
+                "the server still holds a {} agent on this pane",
+                agent.agent.as_deref().unwrap_or("running")
+            ),
+        },
+        // Released only once the pane's identity is known too: a launch is
+        // never allowed on a pane that cannot prove it is still the terminal
+        // the switch started on.
+        Ok(None) => match pane_terminal_id(pane_id) {
+            Some(terminal_id) => PaneReading::Released { terminal_id },
+            None => PaneReading::Unreadable {
+                detail: "pane.get did not report the pane's terminal".to_string(),
+            },
+        },
+        Err(error) => PaneReading::Unreadable {
+            detail: error.to_string(),
+        },
+    }
+}
+
+/// The terminal currently attached to a pane, for the check that the switch is
+/// still talking to the pane it started on. `None` when it cannot be read.
+fn pane_terminal_id(pane_id: &str) -> Option<String> {
+    let response = crate::cli::send_request(&Request {
+        id: "cli:accounts:switch:pane_get".into(),
+        method: Method::PaneGet(PaneTarget {
+            pane_id: pane_id.to_owned(),
+        }),
+    })
+    .ok()?;
+    response["result"]["pane"]["terminal_id"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn send_agent_keys(pane_id: &str, keys: Vec<String>) -> Observation {
+    let response = crate::cli::send_request(&Request {
+        id: "cli:accounts:switch:send_keys".into(),
+        method: Method::AgentSendKeys(AgentSendKeysParams {
+            target: pane_id.to_owned(),
+            keys,
+        }),
+    });
+    observation_of_send(response, "agent.send_keys")
+}
+
+fn submit_agent_prompt(pane_id: &str, text: &str) -> Observation {
+    let response = crate::cli::send_request(&Request {
+        id: "cli:accounts:switch:prompt".into(),
+        method: Method::AgentPrompt(AgentPromptParams {
+            target: pane_id.to_owned(),
+            text: text.to_owned(),
+            wait: None,
+        }),
+    });
+    observation_of_send(response, "agent.prompt")
+}
+
+fn observation_of_send(response: std::io::Result<serde_json::Value>, method: &str) -> Observation {
+    match response {
+        // A transport failure is reported with a code of its own rather than
+        // as a rejection to retry: retrying Escape at a server that is not
+        // answering would only delay the failure.
+        Err(err) => Observation::SendRejected {
+            code: crate::accounts::switch::TRANSPORT_ERROR_CODE.to_string(),
+            detail: format!("{method}: {err}"),
+        },
+        Ok(response) => match response.get("error") {
+            Some(error) => Observation::SendRejected {
+                code: error["code"].as_str().unwrap_or("error").to_string(),
+                detail: error["message"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| error.to_string()),
+            },
+            None => Observation::Sent,
+        },
     }
 }
 

@@ -14,10 +14,14 @@
 //! profile health and the agents running on it, and [`tokens`] the metadata
 //! vocabulary reported back to the server.
 //!
-//! Those seven are pure: sync, socket-free, and free of `tokio`, `ratatui` and
+//! [`switch`] is the protocol that moves a *running* agent to another
+//! account without losing its conversation, expressed as a state machine over
+//! observations.
+//!
+//! Those eight are pure: sync, socket-free, and free of `tokio`, `ratatui` and
 //! the client. [`client`] is the one runtime driver — it composes stock API
-//! methods into the two-step launch — and the architecture test below keeps
-//! the split honest.
+//! methods into the two-step launch and drives [`switch`] — and the
+//! architecture test below keeps the split honest.
 
 pub mod client;
 pub mod config;
@@ -26,6 +30,7 @@ pub mod layout;
 pub mod profile;
 pub mod status;
 pub mod store;
+pub mod switch;
 pub mod tokens;
 
 #[cfg(test)]
@@ -33,13 +38,14 @@ mod tests {
     /// Modules that must stay pure data, and the paths that would end that.
     /// Precedent: `scripts/test_ui_hot_path_architecture.py` guards the render
     /// hot path the same way.
-    const PURE_MODULES: [(&str, &str); 7] = [
+    const PURE_MODULES: [(&str, &str); 8] = [
         ("config.rs", include_str!("config.rs")),
         ("launch.rs", include_str!("launch.rs")),
         ("layout.rs", include_str!("layout.rs")),
         ("profile.rs", include_str!("profile.rs")),
         ("status.rs", include_str!("status.rs")),
         ("store.rs", include_str!("store.rs")),
+        ("switch.rs", include_str!("switch.rs")),
         ("tokens.rs", include_str!("tokens.rs")),
     ];
 
