@@ -44,6 +44,12 @@ pub struct HostReport {
     pub connection: ConnectionReport,
     /// Boot of the server the last snapshot came from, if any.
     pub boot_id: Option<String>,
+    /// Revision of the last snapshot, if any.
+    ///
+    /// Comparable only within one *client connection*: the server restarts it
+    /// at 1 for each connection while `boot_id` outlives them all, so a host
+    /// that reconnects reports a lower revision on the same boot. A reader
+    /// must not treat it as a monotonic freshness counter.
     pub revision: Option<u64>,
     pub counts: AgentRollup,
     /// Workspaces of the last snapshot. Kept while a host is unavailable so a

@@ -1519,6 +1519,17 @@ pub(crate) mod test_support {
         Serve(Vec<ServerMessage>),
         /// Welcome then hang up on the first connection; serve afterwards.
         DropFirstConnection(Vec<ServerMessage>),
+        /// Serve `first`, hang up, then serve `second` on every later
+        /// connection.
+        ///
+        /// A real server counts `ClientShellSnapshot::revision` per *client
+        /// connection* and restarts it at 1, while `boot_id` only changes when
+        /// the server itself restarts — so a host that loses its connection
+        /// and comes back reseeds below the revision the client already holds.
+        Reconnects {
+            first: Vec<ServerMessage>,
+            second: Vec<ServerMessage>,
+        },
         /// Answer with a welcome this client must refuse.
         Incompatible,
         /// Accept the connection and never answer the hello.
@@ -1661,6 +1672,8 @@ pub(crate) mod test_support {
             Behaviour::Incompatible => return,
             Behaviour::Silent => return,
             Behaviour::DropFirstConnection(_) if index == 0 => return,
+            Behaviour::Reconnects { first, .. } if index == 0 => first,
+            Behaviour::Reconnects { second, .. } => second,
             Behaviour::Serve(messages)
             | Behaviour::DropFirstConnection(messages)
             | Behaviour::Answer { messages, .. } => messages,
@@ -1669,6 +1682,11 @@ pub(crate) mod test_support {
             if protocol::write_message(stream, message).is_err() {
                 return;
             }
+        }
+        // The first connection of a `Reconnects` host serves its messages and
+        // then hangs up, the way an ssh bridge dies under a live server.
+        if matches!(behaviour, Behaviour::Reconnects { .. }) && index == 0 {
+            return;
         }
         // Keep the connection alive, recording whatever the client sends.
         while !stop.load(Ordering::Acquire) {
@@ -1877,7 +1895,7 @@ mod tests {
     use super::*;
 
     use crate::fleet::hosts::HostKind;
-    use crate::fleet::state::{FleetState, HostConnection};
+    use crate::fleet::state::{FleetChange, FleetState, HostConnection};
     use crate::fleet::transport::LocalTransport;
 
     /// The daemon options: passive hello, batch-mode ssh, everything else as
@@ -2209,6 +2227,73 @@ mod tests {
             "the second attempt must be reported: {attempts:?}"
         );
         assert!(alpha.connections() >= 2, "the host must be reconnected");
+        connector.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reconnect-lag regression, end to end through the connector.
+    ///
+    /// The host hangs up under a live server and reseeds at revision 1. The
+    /// old rule dropped that seed as stale and left the fleet showing the
+    /// pre-outage snapshot until the host published again — which a quiet
+    /// agent never does.
+    #[test]
+    fn a_reconnecting_hosts_lower_revision_seed_reaches_the_state() {
+        let dir = scratch_dir("reseed");
+        let mut reseeded = snapshot("boot-alpha", 1);
+        reseeded.focused_pane_id = Some("w9:p9".to_string());
+        let alpha = FakeHost::start(
+            &dir,
+            "alpha",
+            Behaviour::Reconnects {
+                first: vec![snapshot_message(&snapshot("boot-alpha", 5))],
+                second: vec![snapshot_message(&reseeded)],
+            },
+        );
+        let mut state = FleetState::new(vec![alpha.spec("alpha")]);
+        let mut connector = fake_connector(&[("alpha", &alpha)], FleetConnectorOptions::default());
+        let id = HostId::new("alpha").expect("valid host id");
+
+        let reseeded_landed = |state: &FleetState| {
+            state.host(&id).is_some_and(|host| {
+                host.connection.is_connected()
+                    && host.snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot.focused_pane_id.as_deref() == Some("w9:p9")
+                    })
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut revisions = Vec::new();
+        while Instant::now() < deadline && !reseeded_landed(&state) {
+            let Some(events) = connector.events() else {
+                break;
+            };
+            match events.try_recv() {
+                Ok(FleetEvent::Host { host, event }) => {
+                    for change in state.apply(&host, event) {
+                        if let FleetChange::Snapshot { revision, .. } = change {
+                            revisions.push(revision);
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        assert!(
+            reseeded_landed(&state),
+            "the reconnect's own snapshot must reach the state; revisions seen: {revisions:?}"
+        );
+        assert_eq!(
+            revisions,
+            vec![5, 1],
+            "both snapshots must be published, the reconnect's last"
+        );
         connector.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

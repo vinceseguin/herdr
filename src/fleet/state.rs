@@ -88,6 +88,14 @@ impl HostConnection {
 }
 
 /// Something one host's transport observed, in [`FleetState::apply`] terms.
+///
+/// One host's events come from one supervisor thread over one channel, so
+/// [`FleetState::apply`] folds them in the order that host's connections
+/// produced them. That order is load-bearing, not incidental: a snapshot
+/// belongs to the connection whose `Connected` most recently preceded it (see
+/// [`HostState::awaiting_baseline`]), so a producer that reordered, replayed or
+/// interleaved one host's events would let a dead connection's snapshot pass as
+/// a live one's baseline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostEvent {
     Connecting {
@@ -172,6 +180,31 @@ pub struct HostState {
     pub snapshot: Option<Box<ClientShellSnapshot>>,
     pub rollup: AgentRollup,
     seen: HashMap<String, SeenAgent>,
+    /// Whether the live connection still owes this host its first snapshot.
+    ///
+    /// A server counts `ClientShellSnapshot::revision` per *client
+    /// connection*, restarting at 1 for each one (`ClientShellConnected` seeds
+    /// `shell_projection_revision = 1`), while `boot_id` only changes when the
+    /// server itself restarts. So revisions are comparable within one
+    /// connection, never across two — and a host can lose its connection
+    /// without rebooting, which is what an ssh host does whenever its bridge
+    /// dies.
+    ///
+    /// Upstream's multi-machine client draws the same line with
+    /// `ClientShellEndpoint::snapshot_generation` ("connection generation that
+    /// produced `snapshot`"), which gates its monotonic revision rule on the
+    /// held snapshot having come from the connection now delivering. This flag
+    /// is that comparison in one bit: set by every [`HostEvent::Connected`],
+    /// cleared by the first snapshot that lands *and by every other connection
+    /// state*, so it is true exactly while the live connection has said nothing
+    /// yet — and never while the host is down, where a straggler has only the
+    /// ordinary rule to stop it.
+    ///
+    /// Without it the fresh connection's seed — the only message carrying
+    /// everything that changed while the host was gone — is dropped as stale,
+    /// and a host that then goes quiet stays wrong for as long as it stays
+    /// quiet.
+    awaiting_baseline: bool,
 }
 
 impl HostState {
@@ -193,6 +226,9 @@ impl HostState {
             snapshot: None,
             rollup: AgentRollup::default(),
             seen: HashMap::new(),
+            // No connection has been made yet, and no snapshot is held, so the
+            // flag is irrelevant until the first `Connected` sets it.
+            awaiting_baseline: false,
         }
     }
 
@@ -288,6 +324,12 @@ pub enum FleetChange {
         #[serde(with = "connection_serde")]
         connection: HostConnection,
     },
+    /// A host replaced its projection.
+    ///
+    /// `revision` is the server's per-*connection* counter, so it restarts at 1
+    /// whenever a host reconnects and can go backwards on an unchanged
+    /// `boot_id`. A reader must treat this delta as "newer", never compare two
+    /// of them to decide which is.
     Snapshot {
         host: HostId,
         boot_id: String,
@@ -431,25 +473,49 @@ impl FleetState {
         };
         match event {
             HostEvent::Connecting { attempt } => {
+                self.set_awaiting_baseline(index, false);
                 self.set_connection(index, HostConnection::Connecting { attempt })
             }
             HostEvent::Connected {
                 server_version,
                 methods,
-            } => self.set_connection(
-                index,
-                HostConnection::Connected {
-                    server_version,
-                    methods,
-                },
-            ),
+            } => {
+                // A new connection restarts the host's projection revisions,
+                // so whatever it seeds is the new baseline. Marked here rather
+                // than inside `set_connection`, which drops a transition it
+                // considers a no-op: two connections can report the same
+                // version and the same methods, and the second one is still a
+                // second one.
+                self.set_awaiting_baseline(index, true);
+                self.set_connection(
+                    index,
+                    HostConnection::Connected {
+                        server_version,
+                        methods,
+                    },
+                )
+            }
             HostEvent::Unavailable { reason, retry_in } => {
+                self.set_awaiting_baseline(index, false);
                 self.set_connection(index, HostConnection::Unavailable { reason, retry_in })
             }
             HostEvent::Incompatible { generation, reason } => {
+                self.set_awaiting_baseline(index, false);
                 self.set_connection(index, HostConnection::Incompatible { generation, reason })
             }
             HostEvent::Snapshot(snapshot) => self.set_snapshot(index, snapshot),
+        }
+    }
+
+    /// Record whether this host's live connection still owes it a snapshot.
+    ///
+    /// Every connection state that is not `Connected` clears it, so the
+    /// baseline amnesty of [`HostState::awaiting_baseline`] can never outlive
+    /// the connection that opened it: while a host is down, a snapshot has to
+    /// clear the ordinary staleness rule like any other.
+    fn set_awaiting_baseline(&mut self, index: usize, awaiting: bool) {
+        if let Some(host) = self.hosts.get_mut(index) {
+            host.awaiting_baseline = awaiting;
         }
     }
 
@@ -574,9 +640,18 @@ impl FleetState {
         // revision is stale and dropped; any new boot_id replaces outright. An
         // equal revision is a resend, folded in again — nothing advanced, so it
         // yields no agent deltas.
-        if host.snapshot.as_ref().is_some_and(|current| {
-            current.boot_id == snapshot.boot_id && snapshot.revision < current.revision
-        }) {
+        //
+        // That rule only holds *within one connection*. The server restarts
+        // `revision` at 1 for every client connection while `boot_id` outlives
+        // them all, so the first snapshot of a fresh connection is the new
+        // baseline however low its number is. Upstream gates the same rule on
+        // `ClientShellEndpoint::snapshot_generation`; the fleet gates it on
+        // [`HostState::awaiting_baseline`].
+        if !host.awaiting_baseline
+            && host.snapshot.as_ref().is_some_and(|current| {
+                current.boot_id == snapshot.boot_id && snapshot.revision < current.revision
+            })
+        {
             return Vec::new();
         }
         let host_id = host.spec.id.clone();
@@ -603,6 +678,9 @@ impl FleetState {
         // where the previous boot's recency is worthless but the agents it had
         // are still leaving the merged list and owe their readers a removal.
         let previous_seen = std::mem::take(&mut host.seen);
+        // This snapshot is the connection's baseline; every later one on the
+        // same connection is compared against it again.
+        host.awaiting_baseline = false;
         host.snapshot = Some(snapshot);
 
         let mut rollup = AgentRollup::default();
@@ -839,8 +917,11 @@ impl FleetState {
     ///
     /// Two hosts report the *same* `boot_id`, the same `w1:p1` pane id and the
     /// same `state_change_seq`; one of them is `Incompatible` while holding a
-    /// snapshot; and `active_host` names a disabled host (reachable only by
-    /// construction, never through [`FleetState::set_active_host`]).
+    /// snapshot; one is `Connected` on a *second* connection whose baseline
+    /// snapshot has not arrived, so the snapshot it holds and the revisions it
+    /// will report next are not comparable; and `active_host` names a disabled
+    /// host (reachable only by construction, never through
+    /// [`FleetState::set_active_host`]).
     pub fn test_with_adversarial_identity_state() -> Self {
         let mut state = Self::new(vec![
             HostSpec::local_default(),
@@ -900,6 +981,23 @@ impl FleetState {
                 reason: "endpoint generation 2".to_string(),
             },
         );
+        // `local` loses its connection and comes back on a new one: it is
+        // `Connected` while every revision it holds belongs to the connection
+        // before, which is exactly the state the reconnect-lag rule turns on.
+        state.apply(
+            &local,
+            HostEvent::Unavailable {
+                reason: "host closed the connection".to_string(),
+                retry_in: Some(Duration::from_secs(1)),
+            },
+        );
+        state.apply(
+            &local,
+            HostEvent::Connected {
+                server_version: "0.8.2-fork".to_string(),
+                methods: vec!["pane.write".to_string()],
+            },
+        );
         state.active_host = Some(HostId::new("off").expect("valid host name"));
         state
     }
@@ -939,6 +1037,15 @@ impl FleetState {
                     host.id()
                 );
             }
+            // The baseline amnesty is a property of a live connection: a host
+            // that is not connected has no connection whose first snapshot is
+            // still owed, so a snapshot arriving now faces the ordinary rule.
+            assert!(
+                !host.awaiting_baseline || host.connection.is_connected(),
+                "host {} awaits a baseline snapshot while {}",
+                host.id(),
+                host.connection.state_name()
+            );
         }
 
         let merged = self.compute_merged();
@@ -1134,6 +1241,197 @@ mod tests {
                 .map(|s| s.revision),
             Some(5)
         );
+        state.assert_invariants_for_test();
+    }
+
+    /// The reconnect-lag regression: a host that reconnects without rebooting.
+    ///
+    /// A server counts `revision` per client connection and restarts it at 1,
+    /// while `boot_id` only changes when the *server* restarts. An ssh host
+    /// whose bridge dies and comes back is therefore the same boot on a new
+    /// connection, seeding a revision below the one already held — and that
+    /// seed is the only message carrying what changed while it was gone.
+    #[test]
+    fn a_reconnects_first_snapshot_lands_even_below_the_revision_it_held() {
+        let (mut state, _, workbox) = two_connected_hosts();
+        state.apply(
+            &workbox,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                5,
+                vec![agent("w1:p1", AgentStatus::Idle, 1)],
+            )),
+        );
+
+        // The bridge dies; the server keeps running, so the boot id is intact.
+        state.apply(
+            &workbox,
+            HostEvent::Unavailable {
+                reason: "host closed the connection".to_string(),
+                retry_in: Some(Duration::from_secs(1)),
+            },
+        );
+        // While it was gone the agent turned blocked, and then went quiet: the
+        // reconnect's seed is the only snapshot that will ever say so.
+        connected(&mut state, &workbox);
+        let changes = state.apply(
+            &workbox,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                1,
+                vec![agent("w1:p1", AgentStatus::Blocked, 2)],
+            )),
+        );
+
+        assert!(
+            changes
+                .iter()
+                .any(|change| matches!(change, FleetChange::Snapshot { revision: 1, .. })),
+            "the reconnect's first snapshot must be published: {changes:?}"
+        );
+        assert_eq!(
+            state
+                .host(&workbox)
+                .and_then(|host| host.snapshot.as_ref())
+                .map(|snapshot| snapshot.revision),
+            Some(1),
+            "the reconnect's snapshot must become the held one"
+        );
+        assert_eq!(
+            state.totals().blocked,
+            1,
+            "a status change made during the outage must reach the roll-up"
+        );
+        state.assert_invariants_for_test();
+    }
+
+    /// The baseline is per connection, not a permanent amnesty: once the
+    /// reconnect's own snapshot has landed, the ordinary staleness rule is
+    /// back for every later snapshot on that connection.
+    #[test]
+    fn after_a_reconnects_first_snapshot_a_lower_revision_is_stale_again() {
+        let (mut state, _, workbox) = two_connected_hosts();
+        state.apply(
+            &workbox,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                5,
+                vec![agent("w1:p1", AgentStatus::Idle, 1)],
+            )),
+        );
+        state.apply(
+            &workbox,
+            HostEvent::Unavailable {
+                reason: "host closed the connection".to_string(),
+                retry_in: None,
+            },
+        );
+        connected(&mut state, &workbox);
+        state.apply(
+            &workbox,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                2,
+                vec![agent("w1:p1", AgentStatus::Blocked, 2)],
+            )),
+        );
+
+        let changes = state.apply(
+            &workbox,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                1,
+                vec![agent("w1:p1", AgentStatus::Idle, 1)],
+            )),
+        );
+        assert!(
+            changes.is_empty(),
+            "a lower revision on the same connection is still stale: {changes:?}"
+        );
+        assert_eq!(
+            state
+                .host(&workbox)
+                .and_then(|host| host.snapshot.as_ref())
+                .map(|snapshot| snapshot.revision),
+            Some(2)
+        );
+        assert_eq!(state.totals().blocked, 1);
+        state.assert_invariants_for_test();
+    }
+
+    /// The amnesty belongs to a connection, not to the host.
+    ///
+    /// A host that connects and drops again before saying anything must not
+    /// carry it into the gap: while the host is down the ordinary staleness
+    /// rule is the only thing between a straggler and the fleet's view of it,
+    /// and the amnesty must come back with the next connection, not before.
+    #[test]
+    fn the_baseline_amnesty_does_not_outlive_its_connection() {
+        let (mut state, _, workbox) = two_connected_hosts();
+        state.apply(
+            &workbox,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                5,
+                vec![agent("w1:p1", AgentStatus::Idle, 1)],
+            )),
+        );
+        state.apply(
+            &workbox,
+            HostEvent::Unavailable {
+                reason: "host closed the connection".to_string(),
+                retry_in: None,
+            },
+        );
+        // A connection that opens and dies again without a snapshot.
+        connected(&mut state, &workbox);
+        state.apply(
+            &workbox,
+            HostEvent::Unavailable {
+                reason: "host closed the connection".to_string(),
+                retry_in: None,
+            },
+        );
+
+        let changes = state.apply(
+            &workbox,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                1,
+                vec![agent("w1:p1", AgentStatus::Idle, 1)],
+            )),
+        );
+        assert!(
+            changes.is_empty(),
+            "a snapshot arriving while the host is down owns no baseline: {changes:?}"
+        );
+        assert_eq!(
+            state
+                .host(&workbox)
+                .and_then(|host| host.snapshot.as_ref())
+                .map(|snapshot| snapshot.revision),
+            Some(5),
+            "the held snapshot must survive a straggler"
+        );
+        state.assert_invariants_for_test();
+
+        // The next connection earns its own baseline.
+        connected(&mut state, &workbox);
+        let changes = state.apply(
+            &workbox,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                1,
+                vec![agent("w1:p1", AgentStatus::Blocked, 2)],
+            )),
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|change| matches!(change, FleetChange::Snapshot { revision: 1, .. })),
+            "a reconnect's own seed still lands: {changes:?}"
+        );
+        assert_eq!(state.totals().blocked, 1);
         state.assert_invariants_for_test();
     }
 

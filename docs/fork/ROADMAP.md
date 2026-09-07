@@ -391,17 +391,38 @@ rate limiting per peer, the gateway proven passive (it never becomes a host's
 foreground client), terminal frames over both transports, control reaching
 exactly one pane, the pairing/rotation loop, clean SIGTERM, and an empty diff
 over `src/protocol`, `src/server`, `src/remote` and the endpoint fixtures.
-**Step 5 fails one clause** — see the known defect below; it is pre-existing,
-outside E3, and does not block E4.
+**Step 5 failed one clause** at the time — a reconnected ssh host went on
+showing its pre-outage state. That defect is **fixed** (fork #49); the cause was
+not where the original validation guessed, and the correction is recorded below.
 
-**Known defect, deferred to E5: an ssh fleet host that reconnects stays one
-snapshot behind.** After a reconnect the host's own snapshot is withheld and
-only flushed by the next publish, so every later update is one revision stale,
-indefinitely. It reproduces on the pure E1 path with no gateway involved
-(`herdr fleet status --watch --json`, ssh host down then up), so the cause is
-in the ssh stdio bridge (`src/remote/attach.rs`, `src/fleet/transport/ssh.rs`)
-— the tree E3 is required to leave untouched. A fresh connection with no
-reconnect shows no lag.
+**Fixed: a fleet host that reconnected kept showing its pre-outage state.**
+After an ssh host's bridge died and came back, the fleet went on reporting
+whatever that host last said *before* the outage, and only caught up when the
+host happened to publish again — which a quiet agent never does. So an agent
+that turned blocked while the link was down was never shown as blocked.
+
+The cause was **not** the ssh stdio bridge. A three-arm A/B run against the ssh
+lab reproduced it identically on current `master`, on a build with the passive
+hello reverted to `surface_active: true`, and on the pre-E3 binary at
+`3d649ce3` — so E3's decision (p) was not the trigger either. It was
+`FleetState::set_snapshot` in `src/fleet/state.rs`, unchanged since E1: a
+server counts `ClientShellSnapshot::revision` **per client connection**,
+restarting at 1 for each one, while `boot_id` only changes when the *server*
+restarts. The fleet compared revisions across connections, so the reconnect's
+seed — the one message carrying everything that changed during the outage —
+was dropped as stale. It only ever showed up on ssh because an ssh host is the
+only kind whose link routinely dies while its server keeps running; a local
+host's connection outlives everything short of its server, and a server that
+died brings a new `boot_id`, which the old rule accepted.
+
+The fix is client-side and one field: a host marked at every
+`HostEvent::Connected` accepts its next snapshot whatever revision it carries,
+then returns to the ordinary monotonic rule; every other connection state
+clears the mark, so it never outlives the connection that set it. It is the
+same rule upstream's own multi-machine client already applies through
+`ClientShellEndpoint::snapshot_generation`, which the fleet had not mirrored.
+Servers stay stock (principle 1), the wire is untouched, and the passive hello
+of decision (p) is unaffected.
 
 **Depends on:** E1.
 **Open decisions (default in bold):** (a) HTTP/WS stack — **`axum` (with its
@@ -489,11 +510,6 @@ which is what makes the PWA installable on iOS and what E6's push requires.
   `--allow-insecure-bind`.
 - Fleet lab documentation for testing "remote" behaviour locally (SSH to
   `localhost` as a fake remote host).
-- **Fix the ssh reconnect snapshot lag** found by E3's validation (see E3's
-  known defect): after an ssh host reconnects, its snapshot is withheld until
-  the next publish, leaving that host permanently one revision stale. Fix it in
-  the bridge/transport, and add a regression test that reconnects an ssh lab
-  host and asserts the next snapshot revision is current.
 - Note for the gateway behind `tailscale serve`: every client shares peer
   `127.0.0.1`, so one client's failed credentials consume the shared per-peer
   rate-limit window. Document it, and reconsider the limiter's key.
