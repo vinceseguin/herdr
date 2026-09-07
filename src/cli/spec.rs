@@ -288,8 +288,9 @@ fn account_command() -> Command {
                      followed by `claude auth login`, so the credentials land in that \
                      profile instead of the ambient one. The pane must be at its shell \
                      prompt and the shell one herdr can write an assignment for; otherwise \
-                     nothing is typed. herdr does not complete the login — follow it in the \
-                     pane, then run `herdr account status <name>`.\n\nnext: herdr account status <NAME>",
+                     nothing is typed, and if the pane does not come back to its prompt the \
+                     login command is not typed either. herdr does not complete the login — \
+                     follow it in the pane, then run `herdr account status <name>`.\n\nnext: herdr account status <NAME>",
                 )
                 .arg(Arg::new("name").required(true).help("Profile name"))
                 .arg(

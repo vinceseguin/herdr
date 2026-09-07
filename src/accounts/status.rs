@@ -295,7 +295,9 @@ fn render_agents(status: &AccountStatus) -> String {
             )
         })
         .collect::<Vec<_>>()
-        .join("\n              ")
+        // One continuation line per extra agent, indented under the column
+        // `field` opens: two spaces, a twelve-wide label, one space.
+        .join("\n               ")
 }
 
 /// The wire spelling of an agent status, matched exhaustively so a new upstream
@@ -452,7 +454,10 @@ mod tests {
 
     #[test]
     fn render_text_is_the_golden_report() {
-        let agents = [fact("%1.1", "a1", Some("work"), Some("ok"))];
+        let agents = [
+            fact("%1.1", "a1", Some("work"), Some("ok")),
+            fact("%1.4", "a4", Some("work"), None),
+        ];
         let mut statuses = assemble(&profiles(), None, |_| healthy(), Some(&agents));
         statuses[0].logged_in = false;
         statuses[0].credentials_mode_ok = None;
@@ -478,8 +483,20 @@ work (store)
   hook         installed
   broken link  /p/work/projects
   agents       a1 on %1.1 working ok
+               a4 on %1.4 working
 "
         );
+
+        // A second agent lines up under the first rather than one column left.
+        let report = render_text(&statuses);
+        let column = |needle: &str| {
+            let line = report
+                .lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} is in the report: {report}"));
+            line.find(needle).unwrap_or_default()
+        };
+        assert_eq!(column("a1 on"), column("a4 on"), "{report}");
     }
 
     #[test]

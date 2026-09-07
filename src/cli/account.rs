@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::accounts::config::{AccountProfileConfig, DEFAULT_AGENT};
-use crate::accounts::launch::{env_assignment_line, pane_shell_at_prompt};
+use crate::accounts::launch::{env_assignment_line, pane_shell_at_prompt, LaunchError};
 use crate::accounts::layout::{self, InspectOptions, SeedPlan, SeedReport};
 use crate::accounts::profile::{
     self, load_profiles, validate_name, AccountAgent, AccountProfile, ProfileOrigin, Profiles,
@@ -986,11 +986,17 @@ fn agent_facts() -> (
 // login
 // ---------------------------------------------------------------------------
 
-/// How long to wait for the pane's shell to finish the environment line before
-/// typing the login command. Mirrors `crate::accounts::client`: the pty
-/// delivers both lines in order, so this is politeness, not correctness.
+/// How long to wait for the pane's shell to come back to its prompt after the
+/// environment line.
+///
+/// Unlike `crate::accounts::client`, this wait is load-bearing rather than
+/// politeness. The launch driver hands its second line to `agent.start`, which
+/// refuses a busy pane itself; `login` submits its second line with a raw
+/// `pane.send_text` that nothing on the server stands in front of, so a pane
+/// that has not come back is a refusal. The budget is generous because a slow
+/// prompt command is the ordinary reason to miss it.
 const LOGIN_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
-const LOGIN_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_000);
+const LOGIN_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5_000);
 const LOGIN_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 fn parse_login(args: &[String]) -> Result<(String, Option<String>), String> {
@@ -1093,6 +1099,15 @@ fn login(args: &[String]) -> std::io::Result<i32> {
     };
     let shell = match pane_shell_at_prompt(&info) {
         Ok(shell) => shell,
+        // The shared refusal ends by offering `--account none`, which belongs
+        // to `herdr agent start`. Point at this command's own way out instead.
+        Err(LaunchError::PaneNotAtPrompt { pane_id, detail }) => {
+            eprintln!(
+                "pane {pane_id} is not at its shell prompt ({detail}); nothing was typed. \
+                 Wait for the pane to return to its prompt, or name another one with --pane"
+            );
+            return Ok(1);
+        }
         Err(error) => {
             eprintln!("{error}");
             return Ok(1);
@@ -1106,35 +1121,19 @@ fn login(args: &[String]) -> std::io::Result<i32> {
                 return Ok(1);
             }
         };
-    let command = format!(
-        "{} auth login",
-        crate::detect::interactive_agent_executable(crate::detect::Agent::Claude)
-    );
+    // Matched, never assumed: a second `AccountAgent` has to be a compile error
+    // here rather than a `claude auth login` typed at a profile that is not
+    // Claude's.
+    let command = match profile.agent {
+        AccountAgent::Claude => format!(
+            "{} auth login",
+            crate::detect::interactive_agent_executable(crate::detect::Agent::Claude)
+        ),
+    };
+    let variable = profile.agent.config_dir_env_var();
 
-    crate::platform::begin_cli_output();
-    if let Err(message) = send_line(&pane_id, &line) {
-        eprintln!("herdr account login: {message}");
-        return Ok(1);
-    }
-    if !wait_for_prompt(&pane_id, shell.pid) {
-        eprintln!(
-            "warning: pane {pane_id} did not return to its shell prompt after the environment \
-             line; the login command was typed anyway and the shell runs both in order"
-        );
-    }
-    if let Err(message) = send_line(&pane_id, &command) {
-        eprintln!(
-            "herdr account login: {message}; {} was already exported in pane {pane_id}, so \
-             running `{command}` there by hand logs the right profile in",
-            profile.agent.config_dir_env_var()
-        );
-        return Ok(1);
-    }
-
-    println!("typed into pane {pane_id}:");
-    println!("  {}", line.trim_start());
-    println!("  {command}");
-    println!("Follow the login in pane {pane_id}, then run `herdr account status {name}`.");
+    // Both warnings are about what completing this login will do, so they are
+    // said while the user can still stop rather than after the fact.
     if inspection.logged_in {
         eprintln!(
             "warning: account profile {name:?} already has credentials; \
@@ -1147,6 +1146,44 @@ fn login(args: &[String]) -> std::io::Result<i32> {
              report its session id; run `CLAUDE_CONFIG_DIR={config_dir} herdr integration install claude`"
         );
     }
+
+    crate::platform::begin_cli_output();
+    if let Err(error) = send_line(&pane_id, &line) {
+        eprintln!("herdr account login: {error}");
+        if error.may_have_landed {
+            // The request left this process and no reply came back, so the
+            // pane's shell may already export the variable. Saying otherwise
+            // would leave a shell pointing at a profile nobody mentioned.
+            eprintln!(
+                "note: pane {pane_id} may already export {variable}={config_dir:?}; check it \
+                 before starting anything there"
+            );
+        }
+        return Ok(1);
+    }
+    if !wait_for_prompt(&pane_id, shell.pid) {
+        // `pane.send_text` has no busy check of its own, so typing the second
+        // line now would feed `claude auth login` to whatever took the
+        // foreground instead of to the shell.
+        eprintln!(
+            "herdr account login: pane {pane_id} did not come back to its shell prompt after \
+             the environment line, so `{command}` was not typed. {variable} is exported in that \
+             shell now, so running `{command}` there logs {name:?} in."
+        );
+        return Ok(1);
+    }
+    if let Err(error) = send_line(&pane_id, &command) {
+        eprintln!(
+            "herdr account login: {error}; {variable} was already exported in pane {pane_id}, \
+             so running `{command}` there by hand logs the right profile in"
+        );
+        return Ok(1);
+    }
+
+    println!("typed into pane {pane_id}:");
+    println!("  {}", line.trim_start());
+    println!("  {command}");
+    println!("Follow the login in pane {pane_id}, then run `herdr account status {name}`.");
     Ok(0)
 }
 
@@ -1194,8 +1231,25 @@ fn pane_process_info(pane_id: &str) -> Result<PaneProcessInfo, String> {
         .map_err(|err| format!("pane.process_info returned an unreadable process table: {err}"))
 }
 
+/// Why a line could not be submitted, and whether it may have reached the pane.
+///
+/// The same distinction `crate::accounts::client::apply_env` draws: a request
+/// the server rejected wrote nothing to the pty, while a transport failure may
+/// have delivered the text and lost only the reply. Only the caller can say
+/// what a pane that may be holding an export line means for the user.
+struct SendLineError {
+    detail: String,
+    may_have_landed: bool,
+}
+
+impl std::fmt::Display for SendLineError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "pane.send_text failed: {}", self.detail)
+    }
+}
+
 /// Submit one line at the pane's prompt.
-fn send_line(pane_id: &str, line: &str) -> Result<(), String> {
+fn send_line(pane_id: &str, line: &str) -> Result<(), SendLineError> {
     let response = crate::cli::send_request(&Request {
         id: "cli:accounts:login:send_text".into(),
         method: Method::PaneSendText(PaneSendTextParams {
@@ -1203,14 +1257,27 @@ fn send_line(pane_id: &str, line: &str) -> Result<(), String> {
             text: format!("{line}\r"),
         }),
     })
-    .map_err(|err| format!("pane.send_text failed: {err}"))?;
+    .map_err(|err| SendLineError {
+        detail: err.to_string(),
+        // The request never reached the server, or its reply never came back.
+        // Assuming nothing was typed would understate what the pane holds.
+        may_have_landed: true,
+    })?;
     match response.get("error") {
-        Some(error) => Err(format!("pane.send_text failed: {error}")),
+        // The server rejected the call (no such pane, bad text), so nothing
+        // was written to the pty.
+        Some(error) => Err(SendLineError {
+            detail: error.to_string(),
+            may_have_landed: false,
+        }),
         None => Ok(()),
     }
 }
 
 /// Poll until the pane's own shell holds the foreground again.
+///
+/// `false` means the budget ran out; the caller refuses rather than typing into
+/// whatever is there.
 fn wait_for_prompt(pane_id: &str, shell_pid: u32) -> bool {
     std::thread::sleep(LOGIN_SETTLE_GRACE);
     let deadline = std::time::Instant::now() + LOGIN_SETTLE_TIMEOUT;

@@ -1096,6 +1096,39 @@ fn account_status_reports_identity_without_reading_a_secret() {
         "{}",
         stderr_of(&unknown)
     );
+
+    // A configuration diagnostic is exit 1 with the report still printed, the
+    // same contract `account list` holds. Last, because it edits the config.
+    let config = lab.root.join("xdg").join("herdr-dev").join("config.toml");
+    let original = std::fs::read_to_string(&config).expect("lab config");
+    std::fs::write(
+        &config,
+        format!(
+            "{original}\n[[accounts]]\nname = \"{DEFAULT_PROFILE}\"\nagent = \"claude\"\nconfig_dir = \"{}/profiles/dup\"\n",
+            lab.root.display()
+        ),
+    )
+    .expect("append a duplicate profile");
+
+    let diagnosed = lab.herdr(&["account", "status", "--json"]);
+    assert_eq!(
+        diagnosed.status.code(),
+        Some(1),
+        "diagnostics must exit 1: {}{}",
+        stdout_of(&diagnosed),
+        stderr_of(&diagnosed)
+    );
+    assert!(
+        stderr_of(&diagnosed).contains("duplicate account profile name"),
+        "{}",
+        stderr_of(&diagnosed)
+    );
+    assert_eq!(
+        rows(&diagnosed).len(),
+        2,
+        "the report is still printed: {}",
+        stdout_of(&diagnosed)
+    );
 }
 
 #[test]
@@ -1218,11 +1251,13 @@ fn account_login_types_the_profile_into_the_pane() {
     assert!(printed.contains("claude auth login"), "{printed}");
     assert!(printed.contains(&pane), "{printed}");
 
-    // The stub really ran, under the new profile's directory.
-    let screen = wait_for_pane_text(&lab, &pane, "fake-claude: auth login");
+    // The stub really ran, and really ran under the new profile: the export
+    // line is echoed by the pane whether or not it took effect, so the proof
+    // is a line only the stub prints, plus the file it wrote (below).
+    let screen = wait_for_pane_text(&lab, &pane, "logged in as fresh@example.test");
     assert!(
-        screen.contains(dir.to_str().expect("utf-8 lab path")),
-        "the stub echoed the profile directory it logged into: {screen}"
+        screen.contains("fake-claude: auth login"),
+        "the stub ran its login path: {screen}"
     );
 
     // …and wrote a private credentials file there, which `status` now sees
@@ -1280,10 +1315,11 @@ fn account_login_refuses_a_busy_pane_without_typing_anything() {
         stdout_of(&output),
         stderr_of(&output)
     );
+    let refusal = stderr_of(&output);
+    assert!(refusal.contains("not at its shell prompt"), "{refusal}");
     assert!(
-        stderr_of(&output).contains("not at its shell prompt"),
-        "{}",
-        stderr_of(&output)
+        refusal.contains("--pane") && !refusal.contains("--account none"),
+        "the refusal points at this command's own way out: {refusal}"
     );
     assert!(
         stdout_of(&output).is_empty(),

@@ -83,6 +83,14 @@ pub const CREDENTIALS_MODE: u32 = 0o600;
 /// per-project history, so the read is bounded rather than unbounded.
 const MAX_CLAUDE_JSON_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Longest identity field `herdr account status` will accept for display.
+///
+/// An address, an organization name and a plan word all fit with room to
+/// spare. The bound exists because `.claude.json` is not herdr's file: without
+/// it a megabyte-long `subscriptionType` would be printed straight into
+/// someone's terminal.
+const MAX_IDENTITY_CHARS: usize = 120;
+
 /// Who a profile is logged in as, for display only.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct AccountIdentity {
@@ -222,7 +230,7 @@ pub fn identity_from_claude_json(text: &str) -> Option<AccountIdentity> {
                 .get(*key)
                 .and_then(serde_json::Value::as_str)
                 .map(str::trim)
-                .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+                .filter(|value| is_printable_identity(value))
                 .map(str::to_string)
         })
     };
@@ -235,6 +243,38 @@ pub fn identity_from_claude_json(text: &str) -> Option<AccountIdentity> {
         return None;
     }
     Some(identity)
+}
+
+/// Whether one `oauthAccount` display field is safe to print at a terminal.
+///
+/// Empty is nothing to show. A control character would be an escape sequence on
+/// someone's screen, and the bidi and zero-width formatting characters can
+/// reorder or hide what surrounds them, so a value that renders as one address
+/// and reads as another is refused rather than cleaned up — the caller then
+/// falls through to the next key name, and failing that reports the identity as
+/// unknown. Length is checked first so the scan itself stays bounded.
+fn is_printable_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().take(MAX_IDENTITY_CHARS + 1).count() <= MAX_IDENTITY_CHARS
+        && !value
+            .chars()
+            .any(|ch| ch.is_control() || is_text_direction_control(ch))
+}
+
+/// The bidi and zero-width formatting characters.
+///
+/// The same class `sanitize_status_text` (`src/app/tab_bar_status.rs`) refuses
+/// for the tab bar; that helper is private to its module and `src/app/` is not
+/// a file this fork edits, so the list is repeated rather than shared.
+fn is_text_direction_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -876,9 +916,50 @@ mod tests {
             // A control character would be an escape sequence once printed.
             r#"{"oauthAccount": {"emailAddress": "a\u001b[2Jb"}}"#,
             r#"{"oauthAccount": {"emailAddress": "a\nb"}}"#,
+            // A right-to-left override renders an address as one thing while it
+            // reads as another.
+            r#"{"oauthAccount": {"emailAddress": "a\u202eb@example.test"}}"#,
+            r#"{"oauthAccount": {"emailAddress": "a\u200bb@example.test"}}"#,
         ] {
             assert_eq!(identity_from_claude_json(text), None, "{text:?}");
         }
+    }
+
+    /// `.claude.json` is not herdr's file, and `herdr account status` prints
+    /// what this returns straight into a terminal.
+    #[test]
+    fn an_oversized_identity_field_is_refused_rather_than_printed() {
+        let huge = "a".repeat(MAX_IDENTITY_CHARS + 1);
+        let text = format!(
+            r#"{{"oauthAccount": {{"emailAddress": "{huge}", "subscriptionType": "max"}}}}"#
+        );
+        let identity = identity_from_claude_json(&text).expect("the plan still shows");
+        assert_eq!(identity.email, None, "the oversized field is dropped");
+        assert_eq!(identity.plan.as_deref(), Some("max"));
+
+        // Exactly at the bound is still shown: the refusal is a cap, not a
+        // guess about what an address may look like.
+        let at_limit = "b".repeat(MAX_IDENTITY_CHARS);
+        let text = format!(r#"{{"oauthAccount": {{"emailAddress": "{at_limit}"}}}}"#);
+        assert_eq!(
+            identity_from_claude_json(&text)
+                .expect("identity")
+                .email
+                .as_deref(),
+            Some(at_limit.as_str())
+        );
+    }
+
+    /// A deeply nested `.claude.json` must not take the parser down with it.
+    #[test]
+    fn a_deeply_nested_claude_json_degrades_to_no_identity() {
+        let depth = 2_000;
+        let text = format!(
+            "{{\"oauthAccount\": {{\"emailAddress\": \"a@b.test\"}}, \"deep\": {}{}}}",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        assert_eq!(identity_from_claude_json(&text), None);
     }
 
     #[test]
