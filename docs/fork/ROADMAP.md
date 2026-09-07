@@ -169,7 +169,7 @@ Owned by `implement-roadmap`. Legend: ✅ done · 🔨 in progress · ⬜ not st
 | E0 | Fork foundations, CI, fleet lab | — | ✅ | `docs/fork/plans/e0-fork-foundations.md` |
 | E1 | Fleet core (multi-host runtime model) | E0 | ✅ | `docs/fork/plans/e1-fleet-core.md` |
 | E2 | Fleet TUI (one console, every machine) | E1 | ♻️ | `docs/fork/plans/e2-fleet-tui.md` — superseded by upstream #3670 (ADR 0002) |
-| E3 | Fleet gateway (HTTP + WebSocket) | E1 | 🔨 | `docs/fork/plans/e3-fleet-gateway.md` |
+| E3 | Fleet gateway (HTTP + WebSocket) | E1 | ✅ | `docs/fork/plans/e3-fleet-gateway.md` |
 | E4 | Phone app (installable PWA) | E3 | ⬜ | — |
 | E5 | Off-LAN access via Tailscale | E3 | ⬜ | — |
 | E6 | Push notifications to the phone | E4, E5 | ⬜ | — |
@@ -383,6 +383,26 @@ the LAN is the only network surface, and it is what E5 puts on the tailnet.
   starts the gateway on loopback against the fleet lab and asserts `/api/fleet`,
   an events stream delta, and a terminal frame.
 
+**Validation outcome (2026-09-06).** All ten PRs merged (fork #36–#47). Nine of
+the plan's ten end-to-end validation steps pass against a three-host lab (two
+local sessions plus one ssh host from a saved machine profile): both builds
+green, `/health` open and `/api/fleet` token-gated, foreign origins refused,
+rate limiting per peer, the gateway proven passive (it never becomes a host's
+foreground client), terminal frames over both transports, control reaching
+exactly one pane, the pairing/rotation loop, clean SIGTERM, and an empty diff
+over `src/protocol`, `src/server`, `src/remote` and the endpoint fixtures.
+**Step 5 fails one clause** — see the known defect below; it is pre-existing,
+outside E3, and does not block E4.
+
+**Known defect, deferred to E5: an ssh fleet host that reconnects stays one
+snapshot behind.** After a reconnect the host's own snapshot is withheld and
+only flushed by the next publish, so every later update is one revision stale,
+indefinitely. It reproduces on the pure E1 path with no gateway involved
+(`herdr fleet status --watch --json`, ssh host down then up), so the cause is
+in the ssh stdio bridge (`src/remote/attach.rs`, `src/fleet/transport/ssh.rs`)
+— the tree E3 is required to leave untouched. A fresh connection with no
+reconnect shows no lag.
+
 **Depends on:** E1.
 **Open decisions (default in bold):** (a) HTTP/WS stack — **`axum` (with its
 `ws` feature) on the existing `tokio`** vs `hyper` + `tokio-tungstenite` vs
@@ -427,6 +447,16 @@ store, no signing, and works on the LAN and over Tailscale unchanged.
   a Playwright smoke run against the gateway + fleet lab is optional and
   headless.
 
+**Constraints from E3 (honor these):** the `agent_added` event carries a
+*merged agent* whose `pane`, `workspace` and `tab` are `host/id` strings, not
+`/api/fleet`'s report shape — upsert keyed by `agent.pane` and never assume the
+report's field names on a delta. Treat an unknown event kind or connection
+state as ignore/unknown. Distinguish `busy` (a pane's single attach slot; offer
+take-over) from `host_busy` (wait). Close code 1001 with reason "the gateway is
+stopping" is a reconnect-with-backoff, not an error. Terminal frames are binary
+`[kind u8][seq u64 LE][w u16 LE][h u16 LE][full u8]`; ignore unknown kinds. The
+app is served same-origin — no CORS headers are sent.
+
 **Depends on:** E3.
 **Open decisions (default in bold):** (a) app shape — **PWA** vs Capacitor
 wrapper vs native; (b) UI library — **Preact + TS** vs vanilla vs React;
@@ -459,6 +489,14 @@ which is what makes the PWA installable on iOS and what E6's push requires.
   `--allow-insecure-bind`.
 - Fleet lab documentation for testing "remote" behaviour locally (SSH to
   `localhost` as a fake remote host).
+- **Fix the ssh reconnect snapshot lag** found by E3's validation (see E3's
+  known defect): after an ssh host reconnects, its snapshot is withheld until
+  the next publish, leaving that host permanently one revision stale. Fix it in
+  the bridge/transport, and add a regression test that reconnects an ssh lab
+  host and asserts the next snapshot revision is current.
+- Note for the gateway behind `tailscale serve`: every client shares peer
+  `127.0.0.1`, so one client's failed credentials consume the shared per-peer
+  rate-limit window. Document it, and reconsider the limiter's key.
 
 **Depends on:** E3.
 **Open decisions (default in bold):** (a) VPN — **Tailscale** vs hand-managed
@@ -512,6 +550,12 @@ workspaces on any host.
 - Console: whatever upstream's multi-machine client offers for acting on an
   agent on another machine — the fork adds no console half of its own
   (ADR 0002).
+
+**Constraints from E3 (honor these):** the terminal WebSocket is the gateway's
+only input path; new actions go through the control-scope check plus the
+methods a host advertises, and must never widen what a `read` credential can
+do. Any new `[gateway]` key or endpoint is documented in `docs/fork/gateway.md`
+in the same PR.
 
 **Depends on:** E3, E4.
 **Open decisions (default in bold):** which destructive actions the phone may
