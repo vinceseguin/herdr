@@ -10,8 +10,11 @@
 //! out until `herdr account login` — and `.claude.json` is copied only after
 //! its identity keys are removed. `src/accounts/layout.rs` enforces both.
 //!
-//! Exit codes: 0 for a report, 1 when the configuration has diagnostics or the
-//! operation failed, 2 for a usage error.
+//! Exit codes: 0 for a report or a completed operation, 1 when a read-only
+//! report found configuration diagnostics or when an operation failed, 2 for a
+//! usage error. A completed operation that degraded — an entry the platform
+//! could not share, a hook that did not install — still exits 0 and says so on
+//! stderr, because the profile it just created is real and usable.
 
 use std::path::{Path, PathBuf};
 
@@ -129,17 +132,31 @@ fn parse_add(args: &[String]) -> Result<AddArgs, String> {
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
+        // A flag where a value belongs is a typo, never a value: `--from
+        // --json` must not seed from a profile called "--json", and
+        // `--config-dir --force` must not create a directory called
+        // "--force".
         let value = |flag: &str| -> Result<String, String> {
-            args.get(index + 1)
-                .cloned()
-                .ok_or_else(|| format!("{flag} needs a value"))
+            match args.get(index + 1) {
+                Some(value) if !value.starts_with('-') => Ok(value.clone()),
+                Some(value) => Err(format!(
+                    "{flag} needs a value, but the next argument is {value:?}"
+                )),
+                None => Err(format!("{flag} needs a value")),
+            }
         };
         match arg {
             "--config-dir" => {
+                if parsed.config_dir.is_some() {
+                    return Err("--config-dir was given more than once".to_string());
+                }
                 parsed.config_dir = Some(value("--config-dir")?);
                 index += 2;
             }
             "--from" => {
+                if parsed.from.is_some() {
+                    return Err("--from was given more than once".to_string());
+                }
                 parsed.from = Some(value("--from")?);
                 index += 2;
             }
@@ -233,11 +250,17 @@ fn add(args: &[String]) -> std::io::Result<i32> {
             return Ok(1);
         }
     };
-    if let Some(clash) = profiles.iter().find(|profile| profile.config_dir == target) {
+    // Lexically *and* as the filesystem resolves it: `config_dir` comparison
+    // alone cannot see `..` or a symlink, and a second profile pointing at an
+    // existing profile's directory is a second name for one login.
+    let target_key = layout::resolved_key(&target);
+    if let Some(clash) = profiles.iter().find(|profile| {
+        profile.config_dir == target || layout::resolved_key(&profile.config_dir) == target_key
+    }) {
         eprintln!(
             "account profile {:?} already uses {}; two profiles must not share a directory",
             clash.name,
-            target.display()
+            clash.config_dir.display()
         );
         return Ok(1);
     }
@@ -277,6 +300,14 @@ fn add(args: &[String]) -> std::io::Result<i32> {
         Ok(report) => report,
         Err(err) => {
             eprintln!("herdr account add: {err}");
+            // Seeding writes entry by entry and never rolls back, so say so
+            // rather than let the user assume nothing happened.
+            if plan.target.exists() {
+                eprintln!(
+                    "{} may be partially seeded; nothing was recorded in the account store",
+                    plan.target.display()
+                );
+            }
             return Ok(1);
         }
     };
@@ -508,7 +539,21 @@ fn install_hook(target: &Path) -> Result<(), String> {
         .output()
         .map_err(|err| format!("could not install the session-start hook ({err}); {rerun}"))?;
     if output.status.success() {
-        return Ok(());
+        // Trust the exit code only as far as the evidence: the child reads
+        // `CLAUDE_CONFIG_DIR` itself, so a success that landed the hook
+        // somewhere else must not be reported as a hook in this profile.
+        if target
+            .join(layout::HOOK_DIR)
+            .join(layout::HOOK_FILE)
+            .is_file()
+        {
+            return Ok(());
+        }
+        return Err(format!(
+            "`herdr integration install claude` reported success but left no hook in {}; \
+             session ids will not be reported and switching accounts will not work; {rerun}",
+            target.display()
+        ));
     }
     let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let detail = if detail.is_empty() {
@@ -670,27 +715,51 @@ fn may_delete_dir(dir: &Path, profiles: &Profiles, name: &str) -> Result<(), Str
             dir.display()
         ));
     }
+    // Every comparison below is made on both spellings: `config_dir` is only
+    // lexically normalized, so `..` and a symlinked ancestor would otherwise
+    // walk a delete straight into `~/.claude` — which `remove_dir_all`
+    // resolves even though this path never looked like it.
+    let resolved = layout::resolved_key(dir);
+    let same = |other: &Path| other == dir || layout::resolved_key(other) == resolved;
+    let inside =
+        |other: &Path| other.starts_with(dir) || layout::resolved_key(other).starts_with(&resolved);
+
     let home = profile::home_dir().map(|home| crate::accounts::config::dir_key(&home));
-    if home.as_deref() == Some(dir) {
-        return Err(format!(
-            "refusing to delete a home directory: {}",
-            dir.display()
-        ));
+    if let Some(home) = home.as_deref() {
+        if inside(home) {
+            return Err(format!(
+                "refusing to delete a home directory: {}",
+                dir.display()
+            ));
+        }
     }
-    if ambient_claude_dir(home.as_deref()).as_deref() == Some(dir) {
-        return Err(format!(
-            "refusing to delete the ambient Claude directory: {}",
-            dir.display()
-        ));
+    if let Some(ambient) = ambient_claude_dir(home.as_deref()) {
+        if inside(&ambient) {
+            return Err(format!(
+                "refusing to delete the ambient Claude directory: {}",
+                dir.display()
+            ));
+        }
     }
     if let Some(other) = profiles
         .iter()
-        .find(|profile| profile.name != name && profile.config_dir == dir)
+        .find(|profile| profile.name != name && same(&profile.config_dir))
     {
         return Err(format!(
             "refusing to delete {}: account profile {:?} also uses it",
             dir.display(),
             other.name
+        ));
+    }
+    if let Some(other) = profiles
+        .iter()
+        .find(|profile| profile.name != name && inside(&profile.config_dir))
+    {
+        return Err(format!(
+            "refusing to delete {}: account profile {:?} lives inside it ({})",
+            dir.display(),
+            other.name,
+            other.config_dir.display()
         ));
     }
     Ok(())
@@ -889,6 +958,14 @@ mod tests {
             vec!["work", "--unknown"],
             vec!["work", "--config-dir"],
             vec!["--from"],
+            // A flag swallowed as a value would seed from — or create — a
+            // directory named after the flag.
+            vec!["work", "--config-dir", "--json"],
+            vec!["work", "--from", "--dry-run"],
+            // Two answers to one question: the silent last-wins would decide
+            // which account's credentials directory this is.
+            vec!["work", "--config-dir", "/a", "--config-dir", "/b"],
+            vec!["work", "--from", "perso", "--from", "other"],
         ] {
             assert!(parse(&bad).is_err(), "{bad:?} must be refused");
         }
@@ -979,6 +1056,49 @@ mod tests {
             let error = may_delete_dir(&key, &profiles, "work").expect_err("home");
             assert!(error.contains("home directory"), "{error}");
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `config_dir` is only lexically normalized, so two profiles can name one
+    /// directory without looking alike. `--delete-dir` deletes credentials, so
+    /// it has to see through both spellings.
+    #[cfg(unix)]
+    #[test]
+    fn delete_dir_sees_through_dot_dot_and_symlinked_ancestors() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-account-delete-resolved-{}-{nanos}",
+            std::process::id()
+        ));
+        let real = root.join("real");
+        std::fs::create_dir_all(real.join("perso")).expect("perso dir");
+        std::os::unix::fs::symlink(&real, root.join("link")).expect("symlink");
+
+        let mut perso = profile("perso", true, ProfileOrigin::Config);
+        perso.config_dir = crate::accounts::config::dir_key(&real.join("perso"));
+        let mut work = profile("work", false, ProfileOrigin::Store);
+        // The same directory, reached through a symlinked ancestor.
+        work.config_dir = crate::accounts::config::dir_key(&root.join("link").join("perso"));
+        let profiles = Profiles::test_new(vec![perso, work.clone()]);
+
+        let error =
+            may_delete_dir(&work.config_dir, &profiles, "work").expect_err("same real directory");
+        assert!(error.contains("also uses it"), "{error}");
+
+        // And a directory that merely *contains* another profile.
+        let mut parent = profile("parent", false, ProfileOrigin::Store);
+        parent.config_dir = crate::accounts::config::dir_key(&real);
+        let profiles = Profiles::test_new(vec![
+            parent.clone(),
+            profiles.get("perso").expect("perso").clone(),
+        ]);
+        let error = may_delete_dir(&parent.config_dir, &profiles, "parent")
+            .expect_err("contains a profile");
+        assert!(error.contains("lives inside it"), "{error}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

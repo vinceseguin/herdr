@@ -224,9 +224,28 @@ fn save_to(path: &std::path::Path, store: &AccountsStore) -> io::Result<()> {
 
     // Same directory, so the rename is atomic on every filesystem herdr runs on.
     let temporary = path.with_extension(format!("toml.{}.tmp", std::process::id()));
-    std::fs::write(&temporary, rendered.as_bytes())?;
+    {
+        use std::io::Write as _;
+
+        // Opened at the final mode rather than written-then-narrowed: the
+        // store lists every account's credentials directory.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(STORE_FILE_MODE);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(rendered.as_bytes())?;
+        // The rename below publishes this file; a crash must not leave the
+        // store renamed but empty.
+        file.sync_all()?;
+    }
     #[cfg(unix)]
     {
+        // `mode` applies at creation only, so a leftover temporary from a
+        // crashed run is narrowed here.
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(STORE_FILE_MODE))?;
     }

@@ -299,12 +299,80 @@ pub struct SeedReport {
     pub warnings: Vec<String>,
 }
 
+/// A path with `.` and `..` removed, purely lexically.
+///
+/// Sound for a path whose components do not exist yet (nothing can be a
+/// symlink), and the second half of [`resolved_key`] for one that does.
+fn collapse(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut collapsed = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match collapsed.components().next_back() {
+                // `/..` is `/`, and `..` at the start of a relative path has
+                // nothing to pop, so it stays.
+                Some(Component::Normal(_)) => {
+                    collapsed.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => collapsed.push(component.as_os_str()),
+            },
+            other => collapsed.push(other.as_os_str()),
+        }
+    }
+    collapsed
+}
+
+/// A path as the *filesystem* sees it: the longest existing prefix resolved
+/// through symlinks, with whatever does not exist yet appended.
+///
+/// [`crate::accounts::config::dir_key`] is lexical — it keeps `..` and cannot
+/// see a symlink — so `/a/link` and `/a/real` compare unequal even when `link`
+/// points at `real`, and `/a/x/../a` compares unequal to `/a/a`. Either
+/// spelling would be two account profiles quietly sharing one login, so every
+/// check that must not be talked around compares these keys too.
+///
+/// Falls back to the lexical form when nothing on the path exists; there is
+/// then no symlink to hide behind either.
+pub fn resolved_key(path: &Path) -> PathBuf {
+    let lexical = collapse(path);
+    let mut prefix = lexical.clone();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(&prefix) {
+            let mut resolved = canonical;
+            for name in tail.iter().rev() {
+                resolved.push(name);
+            }
+            return resolved;
+        }
+        let Some(name) = prefix.file_name().map(std::ffi::OsStr::to_os_string) else {
+            return lexical;
+        };
+        tail.push(name);
+        if !prefix.pop() {
+            return lexical;
+        }
+    }
+}
+
+/// Whether `inner` is `outer` or lives inside it, comparing both the lexical
+/// and the resolved spelling of each.
+fn contains_or_equals(outer: &Path, inner: &Path) -> bool {
+    inner.starts_with(outer) || resolved_key(inner).starts_with(resolved_key(outer))
+}
+
 /// The invariant this module exists to keep.
 ///
 /// Nothing named [`CREDENTIALS_FILE`] may appear on either end of any planned
-/// operation. Checked when a plan is built *and* again before it is applied,
-/// so a future edit to the seed lists — or a plan built by some other code
-/// path — cannot quietly start moving one account's login into another
+/// operation, and nothing the seed would *share* may be a directory that holds
+/// credentials — a `projects` symlink pointing at a Claude config directory
+/// would put one account's login inside another profile just as surely as
+/// copying the file. Checked when a plan is built *and* again before it is
+/// applied, so a future edit to the seed lists — or a plan built by some other
+/// code path — cannot quietly start moving one account's login into another
 /// profile.
 fn guard_no_credentials(plan: &SeedPlan) -> io::Result<()> {
     let is_credentials =
@@ -316,13 +384,34 @@ fn guard_no_credentials(plan: &SeedPlan) -> io::Result<()> {
         .flat_map(|entry| [entry.source.as_path(), entry.target.as_path()])
         .chain(plan.scrub.iter().map(PathBuf::as_path))
         .find(|path| is_credentials(path));
-    match offending {
-        Some(path) => Err(io::Error::other(format!(
+    if let Some(path) = offending {
+        return Err(io::Error::other(format!(
             "refusing to seed {}: credentials are never shared between account profiles",
             path.display()
-        ))),
-        None => Ok(()),
+        )));
     }
+
+    for entry in &plan.links {
+        // Existence only; the file is never opened.
+        if std::fs::symlink_metadata(entry.source.join(CREDENTIALS_FILE)).is_ok() {
+            return Err(io::Error::other(format!(
+                "refusing to share {} as {}: it holds credentials, so it is an account's own \
+                 config directory rather than shared state",
+                entry.source.display(),
+                entry.entry
+            )));
+        }
+        if contains_or_equals(&entry.source, &plan.source)
+            || contains_or_equals(&entry.source, &plan.target)
+        {
+            return Err(io::Error::other(format!(
+                "refusing to share {} as {}: it contains an account profile directory",
+                entry.source.display(),
+                entry.entry
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Decide how a new profile directory would be seeded from an existing one.
@@ -343,13 +432,24 @@ pub fn plan_seed(source: &Path, target: &Path) -> io::Result<SeedPlan> {
 
     let source_dir = crate::accounts::config::dir_key(source);
     let target_dir = crate::accounts::config::dir_key(target);
-    if source_dir == target_dir {
+    // Lexically *and* as the filesystem resolves them: `dir_key` keeps `..`
+    // and cannot see a symlink, so `<source>/../<source>` and a link pointing
+    // at the source both spell the source's own directory without matching it.
+    // Seeding a profile into its own source is two account profiles sharing
+    // one login, which is the failure this epic exists to prevent.
+    let source_real = resolved_key(source);
+    let target_real = resolved_key(target);
+    if source_dir == target_dir || source_real == target_real {
         return Err(io::Error::other(format!(
             "the new profile would use the source's own directory: {}",
             source_dir.display()
         )));
     }
-    if target_dir.starts_with(&source_dir) || source_dir.starts_with(&target_dir) {
+    if target_dir.starts_with(&source_dir)
+        || source_dir.starts_with(&target_dir)
+        || target_real.starts_with(&source_real)
+        || source_real.starts_with(&target_real)
+    {
         return Err(io::Error::other(format!(
             "account profile directories must not nest: {} and {}",
             source_dir.display(),
@@ -398,6 +498,28 @@ pub fn plan_seed(source: &Path, target: &Path) -> io::Result<SeedPlan> {
 
     for entry in COPIED_ENTRIES {
         let path = source.join(entry);
+        let Ok(link_metadata) = std::fs::symlink_metadata(&path) else {
+            plan.skipped
+                .push(format!("{entry}: absent from the source profile"));
+            continue;
+        };
+        // Resolved before it is classified, so `guard_no_credentials` below
+        // sees the name of the file that would actually be read: a
+        // `.claude.json` symlinked at `.credentials.json` must never be copied
+        // into a new profile under an innocent name.
+        let path = if link_metadata.file_type().is_symlink() {
+            match std::fs::canonicalize(&path) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    plan.skipped.push(format!(
+                        "{entry}: the source profile's link does not resolve ({err})"
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            path
+        };
         let Ok(metadata) = std::fs::metadata(&path) else {
             plan.skipped
                 .push(format!("{entry}: absent from the source profile"));
@@ -496,12 +618,22 @@ pub fn apply_seed(plan: &SeedPlan, force: bool) -> io::Result<SeedReport> {
         Err(err) => return Err(err),
     }
 
-    std::fs::create_dir_all(target)?;
+    // Created 0700 rather than created-then-narrowed: a Claude config
+    // directory must never be readable by anyone else, not even for the
+    // instant between `create_dir_all` and a `chmod`.
     #[cfg(unix)]
     {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(PROFILE_DIR_MODE)
+            .create(target)?;
+        // `recursive` leaves an existing directory's mode alone.
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(target, std::fs::Permissions::from_mode(PROFILE_DIR_MODE))?;
     }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(target)?;
 
     for entry in &plan.links {
         if std::fs::symlink_metadata(&entry.target).is_ok() {
@@ -556,7 +688,19 @@ pub fn apply_seed(plan: &SeedPlan, force: bool) -> io::Result<SeedReport> {
         } else {
             body
         };
-        write_private(&entry.target, &body)?;
+        match write_private(&entry.target, &body) {
+            Ok(()) => {}
+            // Something created the entry between the check above and this
+            // write. Never destructive means never destructive: leave it.
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                report.warnings.push(format!(
+                    "{}: already present in the new profile; left as it was",
+                    entry.entry
+                ));
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
         if scrubbed {
             report.scrubbed.push(entry.target.clone());
         }
@@ -1101,6 +1245,120 @@ mod tests {
         std::fs::write(target.join(CREDENTIALS_FILE), "{}").expect("credentials");
         let error = apply_seed(&plan, true).expect_err("logged-in target");
         assert!(error.to_string().contains("already logged in"), "{error}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_resolved_key_collapses_dot_dot_and_falls_back_lexically() {
+        assert_eq!(
+            resolved_key(Path::new("/nonexistent-herdr-accounts/a/../b/./c")),
+            PathBuf::from("/nonexistent-herdr-accounts/b/c")
+        );
+        assert_eq!(resolved_key(Path::new("/..")), PathBuf::from("/"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_resolved_key_sees_through_a_symlinked_ancestor() {
+        let root = temp_dir("resolved");
+        let real = root.join("real");
+        std::fs::create_dir_all(real.join("inner")).expect("inner");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        assert_eq!(
+            resolved_key(&link.join("inner")),
+            resolved_key(&real.join("inner"))
+        );
+        // And a directory that does not exist yet still resolves its parents.
+        assert_eq!(
+            resolved_key(&link.join("later")),
+            resolved_key(&real).join("later")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `dir_key` is lexical, so these three spellings of the source directory
+    /// all compare unequal to it. Every one of them would be a second account
+    /// profile pointing at the first one's login.
+    #[test]
+    fn a_target_that_only_spells_the_source_differently_is_refused() {
+        let root = temp_dir("spelling");
+        let source = seed_source_tree(&root);
+
+        let error = plan_seed(&source, &root.join("elsewhere").join("..").join("source"))
+            .expect_err("`..` must not walk back into the source");
+        assert!(
+            error.to_string().contains("source's own directory"),
+            "{error}"
+        );
+
+        #[cfg(unix)]
+        {
+            let link = root.join("link");
+            std::os::unix::fs::symlink(&source, &link).expect("symlink");
+            let error = plan_seed(&source, &link).expect_err("a symlinked target");
+            assert!(
+                error.to_string().contains("source's own directory"),
+                "{error}"
+            );
+            let error = plan_seed(&link, &source).expect_err("a symlinked source");
+            assert!(
+                error.to_string().contains("source's own directory"),
+                "{error}"
+            );
+
+            let inner = root.join("link").join("inner");
+            let error = plan_seed(&source, &inner).expect_err("nested through a link");
+            assert!(error.to_string().contains("nest"), "{error}");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The crafted-source case: a copied entry that is really the credentials
+    /// file wearing another name.
+    #[cfg(unix)]
+    #[test]
+    fn a_copied_entry_symlinked_at_the_credentials_file_is_refused() {
+        let root = temp_dir("disguise");
+        let source = seed_source_tree(&root);
+        std::fs::remove_file(source.join(CLAUDE_JSON_FILE)).expect("remove .claude.json");
+        std::os::unix::fs::symlink(source.join(CREDENTIALS_FILE), source.join(CLAUDE_JSON_FILE))
+            .expect("symlink");
+
+        let error = plan_seed(&source, &root.join("target")).expect_err("disguised credentials");
+        assert!(error.to_string().contains("never shared"), "{error}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other crafted-source case: a *shared* entry that is really a whole
+    /// Claude config directory, so the new profile would read the source's
+    /// credentials through it.
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_entry_pointing_at_a_config_directory_is_refused() {
+        let root = temp_dir("shared-config");
+        let source = seed_source_tree(&root);
+        std::fs::remove_dir_all(source.join("projects")).expect("remove projects");
+        std::os::unix::fs::symlink(&source, source.join("projects")).expect("symlink");
+
+        let error = plan_seed(&source, &root.join("target")).expect_err("credentials directory");
+        assert!(error.to_string().contains("holds credentials"), "{error}");
+
+        // Same shape without a credentials file: a link that swallows the
+        // profile directories themselves is still refused.
+        let bare = root.join("bare");
+        std::fs::create_dir_all(&bare).expect("bare source");
+        std::os::unix::fs::symlink(&root, bare.join("todos")).expect("symlink");
+        let error = plan_seed(&bare, &root.join("target2")).expect_err("ancestor");
+        assert!(
+            error.to_string().contains("contains an account profile"),
+            "{error}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

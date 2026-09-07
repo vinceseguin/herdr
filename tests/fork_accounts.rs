@@ -461,6 +461,66 @@ fn account_add_seeds_shared_transcripts_and_private_identity() {
         "{}",
         stderr_of(&again)
     );
+
+    // A different name pointing at an existing profile's directory would be
+    // two accounts on one login. The spelling must not decide it: `..` and a
+    // symlinked ancestor are the same directory.
+    let sneaky = lab
+        .root
+        .join("profiles")
+        .join("third")
+        .join("..")
+        .join(SECOND_PROFILE);
+    let refused = lab.herdr(&[
+        "account",
+        "add",
+        "sneaky",
+        "--config-dir",
+        sneaky.to_str().expect("utf-8 path"),
+    ]);
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "{}{}",
+        stdout_of(&refused),
+        stderr_of(&refused)
+    );
+    assert!(
+        stderr_of(&refused).contains("must not share a directory"),
+        "{}",
+        stderr_of(&refused)
+    );
+
+    std::os::unix::fs::symlink(lab.root.join("profiles"), lab.root.join("linked-profiles"))
+        .expect("symlink the profiles directory");
+    let linked = lab.root.join("linked-profiles").join(SECOND_PROFILE);
+    let refused = lab.herdr(&[
+        "account",
+        "add",
+        "linked",
+        "--config-dir",
+        linked.to_str().expect("utf-8 path"),
+    ]);
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "{}{}",
+        stdout_of(&refused),
+        stderr_of(&refused)
+    );
+    assert!(
+        stderr_of(&refused).contains("must not share a directory"),
+        "{}",
+        stderr_of(&refused)
+    );
+    let after_refusals = stdout_of(&lab.herdr(&["account", "list", "--json"]));
+    let listed_after: Vec<serde_json::Value> =
+        serde_json::from_str(&after_refusals).expect("account list --json is JSON");
+    assert_eq!(
+        listed_after.len(),
+        3,
+        "a refused add records nothing: {after_refusals}"
+    );
 }
 
 #[test]
@@ -523,6 +583,11 @@ fn account_default_prefers_store_and_remove_refuses_config_profiles() {
         "a refused remove must not touch the directory"
     );
 
+    // Seeded from the default profile, so its transcripts are that profile's.
+    let shared = lab.profile_dir(DEFAULT_PROFILE).join("projects");
+    std::fs::write(shared.join("a.jsonl"), "{}").expect("transcript");
+    assert!(target.join("projects").join("a.jsonl").is_file());
+
     // The store profile can go, directory and all.
     let removed = lab.herdr(&["account", "remove", "third", "--delete-dir"]);
     assert!(
@@ -532,6 +597,18 @@ fn account_default_prefers_store_and_remove_refuses_config_profiles() {
         stderr_of(&removed)
     );
     assert!(!target.exists(), "--delete-dir removes the directory");
+
+    // Deleting a profile deletes its own directory and nothing through its
+    // symlinks: the transcripts and the login it shared are the other
+    // profile's.
+    assert!(
+        shared.join("a.jsonl").is_file(),
+        "--delete-dir followed a shared symlink"
+    );
+    assert!(lab
+        .profile_dir(DEFAULT_PROFILE)
+        .join(".credentials.json")
+        .is_file());
 
     // The stored default named the profile that just left, so the config
     // default is in charge again — and nothing reports an unknown default.
