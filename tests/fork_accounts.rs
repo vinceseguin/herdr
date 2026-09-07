@@ -304,3 +304,292 @@ fn a_section_of_the_wrong_shape_is_reported_not_silently_empty() {
 
     std::fs::write(&config, original).expect("restore the lab config");
 }
+
+/// The credential hazard of the whole epic, asserted end to end: a new profile
+/// is seeded from an existing one, shares its transcripts, carries its
+/// settings *without* the source's identity, and is logged out.
+#[test]
+fn account_add_seeds_shared_transcripts_and_private_identity() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut lab = Lab::new("add");
+    assert!(lab.up().status.success());
+
+    let source = lab.profile_dir(DEFAULT_PROFILE);
+    let credentials = source.join(".credentials.json");
+    let before = std::fs::metadata(&credentials)
+        .expect("source credentials")
+        .modified()
+        .expect("mtime");
+    let target = lab.root.join("profiles").join("third");
+
+    let dry = lab.herdr(&[
+        "account",
+        "add",
+        "third",
+        "--config-dir",
+        target.to_str().expect("utf-8 path"),
+        "--dry-run",
+    ]);
+    assert!(
+        dry.status.success(),
+        "dry run failed: {}{}",
+        stdout_of(&dry),
+        stderr_of(&dry)
+    );
+    let plan = stdout_of(&dry);
+    assert!(plan.contains("would create"), "{plan}");
+    assert!(plan.contains("link  projects"), "{plan}");
+    assert!(
+        plan.contains(".credentials.json: private to each account"),
+        "{plan}"
+    );
+    assert!(!target.exists(), "--dry-run must write nothing");
+
+    let added = lab.herdr(&[
+        "account",
+        "add",
+        "third",
+        "--config-dir",
+        target.to_str().expect("utf-8 path"),
+        "--json",
+    ]);
+    assert!(
+        added.status.success(),
+        "add failed: {}{}",
+        stdout_of(&added),
+        stderr_of(&added)
+    );
+    let outcome: serde_json::Value =
+        serde_json::from_str(&stdout_of(&added)).expect("account add --json is JSON");
+    assert_eq!(outcome["profile"]["name"], "third");
+    assert_eq!(outcome["profile"]["logged_in"], false);
+    assert_eq!(outcome["profile"]["hook_installed"], true);
+    assert_eq!(outcome["stored"], true);
+    assert_eq!(
+        outcome["seeded_from"].as_str(),
+        source.to_str(),
+        "the default profile is the seed source"
+    );
+
+    // Nothing that could be a credential is printed.
+    let printed = format!("{}{}", stdout_of(&added), stderr_of(&added)).to_ascii_lowercase();
+    for forbidden in ["oauth", "credentials.json", "accesstoken", "secret"] {
+        assert!(
+            !printed.contains(forbidden),
+            "{forbidden} was printed: {printed}"
+        );
+    }
+
+    // Directory: 0700, transcripts shared, identity scrubbed, logged out.
+    assert_eq!(
+        std::fs::metadata(&target)
+            .expect("target metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let projects = target.join("projects");
+    assert!(
+        std::fs::symlink_metadata(&projects)
+            .expect("projects")
+            .file_type()
+            .is_symlink(),
+        "transcripts are shared by symlink"
+    );
+    assert_eq!(
+        std::fs::canonicalize(&projects).expect("canonical"),
+        std::fs::canonicalize(source.join("projects")).expect("canonical source"),
+    );
+
+    let seeded: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(target.join(".claude.json")).expect("seeded .claude.json"),
+    )
+    .expect("json");
+    assert_eq!(
+        seeded.get("oauthAccount"),
+        None,
+        "the source account's identity must not follow the seed"
+    );
+    assert_eq!(seeded["hasCompletedOnboarding"], serde_json::json!(true));
+
+    assert!(
+        !target.join(".credentials.json").exists(),
+        "a seeded profile is logged out until `herdr account login`"
+    );
+    assert_eq!(
+        std::fs::metadata(&credentials)
+            .expect("source credentials")
+            .modified()
+            .expect("mtime"),
+        before,
+        "the source profile's credentials file was touched"
+    );
+
+    // The hook landed in the new profile, not the ambient directory.
+    assert!(target.join("hooks").join("herdr-agent-state.sh").is_file());
+    let settings = std::fs::read_to_string(target.join("settings.json")).expect("settings.json");
+    assert!(settings.contains("SessionStart"), "{settings}");
+    assert!(
+        !lab.ambient_dir().join("hooks").exists(),
+        "the hook must not land in the ambient directory"
+    );
+
+    // And it is a real profile now.
+    let listed = lab.herdr(&["account", "list", "--json"]);
+    let rows = rows(&listed);
+    let third = rows
+        .iter()
+        .find(|row| row["name"] == "third")
+        .expect("third is listed");
+    assert_eq!(third["origin"], "store");
+    assert_eq!(third["logged_in"], false);
+    assert_eq!(third["default"], false);
+
+    // A second add of the same name changes nothing.
+    let again = lab.herdr(&[
+        "account",
+        "add",
+        "third",
+        "--config-dir",
+        target.to_str().expect("utf-8 path"),
+    ]);
+    assert_eq!(again.status.code(), Some(1), "{}", stdout_of(&again));
+    assert!(
+        stderr_of(&again).contains("already exists"),
+        "{}",
+        stderr_of(&again)
+    );
+}
+
+#[test]
+fn account_default_prefers_store_and_remove_refuses_config_profiles() {
+    let mut lab = Lab::new("default");
+    assert!(lab.up().status.success());
+
+    let target = lab.root.join("profiles").join("third");
+    let added = lab.herdr(&[
+        "account",
+        "add",
+        "third",
+        "--config-dir",
+        target.to_str().expect("utf-8 path"),
+        "--no-hook",
+    ]);
+    assert!(
+        added.status.success(),
+        "add failed: {}{}",
+        stdout_of(&added),
+        stderr_of(&added)
+    );
+
+    // The config marks `perso` default; the store's choice beats the flag.
+    let chosen = lab.herdr(&["account", "default", "third"]);
+    assert!(
+        chosen.status.success(),
+        "default failed: {}{}",
+        stdout_of(&chosen),
+        stderr_of(&chosen)
+    );
+    let listed = rows(&lab.herdr(&["account", "list", "--json"]));
+    let defaults: Vec<&str> = listed
+        .iter()
+        .filter(|row| row["default"] == true)
+        .filter_map(|row| row["name"].as_str())
+        .collect();
+    assert_eq!(defaults, vec!["third"], "{listed:#?}");
+
+    let unknown = lab.herdr(&["account", "default", "nope"]);
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(stderr_of(&unknown).contains("unknown account profile"));
+
+    // A [[accounts]] profile is the user's to remove, not herdr's.
+    let refused = lab.herdr(&["account", "remove", DEFAULT_PROFILE]);
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "{}{}",
+        stdout_of(&refused),
+        stderr_of(&refused)
+    );
+    assert!(
+        stderr_of(&refused).contains("config.toml"),
+        "{}",
+        stderr_of(&refused)
+    );
+    assert!(
+        lab.profile_dir(DEFAULT_PROFILE).is_dir(),
+        "a refused remove must not touch the directory"
+    );
+
+    // The store profile can go, directory and all.
+    let removed = lab.herdr(&["account", "remove", "third", "--delete-dir"]);
+    assert!(
+        removed.status.success(),
+        "remove failed: {}{}",
+        stdout_of(&removed),
+        stderr_of(&removed)
+    );
+    assert!(!target.exists(), "--delete-dir removes the directory");
+
+    // The stored default named the profile that just left, so the config
+    // default is in charge again — and nothing reports an unknown default.
+    let output = lab.herdr(&["account", "list", "--json"]);
+    assert!(stderr_of(&output).is_empty(), "{}", stderr_of(&output));
+    let remaining = rows(&output);
+    assert_eq!(remaining.len(), 2, "{remaining:#?}");
+    assert_eq!(remaining[0]["name"], DEFAULT_PROFILE);
+    assert_eq!(remaining[0]["default"], true);
+}
+
+/// `--delete-dir` deletes credentials, so every way the directory could be
+/// somebody else's is refused. The ambient Claude directory is the one a user
+/// can realistically point a profile at by mistake.
+#[test]
+fn account_remove_refuses_to_delete_the_ambient_directory() {
+    let mut lab = Lab::new("ambient-rm");
+    assert!(lab.up().status.success());
+
+    let ambient = lab.ambient_dir();
+    let added = lab.herdr(&[
+        "account",
+        "add",
+        "amb",
+        "--config-dir",
+        ambient.to_str().expect("utf-8 path"),
+        "--no-hook",
+    ]);
+    assert!(
+        added.status.success(),
+        "add failed: {}{}",
+        stdout_of(&added),
+        stderr_of(&added)
+    );
+
+    let removed = lab.herdr(&["account", "remove", "amb", "--delete-dir"]);
+    assert_eq!(
+        removed.status.code(),
+        Some(1),
+        "{}{}",
+        stdout_of(&removed),
+        stderr_of(&removed)
+    );
+    assert!(
+        stderr_of(&removed).contains("ambient Claude directory"),
+        "{}",
+        stderr_of(&removed)
+    );
+    assert!(ambient.is_dir(), "a refused delete leaves the directory");
+
+    // Without --delete-dir the profile still goes away, directory intact.
+    let removed = lab.herdr(&["account", "remove", "amb"]);
+    assert!(
+        removed.status.success(),
+        "{}{}",
+        stdout_of(&removed),
+        stderr_of(&removed)
+    );
+    assert!(ambient.is_dir());
+    assert_eq!(rows(&lab.herdr(&["account", "list", "--json"])).len(), 2);
+}

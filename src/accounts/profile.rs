@@ -355,7 +355,7 @@ pub fn resolve(
 /// Mirrors `crate::integration::env::home_dir`, which is private to a module
 /// fork work must not edit. Resolution order is the same: `$HOME`, then the
 /// Windows profile variables.
-fn home_dir() -> Option<PathBuf> {
+pub fn home_dir() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(home));
     }
@@ -381,7 +381,10 @@ fn home_dir() -> Option<PathBuf> {
 /// Expand a leading `~` against `home`, mirroring
 /// `crate::integration::env::expand_tilde_path`, but against an explicit home
 /// so the merge stays pure.
-fn expand(raw: &str, home: &Path) -> PathBuf {
+///
+/// `herdr account add` expands `--config-dir` the same way, so a directory
+/// written into `profiles.toml` is the one `resolve` will read back.
+pub fn expand(raw: &str, home: &Path) -> PathBuf {
     if raw == "~" {
         return home.to_path_buf();
     }

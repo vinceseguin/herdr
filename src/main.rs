@@ -652,6 +652,9 @@ fn main() -> io::Result<()> {
         println!("       herdr completion <shell>");
         println!("       herdr fleet status [--json] [--watch]");
         println!("       herdr account list [--json]");
+        println!("       herdr account add <name> [--config-dir <path>] [--from <profile>]");
+        println!("       herdr account remove <name> [--delete-dir]");
+        println!("       herdr account default <name>");
         #[cfg(feature = "gateway")]
         println!("       {}", crate::gateway::GATEWAY_COMMAND_LINE);
         println!("       herdr config <subcommand> ...");
