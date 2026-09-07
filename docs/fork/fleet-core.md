@@ -236,7 +236,11 @@ later; the typed forms are `FleetWorkspaceRef`, `FleetTabRef` and
 
 Two per-host counters are **not** comparable across hosts:
 
-- `boot_id` / `revision` are one server's snapshot identity.
+- `boot_id` / `revision` are one server's snapshot identity. `revision` is
+  counted per *client connection* and restarts at 1 for each one, so it can go
+  **backwards** on an unchanged `boot_id` when a host reconnects. Treat the
+  first snapshot after a `host_connection … connected` as the new baseline;
+  never drop it for carrying a lower number than the one you hold.
 - `state_change_seq` restarts at every server boot.
 
 For cross-host recency the fleet assigns its own monotonic `fleet_change_seq`
