@@ -411,13 +411,18 @@ restarting at 1 for each one, while `boot_id` only changes when the *server*
 restarts. The fleet compared revisions across connections, so the reconnect's
 seed — the one message carrying everything that changed during the outage —
 was dropped as stale. It only ever showed up on ssh because an ssh host is the
-only kind that can lose its connection while its server keeps running; a local
-host's reconnect always brings a new `boot_id`, which the old rule accepted.
+only kind whose link routinely dies while its server keeps running; a local
+host's connection outlives everything short of its server, and a server that
+died brings a new `boot_id`, which the old rule accepted.
 
-The fix is client-side and one field: a host marked at every `HostEvent::Connected`
-accepts its next snapshot whatever revision it carries, then returns to the
-ordinary monotonic rule. Servers stay stock (principle 1), the wire is
-untouched, and the passive hello of decision (p) is unaffected.
+The fix is client-side and one field: a host marked at every
+`HostEvent::Connected` accepts its next snapshot whatever revision it carries,
+then returns to the ordinary monotonic rule; every other connection state
+clears the mark, so it never outlives the connection that set it. It is the
+same rule upstream's own multi-machine client already applies through
+`ClientShellEndpoint::snapshot_generation`, which the fleet had not mirrored.
+Servers stay stock (principle 1), the wire is untouched, and the passive hello
+of decision (p) is unaffected.
 
 **Depends on:** E1.
 **Open decisions (default in bold):** (a) HTTP/WS stack — **`axum` (with its
