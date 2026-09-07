@@ -459,10 +459,11 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             // Fork (E9): grade the launch against the process's own
             // environment and record `tokens.account`, then add the two
             // contract keys to the stock response.
-            let Some(plan) = account_plan else {
+            let Some(applied) = account_plan else {
                 return super::print_response(&response);
             };
-            let outcome = crate::accounts::client::finish(&plan);
+            let agent_name = applied.plan().name.clone();
+            let outcome = applied.finish();
             response["result"]["account"] = serde_json::Value::String(outcome.account.clone());
             response["result"]["account_state"] =
                 serde_json::Value::String(outcome.account_state.as_str().to_string());
@@ -472,12 +473,10 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             }
             if outcome.account_state == crate::accounts::tokens::AccountState::Mismatch {
                 eprintln!(
-                    "error: agent {:?} is not running under account {:?}: its {} is {:?}. \
+                    "error: agent {agent_name:?} is not running under account {:?}: {}. \
                      The account token records the mismatch; stop the agent and start it again.",
-                    plan.name,
                     outcome.account,
-                    plan.profile.agent.config_dir_env_var(),
-                    outcome.actual_config_dir.as_deref().unwrap_or("unknown"),
+                    outcome.mismatch_detail(),
                 );
                 return Ok(1);
             }
@@ -497,13 +496,17 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
 /// happens before a byte reaches the pane, and every one of them is an error:
 /// falling back to "start it anyway" is how an agent ends up billing the wrong
 /// Claude account without anyone noticing.
+///
+/// `Ok(Some(_))` hands back a guard that owns the fact that the pane's shell
+/// now carries the variable, so every way this command can fail afterwards
+/// says so without the stock code paths having to know about accounts.
 fn prepare_account_launch(
     expected_kind: &str,
     account: Option<&str>,
     pane_id: &str,
     name: &str,
     agent_args: &[String],
-) -> Result<Option<crate::accounts::launch::LaunchPlan>, i32> {
+) -> Result<Option<crate::accounts::client::AppliedLine>, i32> {
     if expected_kind != crate::accounts::tokens::AGENT_LABEL {
         // Decision (c): profiles configure Claude only for now. Silently
         // ignoring `--account` on another kind would look like it worked.
@@ -540,11 +543,13 @@ fn prepare_account_launch(
             return Err(1);
         }
     };
-    if let Err(error) = crate::accounts::client::apply_env(&plan) {
-        eprintln!("{error}");
-        return Err(1);
+    match crate::accounts::client::apply_env(plan) {
+        Ok(applied) => Ok(Some(applied)),
+        Err(error) => {
+            eprintln!("{error}");
+            Err(1)
+        }
     }
-    Ok(Some(plan))
 }
 
 fn agent_list(args: &[String]) -> std::io::Result<i32> {

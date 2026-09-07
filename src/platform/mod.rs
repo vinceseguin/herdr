@@ -406,52 +406,85 @@ pub(crate) fn parse_agent_env_hint(environ: &[u8]) -> Option<crate::detect::Agen
 #[cfg(any(target_os = "linux", test))]
 const MAX_PROCESS_ENVIRON_BYTES: usize = 1024 * 1024;
 
+/// What another process's environment says about one variable.
+///
+/// The three answers have to stay distinct. [`ProcessEnvVar::Unset`] is
+/// *evidence*: the process was execed without the variable, so it is running
+/// against whatever default its own program picks. [`ProcessEnvVar::Unreadable`]
+/// is the *absence* of evidence. Collapsing the two — the obvious `Option`
+/// shape — would let an agent that really launched under the ambient account
+/// be reported as merely unverified, which is the silent wrong-account outcome
+/// the account tooling exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+// Where there is no `/proc` only `Unreadable` is ever constructed. The other
+// two are still part of the contract every caller matches on, so they are not
+// dead code there — they are simply unreachable on that target.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum ProcessEnvVar {
+    /// The environment could not be read: no `/proc`, the process is gone, the
+    /// read was refused, or the blob was empty or larger than the cap.
+    Unreadable,
+    /// The environment was read and does not contain the variable.
+    Unset,
+    /// The environment was read and the variable holds this value.
+    Set(String),
+}
+
 /// One variable out of another process's environment, where the OS exposes it.
 ///
 /// Linux publishes a process's initial environment at `/proc/<pid>/environ`,
 /// readable for the caller's own processes. Nothing equivalent and portable
-/// exists elsewhere, so every other target returns `None`.
+/// exists elsewhere, so every other target answers
+/// [`ProcessEnvVar::Unreadable`].
 ///
-/// `None` means *not known*, never *not set*: a caller deciding which account
-/// an agent runs under must report that as unverified, never as verified.
 /// Note the value is the environment the process was **execed** with; a later
 /// `setenv` inside the process is not visible here, which is exactly the
 /// property that makes this a launch check and not a shell check.
 #[cfg(target_os = "linux")]
-pub(crate) fn process_env_var(pid: u32, name: &str) -> Option<String> {
+pub(crate) fn process_env_var(pid: u32, name: &str) -> ProcessEnvVar {
     if pid == 0 {
-        return None;
+        return ProcessEnvVar::Unreadable;
     }
-    let file = std::fs::File::open(format!("/proc/{pid}/environ")).ok()?;
-    let LimitedRead::Complete(environ) =
-        read_limited_reader(file, MAX_PROCESS_ENVIRON_BYTES).ok()?
+    let Ok(file) = std::fs::File::open(format!("/proc/{pid}/environ")) else {
+        return ProcessEnvVar::Unreadable;
+    };
+    // `Empty` is deliberately not `Unset`: a zombie and a process whose
+    // environment the kernel will not hand over both read as zero bytes, and
+    // neither says anything about the variable.
+    let Ok(LimitedRead::Complete(environ)) = read_limited_reader(file, MAX_PROCESS_ENVIRON_BYTES)
     else {
-        return None;
+        return ProcessEnvVar::Unreadable;
     };
     parse_environ_blob(&environ, name)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn process_env_var(_pid: u32, _name: &str) -> Option<String> {
-    None
+pub(crate) fn process_env_var(_pid: u32, _name: &str) -> ProcessEnvVar {
+    ProcessEnvVar::Unreadable
 }
 
 /// Pull `name` out of a NUL-separated `environ` blob.
 ///
 /// First match wins, matching what the C library hands a process for a
-/// duplicated name. A value that is not valid UTF-8 is reported as unknown
+/// duplicated name. A value that is not valid UTF-8 reads as *unreadable*
 /// rather than lossily repaired: a mangled path compared against a real one
-/// would answer a question nobody asked.
+/// would answer a question nobody asked, and it is no evidence that the
+/// variable is absent either.
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn parse_environ_blob(environ: &[u8], name: &str) -> Option<String> {
+pub(crate) fn parse_environ_blob(environ: &[u8], name: &str) -> ProcessEnvVar {
     let mut prefix = Vec::with_capacity(name.len() + 1);
     prefix.extend_from_slice(name.as_bytes());
     prefix.push(b'=');
-    environ
+    let Some(value) = environ
         .split(|&byte| byte == 0)
         .find_map(|record| record.strip_prefix(prefix.as_slice()))
-        .and_then(|value| std::str::from_utf8(value).ok())
-        .map(str::to_owned)
+    else {
+        return ProcessEnvVar::Unset;
+    };
+    match std::str::from_utf8(value) {
+        Ok(value) => ProcessEnvVar::Set(value.to_owned()),
+        Err(_) => ProcessEnvVar::Unreadable,
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -680,7 +713,8 @@ mod tests {
 
 /// Reading another process's environment is how herdr proves which Claude
 /// account an agent actually launched under, so the parse is tested on every
-/// target even where [`process_env_var`] itself always answers `None`.
+/// target even where [`process_env_var`] itself always answers
+/// [`ProcessEnvVar::Unreadable`].
 #[cfg(test)]
 mod process_environ_tests {
     use super::*;
@@ -698,39 +732,50 @@ mod process_environ_tests {
     fn reads_a_variable_from_a_nul_separated_blob() {
         let environ = blob(&["PATH=/usr/bin", "CLAUDE_CONFIG_DIR=/p/work", "TERM=xterm"]);
         assert_eq!(
-            parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR").as_deref(),
-            Some("/p/work")
+            parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR"),
+            ProcessEnvVar::Set("/p/work".to_string())
         );
     }
 
+    /// The distinction the account tooling grades on: a blob that was read and
+    /// does not carry the variable is evidence, not ignorance.
     #[test]
-    fn a_missing_variable_is_unknown_rather_than_empty() {
+    fn a_missing_variable_is_unset_rather_than_unreadable() {
         let environ = blob(&["PATH=/usr/bin", "TERM=xterm"]);
-        assert_eq!(parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR"), None);
-        assert_eq!(parse_environ_blob(&[], "CLAUDE_CONFIG_DIR"), None);
+        assert_eq!(
+            parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR"),
+            ProcessEnvVar::Unset
+        );
+        assert_eq!(
+            parse_environ_blob(&[], "CLAUDE_CONFIG_DIR"),
+            ProcessEnvVar::Unset
+        );
     }
 
     #[test]
     fn an_empty_value_is_read_as_an_empty_value() {
         let environ = blob(&["CLAUDE_CONFIG_DIR="]);
         assert_eq!(
-            parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR").as_deref(),
-            Some("")
+            parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR"),
+            ProcessEnvVar::Set(String::new())
         );
     }
 
     #[test]
     fn a_name_that_is_only_a_prefix_of_another_never_matches_it() {
         let environ = blob(&["CLAUDE_CONFIG_DIRECTORY=/p/wrong", "CLAUDE=/p/other"]);
-        assert_eq!(parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR"), None);
+        assert_eq!(
+            parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR"),
+            ProcessEnvVar::Unset
+        );
     }
 
     #[test]
     fn the_first_record_wins_the_way_a_c_library_resolves_a_duplicate() {
         let environ = blob(&["CLAUDE_CONFIG_DIR=/p/first", "CLAUDE_CONFIG_DIR=/p/second"]);
         assert_eq!(
-            parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR").as_deref(),
-            Some("/p/first")
+            parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR"),
+            ProcessEnvVar::Set("/p/first".to_string())
         );
     }
 
@@ -740,22 +785,41 @@ mod process_environ_tests {
         // rewrote its own environment block may not.
         let environ = b"CLAUDE_CONFIG_DIR=/p/work".to_vec();
         assert_eq!(
-            parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR").as_deref(),
-            Some("/p/work")
+            parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR"),
+            ProcessEnvVar::Set("/p/work".to_string())
+        );
+    }
+
+    /// Not UTF-8 is *unreadable*, not unset: the record is there, so it is no
+    /// evidence that the variable is absent, and a lossy repair would compare
+    /// a mangled path against a real one.
+    #[test]
+    fn a_value_that_is_not_utf8_is_unreadable_rather_than_repaired() {
+        let mut environ = b"CLAUDE_CONFIG_DIR=/p/".to_vec();
+        environ.push(0xff);
+        environ.push(0);
+        assert_eq!(
+            parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR"),
+            ProcessEnvVar::Unreadable
         );
     }
 
     #[test]
-    fn a_value_that_is_not_utf8_is_unknown_rather_than_repaired() {
-        let mut environ = b"CLAUDE_CONFIG_DIR=/p/".to_vec();
-        environ.push(0xff);
-        environ.push(0);
-        assert_eq!(parse_environ_blob(&environ, "CLAUDE_CONFIG_DIR"), None);
+    fn pid_zero_is_never_probed() {
+        assert_eq!(
+            process_env_var(0, "CLAUDE_CONFIG_DIR"),
+            ProcessEnvVar::Unreadable
+        );
     }
 
+    /// A pid that cannot be read is never mistaken for a process without the
+    /// variable. `u32::MAX` is above every `pid_max`, so no process owns it.
     #[test]
-    fn pid_zero_is_never_probed() {
-        assert_eq!(process_env_var(0, "CLAUDE_CONFIG_DIR"), None);
+    fn an_unreadable_process_is_unreadable_not_unset() {
+        assert_eq!(
+            process_env_var(u32::MAX, "CLAUDE_CONFIG_DIR"),
+            ProcessEnvVar::Unreadable
+        );
     }
 
     /// The real read, where the platform has one: this test process's own
@@ -767,9 +831,15 @@ mod process_environ_tests {
         let name = "HERDR_PLATFORM_ENVIRON_PROBE";
         assert_eq!(
             process_env_var(pid, name),
-            None,
+            ProcessEnvVar::Unset,
             "the probe variable must not already be set"
         );
-        assert_eq!(process_env_var(pid, "PATH"), std::env::var("PATH").ok());
+        // `/proc/self/environ` is the exec-time block, so this compares against
+        // the `PATH` this process was started with, not one a test may have
+        // changed since.
+        match process_env_var(pid, "PATH") {
+            ProcessEnvVar::Set(path) => assert!(!path.is_empty()),
+            other => panic!("PATH should be readable for our own process: {other:?}"),
+        }
     }
 }

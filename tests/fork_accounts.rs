@@ -898,3 +898,87 @@ fn agent_start_refuses_a_busy_pane_before_typing_anything() {
         "nothing may have been launched"
     );
 }
+
+/// The contract that makes the whole epic trustworthy: when the environment
+/// line does *not* reach the launched agent, herdr says so and fails, instead
+/// of reporting the requested account and billing another one.
+///
+/// The pane is put at a `read` builtin, which leaves the shell itself in the
+/// foreground — so the pane still looks idle to every gate herdr has — but
+/// makes it swallow the next line typed at it. `claude` then starts without
+/// the profile, under whatever directory the pane already had.
+#[test]
+fn agent_start_reports_a_mismatch_when_the_shell_swallows_the_environment_line() {
+    let mut lab = Lab::new("swallow");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    // `printf` and `read` are both builtins, so nothing but the shell is ever
+    // in the pane's foreground; the marker tells us `read` is now running.
+    // The markers are assembled by `printf` so the shell's echo of the typed
+    // line cannot be mistaken for its output: the screen only ever shows
+    // `SWALLOWREADY` or `ATEIT=` once the command has actually run.
+    let sent = lab.herdr(&[
+        "pane",
+        "send-text",
+        &pane,
+        "printf 'SWALLOW%s\\n' READY; read swallowed; printf 'ATE%s=%s\\n' IT \"$swallowed\"\r",
+    ]);
+    assert!(sent.status.success(), "{}", stderr_of(&sent));
+
+    let mut ready = false;
+    for _ in 0..80 {
+        let screen = stdout_of(&lab.herdr(&["pane", "read", &pane, "--source", "recent"]));
+        if screen.contains("SWALLOWREADY") {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(ready, "the pane never reached the read builtin");
+
+    let output = start_agent(&lab, "a1", &["--account", SECOND_PROFILE]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a launch that missed its profile must fail: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let response = json_of(&output);
+    assert_eq!(
+        response["result"]["account_state"], "mismatch",
+        "{response:#?}"
+    );
+    assert_eq!(response["result"]["account"], SECOND_PROFILE);
+    assert!(
+        stderr_of(&output).contains("is not running under account"),
+        "{}",
+        stderr_of(&output)
+    );
+
+    // The shell really did eat the line, and the agent really did run
+    // somewhere else — the lab's ambient directory, not the profile.
+    let screen = stdout_of(&lab.herdr(&["pane", "read", &pane, "--source", "recent"]));
+    assert!(
+        screen.contains("ATEIT="),
+        "the read builtin should have consumed the export line: {screen}"
+    );
+    assert!(
+        !lab.profile_dir(SECOND_PROFILE)
+            .join("last-launch.json")
+            .exists(),
+        "the profile must not have been launched into"
+    );
+    assert!(
+        lab.ambient_dir().join("last-launch.json").is_file(),
+        "the agent ran under the pane's ambient directory"
+    );
+
+    // And the mismatch is recorded where every other surface reads it.
+    let agent = json_of(&lab.herdr(&["agent", "get", "a1"]));
+    assert_eq!(
+        agent["result"]["agent"]["tokens"]["account_state"], "mismatch",
+        "{agent:#?}"
+    );
+}

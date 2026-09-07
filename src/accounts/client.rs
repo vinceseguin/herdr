@@ -17,13 +17,21 @@
 //!    lines in order, so the agent's command line is read after the export has
 //!    been executed;
 //! 4. read the launched process's **own** environment and report `ok` only
-//!    when it really names the profile's directory. Where that cannot be read
-//!    the answer is `unverified`; where it names something else it is
-//!    `mismatch`, and the command fails.
+//!    when it really names the profile's directory. Where that environment
+//!    cannot be read at all the answer is `unverified`; where it was read and
+//!    names something else — including *nothing at all*, which means the agent
+//!    is running against its own default directory — it is `mismatch`, and the
+//!    command fails.
 //!
 //! Step 4 is why `AccountState::Ok` is never assumed from a successful send:
 //! the export could have been swallowed by a shell that was not where herdr
-//! thought it was, and billing the wrong Claude account is silent.
+//! thought it was (a `read` builtin, a continuation prompt), and billing the
+//! wrong Claude account is silent.
+//!
+//! The probe reads `/proc` on the machine this CLI runs on, which is the
+//! machine the pane lives on: `crate::cli::send_request` only ever speaks to
+//! the local API socket, so the pids `pane.process_info` reports are local
+//! pids.
 
 use std::time::{Duration, Instant};
 
@@ -38,6 +46,7 @@ use crate::api::schema::{
     Method, PaneProcessInfo, PaneProcessInfoParams, PaneReportMetadataParams, PaneSendTextParams,
     Request,
 };
+use crate::platform::ProcessEnvVar;
 
 /// How long to wait for the shell to finish running the assignment before
 /// starting the agent anyway. `agent.start` has its own busy retry, and the
@@ -60,10 +69,33 @@ pub struct LaunchOutcome {
     /// The line that was typed, for the record and for a failure message that
     /// tells the user what to rerun by hand.
     pub line: String,
-    /// The directory the launched process really names, when it could be read
-    /// and differs from the profile's. Only ever set for `mismatch`.
+    /// The variable the profile is applied through, so a message can name it
+    /// without reaching back into the plan.
+    pub variable: &'static str,
+    /// The directory the launched process really names, when its environment
+    /// was read and disagreed with the profile. `None` alongside
+    /// [`AccountState::Mismatch`] means the environment was read and the
+    /// variable was not there at all.
     pub actual_config_dir: Option<String>,
     pub warnings: Vec<String>,
+}
+
+impl LaunchOutcome {
+    /// What the launched process's environment actually said, phrased for the
+    /// error the CLI prints on a mismatch.
+    ///
+    /// The two cases read very differently to a user: a wrong directory is a
+    /// misconfiguration, while no directory at all means the assignment never
+    /// ran and the agent is on whatever account Claude picks by itself.
+    pub fn mismatch_detail(&self) -> String {
+        match self.actual_config_dir.as_deref() {
+            Some(dir) => format!("its {} is {dir:?}", self.variable),
+            None => format!(
+                "it has no {} at all, so it is running against Claude's own default directory",
+                self.variable
+            ),
+        }
+    }
 }
 
 /// Why an account launch could not be carried out.
@@ -173,12 +205,81 @@ pub fn prepare(
     plan_launch(profile, &inspection, pane_id, name, args, shell).map_err(AccountLaunchError::Plan)
 }
 
+/// A pane that has had the environment line typed into it.
+///
+/// The exported directory outlives everything that happens next: whatever
+/// `agent.start` makes of the pane, its shell keeps the variable until it
+/// exits. So a launch that ends anywhere other than [`AppliedLine::finish`]
+/// says so on the way out — a later `claude` started in that pane, by hand or
+/// by a `--account none` start, would otherwise run under a profile nobody
+/// mentioned, which is the same silent wrong-account failure this module
+/// exists to prevent. `agent.start` can fail long after the line landed (busy
+/// pane, lost terminal, readiness timeout, transport error), and each of those
+/// returns from a different place, so the notice is tied to the value's
+/// lifetime rather than repeated at every exit.
+pub struct AppliedLine {
+    plan: LaunchPlan,
+    graded: bool,
+}
+
+impl AppliedLine {
+    /// The plan behind the line, for a caller that needs to name it before
+    /// [`AppliedLine::finish`] consumes the guard.
+    pub fn plan(&self) -> &LaunchPlan {
+        &self.plan
+    }
+
+    /// Grade the launch and record it. Called once `agent.start` has reported
+    /// the agent ready; taking `self` is what disarms the notice above.
+    pub fn finish(mut self) -> LaunchOutcome {
+        self.graded = true;
+        let plan = &self.plan;
+        let (account_state, actual_config_dir) = verify(plan);
+        let mut warnings = plan.warnings.clone();
+        if let Err(detail) = report(plan, account_state) {
+            warnings.push(format!(
+                "could not record the account on pane {}: {detail}; the agent is running under \
+                 {:?} but `herdr agent list` will not show it",
+                plan.pane_id, plan.profile.name
+            ));
+        }
+        LaunchOutcome {
+            account: plan.profile.name.clone(),
+            account_state,
+            line: plan.line.clone(),
+            variable: plan.profile.agent.config_dir_env_var(),
+            actual_config_dir,
+            warnings,
+        }
+    }
+}
+
+impl Drop for AppliedLine {
+    fn drop(&mut self) {
+        if self.graded {
+            return;
+        }
+        eprintln!(
+            "note: {} was already exported in pane {} when the start failed; that shell still \
+             points at {:?} (account {:?}) until it exits, so anything started there — including \
+             a later `--account none` start — will use it.",
+            self.plan.profile.agent.config_dir_env_var(),
+            self.plan.pane_id,
+            self.plan.expected_config_dir,
+            self.plan.profile.name,
+        );
+    }
+}
+
 /// Type the assignment, then wait for the shell to be back at its prompt.
 ///
 /// The wait is not the ordering guarantee — the pty delivers the export and
 /// the agent's command line in order, and the shell reads them in order — it
 /// only keeps `agent.start` from meeting a pane that is momentarily busy.
-pub fn apply_env(plan: &LaunchPlan) -> Result<(), AccountLaunchError> {
+///
+/// Consumes the plan and hands back the guard that owns it, so the pane's new
+/// state cannot be forgotten by a caller that fails later.
+pub fn apply_env(plan: LaunchPlan) -> Result<AppliedLine, AccountLaunchError> {
     let response = crate::cli::send_request(&Request {
         id: "cli:accounts:launch:send_text".into(),
         method: Method::PaneSendText(PaneSendTextParams {
@@ -195,6 +296,8 @@ pub fn apply_env(plan: &LaunchPlan) -> Result<(), AccountLaunchError> {
         typed: true,
     })?;
     if let Some(error) = response.get("error") {
+        // The server rejected the call (no such pane, bad text), so nothing
+        // was written to the pty.
         return Err(AccountLaunchError::Api {
             method: "pane.send_text",
             detail: error.to_string(),
@@ -202,8 +305,11 @@ pub fn apply_env(plan: &LaunchPlan) -> Result<(), AccountLaunchError> {
         });
     }
 
-    wait_for_prompt(plan);
-    Ok(())
+    wait_for_prompt(&plan);
+    Ok(AppliedLine {
+        plan,
+        graded: false,
+    })
 }
 
 /// Poll until the pane's shell holds the foreground again, or the budget runs
@@ -238,11 +344,12 @@ fn wait_for_prompt(plan: &LaunchPlan) {
 
 /// Read the launched process's own environment and grade the launch.
 ///
-/// Every process in the pane's foreground job was execed by the pane shell, so
-/// each one carries the environment the shell had at that moment. Reading all
-/// of them and demanding they agree is stricter than picking the one that
-/// looks like `claude`: a disagreement anywhere is reported as a mismatch
-/// rather than resolved in the launch's favour.
+/// Every process in the pane's foreground job was execed by the pane shell
+/// *after* the assignment was typed, so each one carries the environment the
+/// shell had at that moment. Reading all of them and demanding they agree is
+/// stricter than picking the one that looks like `claude`: a disagreement
+/// anywhere is reported as a mismatch rather than resolved in the launch's
+/// favour.
 ///
 /// Nothing readable at all — a platform without `/proc`, a process that has
 /// already exited, a permission error — is [`AccountState::Unverified`]. It is
@@ -264,30 +371,57 @@ pub fn verify(plan: &LaunchPlan) -> (AccountState, Option<String>) {
         return (AccountState::Unverified, None);
     };
     let variable = plan.profile.agent.config_dir_env_var();
-    let expected =
-        crate::accounts::config::dir_key(std::path::Path::new(&plan.expected_config_dir));
+    let readings: Vec<ProcessEnvVar> = info
+        .foreground_processes
+        .iter()
+        // The pane shell's `/proc` environment is its *exec-time* one, so it
+        // never shows the assignment that was just typed. Reading it would
+        // grade every launch against the wrong process.
+        .filter(|process| process.pid != shell_pid)
+        .map(|process| crate::platform::process_env_var(process.pid, variable))
+        .collect();
+    grade(&readings, &plan.expected_config_dir)
+}
 
+/// Turn what the probe read into a verdict, with no I/O, so the rule that
+/// decides whether herdr claims an account is testable on its own.
+///
+/// The three outcomes:
+///
+/// * any reading that names a **different** directory is a mismatch, whatever
+///   the others say — a launch is never resolved in its own favour;
+/// * otherwise a reading that names the **expected** directory is the evidence
+///   `ok` requires;
+/// * otherwise, if any environment was read at all and **none** of them
+///   carried the variable, the assignment did not reach the launched job: the
+///   agent is running against the agent's own default directory, which is a
+///   different account than the one asked for, so that is a mismatch too —
+///   reporting it as merely unverified would hide a wrong account behind a
+///   word that means "could not check";
+/// * only when nothing could be read is the answer
+///   [`AccountState::Unverified`].
+fn grade(readings: &[ProcessEnvVar], expected_config_dir: &str) -> (AccountState, Option<String>) {
+    let expected = crate::accounts::config::dir_key(std::path::Path::new(expected_config_dir));
     let mut read_any = false;
-    for process in &info.foreground_processes {
-        if process.pid == shell_pid {
-            // The pane shell's `/proc` environment is its *exec-time* one, so
-            // it never shows the assignment that was just typed. Reading it
-            // would produce a mismatch on every launch.
-            continue;
-        }
-        let Some(value) = crate::platform::process_env_var(process.pid, variable) else {
-            continue;
-        };
-        read_any = true;
-        if crate::accounts::config::dir_key(std::path::Path::new(&value)) != expected {
-            return (AccountState::Mismatch, Some(value));
+    let mut matched = false;
+    for reading in readings {
+        match reading {
+            ProcessEnvVar::Unreadable => {}
+            ProcessEnvVar::Unset => read_any = true,
+            ProcessEnvVar::Set(value) => {
+                read_any = true;
+                if crate::accounts::config::dir_key(std::path::Path::new(value)) != expected {
+                    return (AccountState::Mismatch, Some(value.clone()));
+                }
+                matched = true;
+            }
         }
     }
 
-    if read_any {
-        (AccountState::Ok, None)
-    } else {
-        (AccountState::Unverified, None)
+    match (matched, read_any) {
+        (true, _) => (AccountState::Ok, None),
+        (false, true) => (AccountState::Mismatch, None),
+        (false, false) => (AccountState::Unverified, None),
     }
 }
 
@@ -331,23 +465,102 @@ pub fn report(plan: &LaunchPlan, state: AccountState) -> Result<(), String> {
     }
 }
 
-/// Grade the launch and record it. Called once `agent.start` has reported the
-/// agent ready.
-pub fn finish(plan: &LaunchPlan) -> LaunchOutcome {
-    let (account_state, actual_config_dir) = verify(plan);
-    let mut warnings = plan.warnings.clone();
-    if let Err(detail) = report(plan, account_state) {
-        warnings.push(format!(
-            "could not record the account on pane {}: {detail}; the agent is running under {:?} \
-             but `herdr agent list` will not show it",
-            plan.pane_id, plan.profile.name
-        ));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WORK: &str = "/p/work";
+
+    fn set(dir: &str) -> ProcessEnvVar {
+        ProcessEnvVar::Set(dir.to_string())
     }
-    LaunchOutcome {
-        account: plan.profile.name.clone(),
-        account_state,
-        line: plan.line.clone(),
-        actual_config_dir,
-        warnings,
+
+    #[test]
+    fn a_process_that_names_the_profile_directory_is_the_evidence_ok_requires() {
+        assert_eq!(grade(&[set(WORK)], WORK), (AccountState::Ok, None));
+        // Spelling is normalized the same way the profile's own directory is,
+        // so a trailing slash is the same account.
+        assert_eq!(grade(&[set("/p/work/")], WORK), (AccountState::Ok, None));
+    }
+
+    #[test]
+    fn a_different_directory_anywhere_is_a_mismatch_naming_it() {
+        assert_eq!(
+            grade(&[set(WORK), set("/p/perso")], WORK),
+            (AccountState::Mismatch, Some("/p/perso".to_string()))
+        );
+        assert_eq!(
+            grade(&[set("/p/perso"), set(WORK)], WORK),
+            (AccountState::Mismatch, Some("/p/perso".to_string()))
+        );
+    }
+
+    /// The launch that would otherwise be graded most dangerously: the shell
+    /// swallowed the assignment (a `read` builtin, a continuation prompt), so
+    /// `claude` was execed without the variable and is billing the account it
+    /// picks by itself. That is a wrong account, not an unknown one.
+    #[test]
+    fn an_environment_read_without_the_variable_is_a_mismatch_not_unverified() {
+        assert_eq!(
+            grade(&[ProcessEnvVar::Unset], WORK),
+            (AccountState::Mismatch, None)
+        );
+        assert_eq!(
+            grade(&[ProcessEnvVar::Unreadable, ProcessEnvVar::Unset], WORK),
+            (AccountState::Mismatch, None)
+        );
+    }
+
+    /// A child that scrubbed its own environment is not evidence against the
+    /// process that does name the directory.
+    #[test]
+    fn one_reading_that_matches_outweighs_a_sibling_without_the_variable() {
+        assert_eq!(
+            grade(&[ProcessEnvVar::Unset, set(WORK)], WORK),
+            (AccountState::Ok, None)
+        );
+    }
+
+    /// Nothing read is nothing known: non-Linux targets, a process that has
+    /// already exited, a refused `/proc` read, an empty foreground list.
+    #[test]
+    fn nothing_readable_is_unverified_and_never_ok() {
+        assert_eq!(grade(&[], WORK), (AccountState::Unverified, None));
+        assert_eq!(
+            grade(
+                &[ProcessEnvVar::Unreadable, ProcessEnvVar::Unreadable],
+                WORK
+            ),
+            (AccountState::Unverified, None)
+        );
+    }
+
+    /// A value that is not a directory at all still has to be *reported*, not
+    /// swallowed: it is a different account than the one asked for.
+    #[test]
+    fn an_empty_value_is_a_mismatch_that_names_what_was_read() {
+        assert_eq!(
+            grade(&[set("")], WORK),
+            (AccountState::Mismatch, Some(String::new()))
+        );
+    }
+
+    #[test]
+    fn a_mismatch_message_distinguishes_a_wrong_directory_from_no_directory() {
+        let outcome = |actual: Option<&str>| LaunchOutcome {
+            account: "work".to_string(),
+            account_state: AccountState::Mismatch,
+            line: " export CLAUDE_CONFIG_DIR='/p/work'".to_string(),
+            variable: "CLAUDE_CONFIG_DIR",
+            actual_config_dir: actual.map(str::to_string),
+            warnings: Vec::new(),
+        };
+        let wrong = outcome(Some("/p/perso")).mismatch_detail();
+        assert!(wrong.contains("CLAUDE_CONFIG_DIR"), "{wrong}");
+        assert!(wrong.contains("/p/perso"), "{wrong}");
+
+        let absent = outcome(None).mismatch_detail();
+        assert!(absent.contains("no CLAUDE_CONFIG_DIR"), "{absent}");
+        assert!(absent.contains("default directory"), "{absent}");
     }
 }

@@ -347,7 +347,7 @@ implementation starts only after E3 is ✅.
 | 1 | feat(accounts): account profiles config, pure resolution, herdr account list and the accounts lab | A · Foundations | — | ✅ |
 | 2 | feat(accounts): herdr account add, remove and default with seeded profile directories | A · Foundations | 1 | ✅ |
 | 3 | feat(accounts): herdr account status and login | B · CLI | 2 | ⬜ |
-| 4 | feat(accounts): launch claude under a profile with herdr agent start --account | B · CLI | 1 | ⬜ |
+| 4 | feat(accounts): launch claude under a profile with herdr agent start --account | B · CLI | 1 | ✅ |
 | 5 | feat(accounts): switch a running claude agent to another profile keeping its session | B · CLI | 4 | ⬜ |
 | 6 | feat(fleet): fleet report and change stream carry agent metadata tokens | C · Fleet | 1 | ⬜ |
 | 7 | feat(accounts): tui account picker to start claude in a pane | D · TUI | 4 | ⬜ |
@@ -980,6 +980,87 @@ capture the row showing `work`.
 and PR 7's TUI call it, never `agent.start` directly. `process_env_var`
 returning `None` means `unverified`, never `ok`. The JSON keys `account`,
 `account_state` on the `agent start` response are contract.
+
+**As built (PR 4, merged).** The sequence and the exit codes are as
+specified; the corrections below are the shapes PR 5, PR 7 and PR 8 must code
+against, and they win over the prose above.
+
+- **`crate::platform::process_env_var` answers three ways, not two.**
+  `ProcessEnvVar::{Unreadable, Unset, Set(String)}` replaces the planned
+  `Option<String>`, because "the environment was read and the variable is not
+  there" is *evidence* (the assignment never reached the launched job, so the
+  agent is on Claude's own default directory) while "could not read it" is the
+  absence of evidence. The plan's *Downstream* line — "`process_env_var`
+  returning `None` means `unverified`" — therefore holds only for
+  `Unreadable`. A value that is not UTF-8 is `Unreadable`, and so is an empty
+  or oversized `/proc` blob.
+- **`verify` grades through the pure `client::grade(&[ProcessEnvVar], &str)`.**
+  A reading naming a different directory is `mismatch` whatever the others
+  say; otherwise a reading naming the expected directory is `ok`; otherwise
+  *any* environment read without the variable is `mismatch` with no directory
+  (`LaunchOutcome::mismatch_detail` renders that as "no CLAUDE_CONFIG_DIR at
+  all"); only when nothing at all could be read is it `unverified`. The pane
+  shell's own pid is always excluded — its `/proc` environment is its
+  exec-time one and never shows the line just typed. A shell that swallows the
+  line (a `read` builtin, a continuation prompt) passes every gate herdr has,
+  so this is the check that catches it; `tests/fork_accounts.rs::agent_start_
+  reports_a_mismatch_when_the_shell_swallows_the_environment_line` drives that
+  through a real server.
+- **`apply_env` consumes the plan and returns `client::AppliedLine`**, a guard
+  that owns the fact that the pane's shell now exports the variable.
+  `AppliedLine::finish()` grades and reports; dropping it any other way prints
+  a note naming the pane, the directory and the profile, because `agent.start`
+  can fail from a dozen places after the line has landed and the export
+  outlives all of them. Callers keep the guard alive until the agent is ready.
+- **`--account none` is the stock launch, which means it does not undo a
+  previous one.** Nothing is typed and no token is reported, so a pane whose
+  shell still exports `CLAUDE_CONFIG_DIR` from an earlier `--account` start
+  launches under that directory with no account claimed. The `agent start`
+  after-help says so.
+- The probe reads `/proc` on the machine the CLI runs on. That is sound
+  because `crate::cli::send_request` only ever speaks to the local API socket,
+  so the pids `pane.process_info` returns are local pids; a hand-forwarded
+  remote API socket would break the assumption and is not supported.
+- `pane_shell_at_prompt` lives in `launch.rs` (pure) and is deliberately as
+  strict as the server's own `available_pane_shell_from_job`: the foreground
+  process group must *be* the shell and hold nothing else. It additionally
+  accepts `argv[0]` when the process name is not a shell, matching
+  `src/cli/agent.rs::process_info_shows_shell_initialization`.
+- **`PaneProcessInfo.foreground_processes`, not `processes`.** The field the
+  plan named does not exist; the shape is `{pane_id, shell_pid,
+  foreground_process_group_id, tty, foreground_processes: [{pid, name, argv0,
+  argv, cmdline, cwd}]}` (`src/api/schema/panes.rs`). While an agent runs the
+  pane's `shell_pid` is **not** in that list — the foreground job is the
+  agent's own process group.
+- **The `agent_pane_busy` retry was not factored out of `src/cli/agent.rs`,
+  and there is no `AccountsClient` struct.** Duplicating that retry loop into
+  `accounts::client` would have made a second, drifting copy of the subtlest
+  part of `agent.start`, so `agent_start` keeps the stock loop verbatim and
+  the account steps bracket it: `prepare_account_launch` (resolve → refuse →
+  type) before it, `AppliedLine::finish` (verify → report) after it.
+  `client.rs` never calls `agent.start`. Its entry points are free functions
+  over `crate::cli::send_request` rather than methods on a struct holding an
+  `ApiClient`, so an account command reports an incompatible or absent server
+  through the same protocol guard as every other `herdr` subcommand.
+- **Directories are compared through `config::dir_key`**, on both sides, so a
+  trailing slash in a `config_dir` or in the process environment is not a
+  mismatch.
+- **`agent_start_refuses_unknown_shell` became two tests.** herdr offers no
+  way to start a pane under a renamed shell binary, so the planned `weirdsh`
+  case is a unit test over a synthetic `PaneProcessInfo`
+  (`a_shell_herdr_cannot_write_an_assignment_for_is_refused_by_name`), and the
+  integration test covers what a lab can really produce: a pane whose
+  foreground is `sleep`
+  (`agent_start_refuses_a_busy_pane_before_typing_anything`), asserting that
+  nothing was typed and nothing was launched.
+- **The csh refusal PR 1 shipped is reachable from the launch path** and is
+  covered by `a_csh_pane_refuses_a_directory_it_cannot_quote_rather_than_
+  launching`: a tcsh pane with a `!` in the profile directory fails the plan
+  instead of launching under the ambient account.
+- **`src/main.rs` was not touched.** `agent start` already has its usage line
+  and `--account` is a flag, so no usage or allowlist change was needed; the
+  only upstream edits are `src/cli/agent.rs`, `src/cli/spec.rs`
+  (`agent_command()` only) and the appended `src/platform/mod.rs` function.
 
 ### PR 5 — feat(accounts): switch a running claude agent to another profile keeping its session · deps: 4
 
