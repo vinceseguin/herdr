@@ -172,6 +172,23 @@ pub struct HostState {
     pub snapshot: Option<Box<ClientShellSnapshot>>,
     pub rollup: AgentRollup,
     seen: HashMap<String, SeenAgent>,
+    /// Whether the next snapshot opens a new connection to this host.
+    ///
+    /// A server counts `ClientShellSnapshot::revision` per *client
+    /// connection*, restarting at 1 for each one (`ClientShellConnected` seeds
+    /// `shell_projection_revision = 1`), while `boot_id` only changes when the
+    /// server itself restarts. So revisions are comparable within one
+    /// connection, never across two — and a host can lose its connection
+    /// without rebooting, which is what an ssh host does whenever its bridge
+    /// dies.
+    ///
+    /// Set on every [`HostEvent::Connected`] and cleared by the first snapshot
+    /// that lands, so that first snapshot becomes the new baseline whatever
+    /// number it carries. Without it the fresh connection's seed — the only
+    /// message carrying everything that changed while the host was gone — is
+    /// dropped as stale, and a host that then goes quiet stays wrong for as
+    /// long as it stays quiet.
+    reconnected: bool,
 }
 
 impl HostState {
@@ -193,6 +210,9 @@ impl HostState {
             snapshot: None,
             rollup: AgentRollup::default(),
             seen: HashMap::new(),
+            // No connection has been made yet, and no snapshot is held, so the
+            // flag is irrelevant until the first `Connected` sets it.
+            reconnected: false,
         }
     }
 
@@ -436,13 +456,22 @@ impl FleetState {
             HostEvent::Connected {
                 server_version,
                 methods,
-            } => self.set_connection(
-                index,
-                HostConnection::Connected {
-                    server_version,
-                    methods,
-                },
-            ),
+            } => {
+                // A new connection restarts the host's projection revisions,
+                // so whatever it seeds is the new baseline. Marked here rather
+                // than inside `set_connection`, which drops a transition it
+                // considers a no-op: the connection is new either way.
+                if let Some(host) = self.hosts.get_mut(index) {
+                    host.reconnected = true;
+                }
+                self.set_connection(
+                    index,
+                    HostConnection::Connected {
+                        server_version,
+                        methods,
+                    },
+                )
+            }
             HostEvent::Unavailable { reason, retry_in } => {
                 self.set_connection(index, HostConnection::Unavailable { reason, retry_in })
             }
@@ -574,9 +603,18 @@ impl FleetState {
         // revision is stale and dropped; any new boot_id replaces outright. An
         // equal revision is a resend, folded in again — nothing advanced, so it
         // yields no agent deltas.
-        if host.snapshot.as_ref().is_some_and(|current| {
-            current.boot_id == snapshot.boot_id && snapshot.revision < current.revision
-        }) {
+        //
+        // The one thing upstream's client never has to handle is a *second*
+        // connection to the same boot: it holds one connection for its whole
+        // life. The fleet reconnects, and the server restarts `revision` at 1
+        // for each connection, so the first snapshot after a reconnect is
+        // authoritative however low its number is — see [`HostState::reconnected`].
+        let reconnected = host.reconnected;
+        if !reconnected
+            && host.snapshot.as_ref().is_some_and(|current| {
+                current.boot_id == snapshot.boot_id && snapshot.revision < current.revision
+            })
+        {
             return Vec::new();
         }
         let host_id = host.spec.id.clone();
@@ -603,6 +641,9 @@ impl FleetState {
         // where the previous boot's recency is worthless but the agents it had
         // are still leaving the merged list and owe their readers a removal.
         let previous_seen = std::mem::take(&mut host.seen);
+        // This snapshot is the connection's baseline; every later one on the
+        // same connection is compared against it again.
+        host.reconnected = false;
         host.snapshot = Some(snapshot);
 
         let mut rollup = AgentRollup::default();
@@ -1134,6 +1175,121 @@ mod tests {
                 .map(|s| s.revision),
             Some(5)
         );
+        state.assert_invariants_for_test();
+    }
+
+    /// The reconnect-lag regression: a host that reconnects without rebooting.
+    ///
+    /// A server counts `revision` per client connection and restarts it at 1,
+    /// while `boot_id` only changes when the *server* restarts. An ssh host
+    /// whose bridge dies and comes back is therefore the same boot on a new
+    /// connection, seeding a revision below the one already held — and that
+    /// seed is the only message carrying what changed while it was gone.
+    #[test]
+    fn a_reconnects_first_snapshot_lands_even_below_the_revision_it_held() {
+        let (mut state, _, workbox) = two_connected_hosts();
+        state.apply(
+            &workbox,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                5,
+                vec![agent("w1:p1", AgentStatus::Idle, 1)],
+            )),
+        );
+
+        // The bridge dies; the server keeps running, so the boot id is intact.
+        state.apply(
+            &workbox,
+            HostEvent::Unavailable {
+                reason: "host closed the connection".to_string(),
+                retry_in: Some(Duration::from_secs(1)),
+            },
+        );
+        // While it was gone the agent turned blocked, and then went quiet: the
+        // reconnect's seed is the only snapshot that will ever say so.
+        connected(&mut state, &workbox);
+        let changes = state.apply(
+            &workbox,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                1,
+                vec![agent("w1:p1", AgentStatus::Blocked, 2)],
+            )),
+        );
+
+        assert!(
+            changes
+                .iter()
+                .any(|change| matches!(change, FleetChange::Snapshot { revision: 1, .. })),
+            "the reconnect's first snapshot must be published: {changes:?}"
+        );
+        assert_eq!(
+            state
+                .host(&workbox)
+                .and_then(|host| host.snapshot.as_ref())
+                .map(|snapshot| snapshot.revision),
+            Some(1),
+            "the reconnect's snapshot must become the held one"
+        );
+        assert_eq!(
+            state.totals().blocked,
+            1,
+            "a status change made during the outage must reach the roll-up"
+        );
+        state.assert_invariants_for_test();
+    }
+
+    /// The baseline is per connection, not a permanent amnesty: once the
+    /// reconnect's own snapshot has landed, the ordinary staleness rule is
+    /// back for every later snapshot on that connection.
+    #[test]
+    fn after_a_reconnects_first_snapshot_a_lower_revision_is_stale_again() {
+        let (mut state, _, workbox) = two_connected_hosts();
+        state.apply(
+            &workbox,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                5,
+                vec![agent("w1:p1", AgentStatus::Idle, 1)],
+            )),
+        );
+        state.apply(
+            &workbox,
+            HostEvent::Unavailable {
+                reason: "host closed the connection".to_string(),
+                retry_in: None,
+            },
+        );
+        connected(&mut state, &workbox);
+        state.apply(
+            &workbox,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                2,
+                vec![agent("w1:p1", AgentStatus::Blocked, 2)],
+            )),
+        );
+
+        let changes = state.apply(
+            &workbox,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                1,
+                vec![agent("w1:p1", AgentStatus::Idle, 1)],
+            )),
+        );
+        assert!(
+            changes.is_empty(),
+            "a lower revision on the same connection is still stale: {changes:?}"
+        );
+        assert_eq!(
+            state
+                .host(&workbox)
+                .and_then(|host| host.snapshot.as_ref())
+                .map(|snapshot| snapshot.revision),
+            Some(2)
+        );
+        assert_eq!(state.totals().blocked, 1);
         state.assert_invariants_for_test();
     }
 

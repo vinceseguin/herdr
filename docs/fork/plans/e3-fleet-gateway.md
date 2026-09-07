@@ -546,6 +546,19 @@ exactly these E1 contracts (verified in the code):
   host for as long as it runs. The residual documented limitation becomes:
   *against a server older than #3670 the gateway is that host's foreground
   client at 120×40 (a no-op for a headless default-size server)*.
+  > **Landed, and one correction (fork #49).** Decision (p) shipped as
+  > written, and it is **not** the cause of the reconnect defect step 5 hit.
+  > The epic's validation note originally blamed the ssh stdio bridge, and a
+  > later reading blamed this decision — because `for_config` resolves to
+  > `read_only`, `herdr fleet status` became a passive reader in PR 3 too, so
+  > the "it reproduces without the gateway" argument did not separate the two.
+  > A three-arm A/B against the ssh lab settled it: current `master`, a build
+  > with `read_only` reverted to `surface_active: true`, and the pre-E3 binary
+  > at `3d649ce3` all lag identically. The cause is `FleetState::set_snapshot`
+  > in `src/fleet/state.rs` (E1, unchanged since): revisions are counted per
+  > *client connection* and restart at 1, so the reconnect's seed was dropped
+  > as stale. Fixed client-side; decision (p)'s passivity is untouched and was
+  > re-verified with step 4's `stty size` check.
 - **(q) Daemon ssh: the fleet passes `noninteractive: true` to the bridge
   when a consumer asks for it** *(auto default)*. PR 3 adds
   `FleetConnectorOptions.ssh_noninteractive: bool` (default `false`, so
@@ -3399,6 +3412,13 @@ recorded skip):
    → `hello`, `fleet`, then `host_connection lab-ssh unavailable` when
    `ssh-lab.sh down` runs, and `connected` + `snapshot` after `ssh-lab.sh
    up` (host-local: no line names `lab-1`/`lab-2`).
+   > **Landed (fork #49).** The `snapshot` after `connected` was missing at
+   > epic-validation time: the reconnect's seed carries a revision that
+   > restarts at 1, and `FleetState::set_snapshot` dropped it as stale, so a
+   > host that reconnected went on reporting its pre-outage state until it
+   > published again. Fixed in `src/fleet/state.rs`; a reconnected ssh lab
+   > host now emits its `snapshot` in the same instant as `connected`. See the
+   > correction under decision (p) — it was neither the ssh bridge nor (p).
 6. **Terminals on every transport.** Observe `lab-2/<pane>`: `terminal.ready`
    + a binary frame whose decoded header is `full=1 80×24` and whose body
    holds `herdr-fleet-lab:lab-2`; observe `lab-ssh/<pane>` over ssh → the
