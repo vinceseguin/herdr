@@ -408,7 +408,8 @@ reconnect behaviour, and the `src/fleet/` module map for E3 — is in
 
 `herdr gateway` serves the fleet over HTTP and WebSocket so a phone or a browser
 can watch it. It is loopback-first (`127.0.0.1:7788`), token-gated, and a
-passive reader — attaching it never resizes anybody's panes.
+passive reader — watching a fleet never resizes anybody's panes (taking control
+of a pane, which needs the `control` scope, does).
 
 ```bash
 herdr gateway                     # run it (foreground; SIGTERM stops it cleanly)
@@ -486,8 +487,8 @@ After every sync, re-run `gh workflow list --all -R vinceseguin/herdr` and
 Fork-owned paths never conflict — whole directories (`docs/fork/`, `.claude/`,
 `scripts/fork/`, including `fleet-lab.sh`, `ssh-lab.sh`, `gate.sh` and
 `dev-setup.sh`; `src/fleet/` and `src/gateway/`, and `web/` — whose committed
-`web/dist` E3 embeds and E4 fills in) plus fork-only files that live inside upstream directories:
-`src/cli/fleet.rs`, `.github/workflows/fork-*.yml`, every `tests/fork_*.rs`
+`web/dist` E3 embeds and E4 fills in) plus fork-only files that live inside
+upstream directories: `src/cli/fleet.rs`, `.github/workflows/fork-*.yml`, every `tests/fork_*.rs`
 (today `tests/fork_channel.rs`, `tests/fork_fleet_lab.rs`,
 `tests/fork_gateway.rs`, `tests/fork_ssh_lab.rs`), `tests/support/fleet_lab.rs`
 and `tests/cli/fleet.rs`.

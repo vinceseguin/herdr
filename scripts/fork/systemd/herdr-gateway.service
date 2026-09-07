@@ -19,8 +19,10 @@
 [Unit]
 Description=Herdr Fleet gateway (HTTP + WebSocket over the fleet)
 Documentation=https://github.com/vinceseguin/herdr/blob/master/docs/fork/gateway.md
-After=network-online.target
-Wants=network-online.target
+# Deliberately no `After=network-online.target`: the systemd *user* manager has
+# no such target, so ordering against it would be a no-op that only logs. The
+# default bind is loopback, and the fleet connector retries a host with backoff,
+# so the gateway does not need to wait for the network anyway.
 
 [Service]
 Type=simple

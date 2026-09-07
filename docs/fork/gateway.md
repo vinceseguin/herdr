@@ -18,7 +18,9 @@ Three properties hold everywhere in this document:
 - **Servers are stock.** The gateway is an ordinary herdr *client*. Nothing on a
   host knows a gateway exists ([ADR 0001](./decisions/0001-servers-stay-stock-ssh-transport.md)).
 - **The gateway is a passive reader.** It never becomes a host's foreground
-  client, so attaching it does not resize anyone's panes.
+  client, so watching a fleet does not resize anyone's panes. (Taking *control*
+  of a pane is the one exception; see
+  [client messages](#client-messages).)
 - **Loopback first.** The default bind is `127.0.0.1:7788`; a non-loopback bind
   is refused unless you also say which browser origins may reach it.
 
@@ -35,7 +37,7 @@ binary with no `gateway` command at all (`herdr gateway` then exits **2** with
 # 1. tell the fleet which herdr servers to aggregate (see `[fleet]` below)
 $EDITOR ~/.config/herdr/config.toml
 
-# 2. run it (foreground; Ctrl-C or SIGTERM stops it)
+# 2. run it (foreground; Ctrl-C stops it, as does SIGTERM on unix)
 herdr gateway
 
 # 3. from another shell: the tokens were generated on first run
@@ -63,7 +65,7 @@ value in either.
 | Key | Type | Default | What it does |
 | --- | --- | --- | --- |
 | `bind` | string | `"127.0.0.1:7788"` | Listen address, `ADDRESS:PORT`. `--bind` overrides it for one run. |
-| `allowed_origins` | array of string | `[]` | Browser origins (`scheme://host[:port]`) allowed to call the API. **Required for a non-loopback bind.** A loopback bind implicitly allows its own origins. |
+| `allowed_origins` | array of string | `[]` | Browser origins (`scheme://host[:port]`) a browser may reach this gateway from. **A non-loopback bind needs at least one of this or `public_url`.** A loopback bind implicitly allows its own origins. |
 | `public_url` | string | `""` | The origin pairing URLs and QR codes advertise — E5 sets it to the `https://<host>.<tailnet>.ts.net` origin. Implicitly allowed; an `https` scheme also marks device cookies `Secure`. |
 | `auth_failure_limit` | integer | `5` | Failed authentications from one peer address before it is refused for the window. |
 | `auth_failure_window_secs` | integer | `60` | Length of that window, in seconds. |
@@ -79,9 +81,10 @@ auth_failure_window_secs = 60
 pairing_ttl_secs = 600
 ```
 
-**A bad `[gateway]` value is never fatal at load time** — it becomes a
-diagnostic and the documented default is used instead, because the same config
-can be valid under a different `--bind`. The exact diagnostics:
+**A `[gateway]` value of the right TOML type is never fatal** — a value that
+fails validation becomes a diagnostic and the documented default is used
+instead, because the same config can be valid under a different `--bind`. The
+exact diagnostics:
 
 ```text
 invalid gateway bind: gateway.bind = "…"; expected ADDRESS:PORT (for example 127.0.0.1:7788); using 127.0.0.1:7788
@@ -93,15 +96,22 @@ invalid gateway auth failure window: gateway.auth_failure_window_secs = 0 disabl
 invalid gateway pairing ttl: gateway.pairing_ttl_secs = 10; expected 30..=86400; using 600
 ```
 
-A malformed *section* (`[gateway]` holding the wrong TOML types) yields
-`invalid gateway config: <error>; keeping current gateway settings`, and an
-unknown key inside it yields `unknown config key gateway.<key>; ignoring key`.
-Note that `auth_failure_limit = 0` and `auth_failure_window_secs = 0` fall back
-to the defaults rather than *disabling* rate limiting: there is no way to turn
-the limiter off from the config file.
+A value of the **wrong TOML type** is a different story, because the whole file
+is deserialized in one pass: `bind = 7788` makes `herdr gateway` (and
+`herdr config check`) print `config parse error: <error>; using defaults` and
+fall back to defaults for **every** section, `[fleet]` included — not just
+`[gateway]`. Fix the type before reading anything else the run says. (The
+per-section `invalid gateway config: <error>; keeping current gateway settings`
+wording belongs to the running server's live config reload, not to this path.)
+An unknown key inside the section yields
+`unknown config key gateway.<key>; ignoring key`. Note that
+`auth_failure_limit = 0` and `auth_failure_window_secs = 0` fall back to the
+defaults rather than *disabling* rate limiting: there is no way to turn the
+limiter off from the config file.
 
 **Origins are compared the way browsers serialize them** (RFC 6454 §6.1): the
-scheme is exact, the host folds case, and a scheme's default port disappears —
+scheme and the host both fold case (but `http` never matches `https`), and a
+scheme's default port disappears —
 so `HTTPS://Fleet.Example:443` matches the `https://fleet.example` a browser
 actually sends, and `[0:0:0:0:0:0:0:1]` canonicalizes to `[::1]`. Port `0`, a
 signed port, a non-ASCII host (use punycode), userinfo, a path, a query, a
@@ -133,7 +143,7 @@ name = "workbox"
 kind = "ssh"
 target = "workbox"         # required for kind = "ssh"; an ssh destination
 session = "agents"         # optional: a named session on that host
-enabled = true             # default true; false reports the host as `unavailable: host disabled`
+enabled = true             # default true; false reports the host `unavailable`, reason `host disabled in [fleet]`
 ```
 
 `name = "local"` is reserved for `include_local`, and two hosts (or a machine
@@ -156,8 +166,11 @@ $ herdr gateway --bind 127.0.0.1:7788
 listening on http://127.0.0.1:7788
 ```
 
-`stdout` carries that one line so a supervisor can wait for it; everything else
-is `tracing` on **stderr**:
+`stdout` carries that one line and nothing else, so a supervisor can wait for
+it. Everything else goes to **stderr**: the runtime's `tracing` events, plus a
+handful of plain `eprintln!` lines for config diagnostics, a refused bind and a
+token or device store the gateway will not touch — those last ones are *not*
+governed by `HERDR_LOG`.
 
 ```text
 2026-09-06T23:46:50.493006Z  INFO gateway: gateway listening listen=127.0.0.1:7788
@@ -172,7 +185,7 @@ turns on per-request lines without the rest of herdr.
 | Code | Meaning |
 | --- | --- |
 | `0` | Clean stop (SIGINT/SIGTERM), a printed help, or a successful `pair`/`status`/`rotate-token`. |
-| `1` | The gateway **refused**: bad `[fleet]` config, a bind the policy rejects, a token or device file it does not trust, a rotation that did not change the file, or no address to advertise in a pairing URL. |
+| `1` | The gateway **refused** or could not serve: bad `[fleet]` config, a bind the policy rejects, an address already in use, a token or device file it does not trust, a rotation that did not change the file, no address to advertise in a pairing URL, or a serve error (`gateway stopped: …`). |
 | `2` | Usage error (unknown option or subcommand, malformed `--bind`, `rotate-token` without a valid scope). |
 | `3` | `herdr gateway status` when **no gateway is running**. |
 
@@ -184,7 +197,9 @@ config *directory* and the config *file path* are separate: `--config PATH` (and
 with `--config /etc/herdr/gateway.toml` still keeps its tokens under
 `~/.config/herdr/gateway/`. `pair`, `status` and `rotate-token` do not take
 `--config` at all for the same reason — they find the store through
-`XDG_CONFIG_HOME` and the running gateway's own marker file.
+`XDG_CONFIG_HOME` and the running gateway's own marker file. (`pair` and
+`status` do still *read* a config file for the base URL and the default TTL,
+but only the default one or `HERDR_CONFIG_PATH`; `rotate-token` reads none.)
 
 ```text
 <config>/gateway/                 0700, owned by you
@@ -196,15 +211,22 @@ with `--config /etc/herdr/gateway.toml` still keeps its tokens under
 ```
 
 Every write is atomic (a `0600` temp file in the same directory, `fsync`, then
-rename), so a file is never briefly world-readable. On startup the gateway
-**refuses to run** (exit 1) rather than repair a store it does not trust:
+rename), so a file is never briefly world-readable. A `<config>/gateway/`
+directory **you own** with a wider mode is quietly tightened back to `0700` on
+startup; anything the gateway cannot make safe by itself is a refusal (exit 1)
+rather than a repair:
 
 ```text
+cannot use the gateway token store: /…/gateway is owned by another user
 cannot use the gateway token store: /…/gateway/read.token is readable by group or other; run chmod 600 on it or delete it to regenerate
 cannot use the gateway token store: /…/gateway/read.token is not 64 hexadecimal characters; delete it to regenerate
 cannot use the gateway token store: /…/read.token and /…/control.token hold the same token, so the read token would grant control; delete one of them to regenerate it
-cannot read the paired devices: /…/gateway is owned by another user
+cannot read the paired devices: /…/gateway/devices.json is readable by group or other; run chmod 600 on it or delete it to regenerate
 ```
+
+The token store is created and checked first, so a `<config>/gateway/` owned by
+somebody else is always reported under `cannot use the gateway token store:`,
+never under `cannot read the paired devices:`.
 
 On Windows the mode checks are no-ops (as they are for herdr's own sockets) and
 log at `debug`.
@@ -218,6 +240,11 @@ gateway does not resize anybody's panes, and detaching it does not resize them
 back. Verified against the lab: a pane reporting `40 120` from `stty size` still
 reports `40 120` with the gateway attached.
 
+This covers the fleet connection and every `mode: "observe"` terminal. A
+`mode: "control"` terminal is a real attach and *does* resize the pane's PTY to
+the browser's `cols`/`rows`, exactly as `herdr terminal session control` would
+— that is the point of control mode, not a leak in the guarantee.
+
 **Residual:** a host running a herdr server older than upstream #3670 does not
 understand `surface_active` and will treat any client as foreground. The fix is
 to upgrade that host; the fork does not work around it.
@@ -228,17 +255,21 @@ An `ssh` host is reached by an `ssh` child running herdr's stdio bridge. Because
 a gateway has no terminal to prompt at, its bridges are **noninteractive**:
 `BatchMode=yes`, `NumberOfPasswordPrompts=0`, `StrictHostKeyChecking=yes`, and
 the child's stderr is discarded rather than painted over your daemon log. An ssh
-host that would have asked for a passphrase therefore fails fast and surfaces as
+host that would have asked for a passphrase surfaces as
 `connection.state == "unavailable"` with a reason in `/api/fleet`, never as a
-hung prompt.
+prompt on the daemon's terminal.
 
 Two consequences worth knowing:
 
 - **The gateway's ssh forward sockets are scoped.** They are named
-  `/tmp/herdr-remote-<pid>-gateway-<host>-<target>-<session>.sock` so they never
-  collide with the fleet connector's own `/tmp/herdr-remote-<pid>-<host>-…`
-  socket. They appear when the first terminal on that host opens and are removed
-  on shutdown.
+  `<tmpdir>/herdr-remote-<pid>-gateway-<host>-<target>-<session>.sock` so they
+  never collide with the fleet connector's own
+  `<tmpdir>/herdr-remote-<pid>-<host>-…` socket. `<tmpdir>` is the platform
+  temp dir (`/tmp` on a stock Linux box), and when that readable name would
+  exceed a unix socket's `sun_path` limit the runtime falls back to a short
+  hashed `herdr-r-<pid>-gateway--<target>-<hash>.sock` form instead; Windows
+  always uses the short form. They appear when the first terminal on that host
+  opens and are removed on shutdown.
 - **An ssh host serves one terminal stream at a time.** The bridge handles one
   connection inline, so a second terminal on the same ssh host waits 2 s for the
   first to release and is then refused with `terminal.error {code:"host_busy"}`
@@ -249,8 +280,10 @@ Two consequences worth knowing:
 Herdr's *discovery* probes (the `uname -s` and binary check that run before a
 bridge starts) still use an interactive `ssh`, because they go through upstream
 code the fork freezes for this epic. They pipe both stdout and stderr, so
-nothing is painted on a daemon's terminal; a hung probe blocks only that host's
-own supervisor thread.
+nothing is painted on a daemon's terminal — but a host that cannot authenticate
+without a prompt stalls **there**, before the noninteractive bridge is ever
+started, and blocks that host's own supervisor thread until ssh gives up. Only
+that one host is affected; the rest of the fleet keeps serving.
 
 ---
 
@@ -301,6 +334,8 @@ rotated the read token; revoked 1 device and 3 pending pairing codes
 the running gateway applies this on its next request; no restart is needed.
 ```
 
+(The second line is printed only when a gateway is actually running.)
+
 `rotate-token` revokes three things, in this order: the **token file**, then
 that scope's **pending pairing codes**, then that scope's **devices**. The
 pairing codes matter — a code still outstanding when you rotate would otherwise
@@ -309,8 +344,9 @@ mint a device carrying exactly the authority you just took back.
 It really does take effect without a restart. Both stores remember the length,
 mtime and (on unix) inode of the file they were read from, and re-`stat` it
 before a comparison: two `stat`s on a request that presents a bearer token, one
-on a request that presents a cookie, and a full re-read only when a stamp
-changed. `rotate-token` runs in a *separate process*, so this is what makes the
+on a request whose cookie is rejected and two on one that is accepted (the
+`last_seen` touch re-checks), and a full re-read only when a stamp changed.
+`rotate-token` runs in a *separate process*, so this is what makes the
 running gateway stop honouring a revoked cookie — and stop writing the revoked
 records back the next time it persists `last_seen`. The log says so:
 
@@ -334,7 +370,9 @@ Two accepted behaviours to know about:
   unreadable or corrupt while the gateway is running, the credentials already in
   memory stay in force and the gateway logs
   `WARN gateway: could not reload the gateway token store; the tokens already in memory stay in force`
-  (and the same wording for `the paired devices`). Refusing every client because
+  (or, for the device half,
+  `could not reload the paired devices; the records already in memory stay in force`).
+  Refusing every client because
   a file blipped is worse, and anyone who can corrupt that file already has
   write access to the gateway directory. Any *further* change is retried.
   A store that is bad at **startup** is still a hard refusal (exit 1).
@@ -354,11 +392,16 @@ of that scope's devices at once.
 
 ```console
 $ herdr gateway pair
+warning: this URL points at loopback, so only a browser on this machine can open it; set [gateway] public_url for a phone
 Pair this device with Herdr Fleet (read scope, valid 10 min):
   http://127.0.0.1:7788/pair?code=<id>.<secret>
 <a 31-line QR code of that URL>
+If a scanner cannot read this code, re-run with --invert (dark terminals).
 The link works once and then expires.
 ```
+
+(The first line is the loopback warning below; it is absent once
+`[gateway] public_url` is set.)
 
 Open the URL (or scan the QR) on the phone. The gateway answers `303` with
 `Location: /` and sets the device cookie, so the phone lands on the app already
@@ -371,7 +414,7 @@ authenticated and the secret never has to be typed.
 | `--label TEXT` | Name the device in `herdr gateway status`. The label travels *with the code*, because the device record is created when the code is redeemed — on a machine you are not typing at. |
 | `--no-qr` | Print only the sentence, the URL and the note (3 lines). |
 | `--invert` | Invert the QR code. A QR code is dark modules on a light field and a terminal draws blocks in its **foreground** colour, so the default is right on a light terminal and unscannable on a dark one. |
-| `--json` | `{"url": "…", "scope": "read"\|"control", "expires_unix": 1788738…}` and nothing else. |
+| `--json` | `{"expires_unix":1788738…,"scope":"read"\|"control","url":"…"}` and nothing else — keys sorted, one line. |
 
 **Which base URL the link uses**, in order:
 
@@ -382,8 +425,8 @@ authenticated and the secret never has to be typed.
 3. Otherwise `[gateway] bind`.
 
 A wildcard address or port `0` with no gateway running is a refusal naming
-`public_url`, never a URL that cannot work. A loopback base prints a warning,
-because only a browser on this machine can open it:
+`public_url`, never a URL that cannot work. A loopback base prints this warning
+first, because only a browser on this machine can open the link:
 
 ```text
 warning: this URL points at loopback, so only a browser on this machine can open it; set [gateway] public_url for a phone
@@ -396,7 +439,7 @@ warning: this URL points at loopback, so only a browser on this machine can open
 | Valid code | `303`, `Location: /`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, and `Set-Cookie: herdr_gateway_device=<id>.<secret>; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000` |
 | Unknown, malformed, or already redeemed | `403 {"error":"pairing_invalid","message":"that pairing link is not valid"}` |
 | The window passed | `403 {"error":"pairing_expired","message":"that pairing link has expired; ask for a new one"}` |
-| No `?code=` | `400 {"error":"pairing_required","message":"open the pairing link \`herdr gateway pair\` printed"}` |
+| No `?code=`, an empty one, or a query string that will not parse | `400 {"error":"pairing_required","message":"open the pairing link \`herdr gateway pair\` printed"}` |
 | Peer over the failure limit | `429` with `Retry-After` |
 
 `; Secure` is appended to the cookie when `[gateway] public_url` is `https`, or
@@ -412,7 +455,7 @@ never deletes a valid code, and every failure except expiry collapses to
 `pairing_invalid`, so guessing an id learns nothing. Because `consume` compares
 the secret in constant time *before* it looks at the clock, only the holder of
 the whole code can tell "expired" from "invalid". Bad and expired codes count
-against the failure limiter; a missing `?code=` does not.
+against the failure limiter; a request with no usable `?code=` at all does not.
 
 One thing to expect: **a link previewer burns the link.** A one-time `GET` URL
 pasted into a chat app that fetches previews will be redeemed by the previewer,
@@ -435,14 +478,17 @@ $ echo $?
 
 ```console
 $ herdr gateway status --json
-{"devices":{"control":0,"read":0},"healthy":true,"listen":"127.0.0.1:7788","pairings_pending":0,"pid":246143,"running":true,"schema":"herdr.gateway.status.v1"}
+{"devices":{"control":0,"read":1},"healthy":true,"listen":"127.0.0.1:7788","pairings_pending":3,"pid":246143,"running":true,"schema":"herdr.gateway.status.v1"}
 ```
 
 - `running` is "the pid recorded in `gateway.json` is alive" — that is how a
   marker left behind by a crash is refused rather than believed.
-- `healthy` is a **real** `GET /health` against the recorded address, with a
-  shared 2 s deadline (a wildcard bind is dialled on loopback).
-- Exit **3**, and `gateway: not running`, when nothing is running. Every other
+- `healthy` is a **real** `GET /health` against the recorded address (a
+  wildcard bind is dialled on loopback). The 2 s bound is applied to the
+  connect, to the write and to the read as a deadline, so a pathological
+  network can stretch the whole probe to about twice that; it is not one
+  end-to-end budget.
+- Exit **3**, and `gateway:  not running`, when nothing is running. Every other
   successful run exits 0.
 
 ---
@@ -481,7 +527,9 @@ $ curl -s -H "Authorization: Bearer $READ" http://127.0.0.1:7788/api/gateway
 ```
 
 `via` is `"bearer"` or `"device"`; a device principal also gets
-`"device": {"id": "<64 hex>", "label": "<label>"}`. `features` is how a client
+`"device": {"id": "<64 hex>", "label": "<label>"}`, unless the record was
+revoked between the credential check and the lookup, in which case the key is
+simply absent. `features` is how a client
 discovers what this gateway can do — names are only ever **appended**, so a
 client must treat an unknown name as "ignore" and a missing name as "that
 feature is not available here", never as an error.
@@ -540,13 +588,19 @@ and, for `forbidden`, `"needed"`.
 | --- | --- | --- |
 | `unauthorized` | `401` | No credential, or one that did not verify. Also sends `WWW-Authenticate: Bearer realm="herdr gateway"`. |
 | `forbidden` | `403` | The credential is valid but its scope is too narrow; `"needed"` names the scope. |
-| `origin_not_allowed` | `403` | The `Origin` is not on the allowlist, there was more than one `Origin` header, it was not visible ASCII, or a device cookie arrived on a cross-site request that carried no `Origin`. |
+| `origin_not_allowed` | `403` | The `Origin` is not on the allowlist, there was more than one `Origin` header, it was not visible ASCII, or a device cookie arrived with no `Origin` on a request whose `Sec-Fetch-Site` is `cross-site` **or** `same-site`. |
 | `too_many_requests` | `429` | The peer is over the failure limit. Sends `Retry-After` (never `0`). |
-| `not_found` | `404` | An unknown `/api/…` path, or an unknown asset with a known extension. |
-| `method_not_allowed` | `405` | A non-`GET`/`HEAD` method on the asset route. |
-| `pairing_required` | `400` | `/pair` with no `?code=`. |
+| `not_found` | `404` | An unknown `/api/…` path, or any path that looks like a file (its last segment has an extension) and is not in the embedded app. |
+| `method_not_allowed` | `405` | A non-`GET`/`HEAD` method on the asset route, *after* a credential was accepted — see the note below. |
+| `pairing_required` | `400` | `/pair` with no usable `?code=`. |
 | `pairing_expired` / `pairing_invalid` | `403` | See [pairing](#get-paircodeidsecret). |
 | `internal_error` | `500` | The gateway's fault, not the client's. |
+
+A non-`GET`/`HEAD` method is never treated as public, so the credential check
+runs first: `POST /` with no token is `401 unauthorized`, and only a request
+that authenticates reaches the `405`. On `/api/…` and `/health` an
+authenticated non-`GET` gets the router's own bare `405` — `Allow: GET,HEAD`,
+an **empty** body, and none of the JSON envelope's headers.
 
 ```console
 $ curl -s -D- -o/dev/null http://127.0.0.1:7788/api/fleet | grep -i www-authenticate
@@ -564,8 +618,11 @@ $ curl -s -H "Authorization: Bearer $READ" http://127.0.0.1:7788/api/nope
 The app is compiled into the binary with `include_bytes!` over `web/dist`, so
 there is **no filesystem lookup at request time** — a crafted path cannot escape
 anything, because there is nothing to escape into. `/` and any extension-less
-path serve `index.html` (SPA fallback); a path with an unknown extension is
-`404`; a path under `/api/` that reached the fallback answers JSON `not_found`,
+path serve `index.html` (SPA fallback); a path whose last segment *has* an
+extension is looked up in the embedded table and is `404` when it is not there,
+whether or not the extension is one the content-type table knows (an unknown
+extension that *is* in the table is served `application/octet-stream`); a path
+under `/api/` that reached the fallback answers JSON `not_found`,
 never the HTML shell an API client could not tell from a real reply.
 `index.html` is served `Cache-Control: no-cache, private`, other assets
 `private, max-age=3600`.
@@ -588,13 +645,20 @@ headers, so a page served from a *different* allowed origin still cannot call
 a credential and gets `401`). The app must be same-origin — embedded, or behind
 `public_url`.
 
-A loopback bind implicitly allows its own origins (`http://127.0.0.1:<port>`,
-`http://localhost:<port>`, `http://[::1]:<port>`); a non-loopback bind gets
-none, so `allowed_origins` or `public_url` is the whole allowlist. A request
-with **no** `Origin` header passes the origin step entirely and is decided by
-its credential alone — only browsers send `Origin`, and that is exactly why the
-device cookie is `SameSite=Strict` and why a cookie on a `Sec-Fetch-Site:
-cross-site` request with no `Origin` is refused.
+A loopback bind implicitly allows its own origins — `http://127.0.0.1:<port>`,
+`http://localhost:<port>`, `http://[::1]:<port>` and the bound address itself
+(which matters for a bind like `127.0.0.53:7788`), each canonicalized, so a
+bind on port 80 matches the portless `http://localhost` a browser sends. A
+non-loopback bind gets none, so `allowed_origins` or `public_url` is the whole
+allowlist. A request with **no** `Origin` header passes the origin step
+entirely and is decided by its credential alone — only browsers send `Origin`,
+and that is exactly why the device cookie is `SameSite=Strict` and why a cookie
+with no `Origin` on a request whose `Sec-Fetch-Site` is `cross-site` or
+`same-site` is refused.
+
+The origin check runs **before** the public-path check, so a foreign `Origin`
+is `403 origin_not_allowed` on `/health` and on a static asset too — only the
+credential and rate-limit steps are skipped for public paths.
 
 A non-loopback bind with neither is refused before anything is opened:
 
@@ -631,12 +695,15 @@ $ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:7788/health
 ```
 
 (That transcript starts with four failures already inside the window, which is
-why it blocks on the second request rather than the sixth. `/health` is public,
-so it keeps answering.)
+why it blocks on the second request rather than the sixth. `/health` skips the
+limiter, so it keeps answering — it does not skip the *origin* check.) While a
+peer is blocked, even a valid token gets `429`.
 
 At most 4096 peers are tracked; when the table is full an **unblocked** peer is
-evicted before a blocked one, so a flood of fresh addresses cannot clear a
-victim's counter.
+evicted before a blocked one, so a flood of fresh addresses has to earn 4096
+blocks of its own before it can start clearing a victim's counter. That is a
+cost, not a guarantee — an attacker with unlimited addresses never needs the
+evicted one back.
 
 ---
 
@@ -666,11 +733,19 @@ Then one message per change, each a newline-free JSON object tagged by `kind`:
 | `fleet` | `report` | A whole `herdr.fleet.status.v1` report. |
 | `host_connection` | `host`, `connection` | A host changed state (the `connection` object of `/api/fleet`). |
 | `snapshot` | `host`, `boot_id`, `revision` | That host re-sent its whole view; `boot_id` changing means it restarted. |
-| `agent_added` | `agent` | A new agent pane (the `agents[]` entry shape). |
+| `agent_added` | `agent` | An agent pane joined, or rejoined with fresh recency — treat it as an **upsert** keyed by `agent.pane`. |
 | `agent_removed` | `pane` | `host/w1:p1`. |
 | `agent_status` | `pane`, `from`, `to` | A status transition. |
 | `active_host` | `host` | Not emitted by a gateway (it has no active host). |
 | `resync` | — | You fell behind; a fresh `fleet` follows immediately. |
+
+**`agent_added.agent` is not the `agents[]` shape.** The delta carries the
+merged agent as the fleet model holds it: `pane`, `workspace` and `tab` are
+single `host/id` strings where `/api/fleet`'s `agents[]` spells them out as
+`ref` + `host` + `pane_id` + `workspace_id` + `tab_id`. The remaining nine
+fields (`workspace_label`, `name`, `title`, `agent`, `display_agent`,
+`agent_status`, `state_change_seq`, `fleet_change_seq`, `focused`) are spelled
+the same. A client needs two decoders, or one that accepts both spellings.
 
 **A reader must skip a `kind` it does not know** — new kinds are additive and
 E6/E7 will add them.
@@ -694,8 +769,9 @@ it, so the URL for `lab-2/w1:p1` is
 `/api/terminal/lab-2/w1:p1`. A pane id containing a `/` must be
 percent-encoded — and is then still refused, because such a pane cannot form an
 unambiguous reference. A malformed host or pane, an empty pane, or a pane
-containing a control character is `404` **before** the upgrade; everything after
-the upgrade is a `terminal.error` on the socket, never a 5xx.
+containing a control character is `404` **before** the upgrade; after the
+upgrade every outcome is a `terminal.error` or a `terminal.closed` on the
+socket, never a 5xx.
 
 The route needs `read`; the **mode** decides what else is needed.
 
@@ -710,9 +786,12 @@ session to observe):
 {"type":"terminal.open","mode":"control","cols":80,"rows":24,"takeover":false}
 ```
 
-`cols` and `rows` must be `1..=1024` in each dimension. The gateway answers
-`terminal.ready` **only after the host confirms the attach**, so a client never
-draws a terminal it is about to lose:
+`cols` and `rows` must be `1..=1024` in each dimension. The gateway waits for
+the host to confirm the attach before it answers `terminal.ready`, so a client
+normally never draws a terminal it is about to lose. The wait is bounded at
+10 s: a host that answers neither way inside that window gets its
+`terminal.ready` anyway and the stream continues, so a very slow host can still
+produce a ready-then-refused sequence.
 
 ```console
 $ python3 scripts/fork/ws-client.py "ws://127.0.0.1:7788/api/terminal/lab-2/w1:p1" \
@@ -745,10 +824,12 @@ The first frame of a session is always `full`. A real header from the lab:
 1b5b3f32303236681b5b3f32356c…      →  the payload, containing `herdr-fleet-lab:lab-2`
 ```
 
-Frames mirror the server's own `MAX_FRAME_SIZE` (2 MiB). The gateway holds at
-most **two** frames per open terminal: the bridge from the host to the socket
-uses bounded channels, so a slow browser applies backpressure to the server's
-render lane instead of making the gateway buffer.
+Frames mirror the server's own `MAX_FRAME_SIZE` (2 MiB). The gateway *buffers*
+at most **two** frames per open terminal — the bridge from the host to the
+socket uses a depth-2 channel, so a slow browser applies backpressure to the
+server's render lane instead of making the gateway buffer. (Counting the frame
+a blocked reader is holding and the one the socket task is writing, the true
+ceiling is four; the point is that it is a small constant, not a queue.)
 
 ### Client messages
 
@@ -757,12 +838,15 @@ vocabulary, parsed by the same function the CLI uses so the two cannot drift:
 
 | Message | Fields | Observe | Control |
 | --- | --- | --- | --- |
-| `terminal.input` | `text` **or** `bytes` (base64) — exactly one | `forbidden` | forwarded to the PTY byte-exact |
+| `terminal.input` | `text` **or** `bytes` (base64) — at most one: both is an error, and neither sends an empty input | `forbidden` | forwarded to the PTY byte-exact |
 | `terminal.resize` | `cols`, `rows` (`1..=1024`) | client-local viewport only | a **real PTY resize** |
 | `terminal.scroll` | `direction`, `lines`, `source?`, `column?`, `row?`, `modifiers?` | `unsupported` | forwarded |
 | `terminal.release` | — | closes the session | closes the session and releases the pane |
 
-Client messages are capped at 64 KiB. A controller's `terminal.resize` never
+Client messages are capped at 64 KiB, and that cap is enforced by the WebSocket
+layer: an oversize message fails the socket outright, so it produces a bare
+close rather than a `terminal.error` you could read. A controller's
+`terminal.resize` never
 carries the browser's pixel cell geometry — `cell_width_px`/`cell_height_px` are
 rebuilt as zeros, so a control client cannot change the pixel cell size the pane
 reports to every *other* client of that host.
@@ -774,31 +858,40 @@ scroll in your own client instead.
 
 ### Server messages
 
+These messages are built as JSON maps, so their keys come out **sorted** and
+`type` is last, not first. (The `/api/fleet` report and the `/api/events`
+envelopes are serialized from structs instead, and keep declaration order —
+`kind` really is first there.)
+
 ```json
-{"type":"terminal.ready","schema":"herdr.fleet.terminal.v1","mode":"observe","host":"lab-2","pane":"w1:p1","ref":"lab-2/w1:p1","cols":80,"rows":24}
-{"type":"terminal.error","code":"busy","message":"…"}
-{"type":"terminal.closed","reason":"released"}
+{"cols":80,"host":"lab-2","mode":"observe","pane":"w1:p1","ref":"lab-2/w1:p1","rows":24,"schema":"herdr.fleet.terminal.v1","type":"terminal.ready"}
+{"code":"busy","message":"…","type":"terminal.error"}
+{"reason":"released","type":"terminal.closed"}
 ```
 
 `terminal.closed.reason` is `"released"` (your own `terminal.release`),
 `"taken_over"` (another controller took the pane), `"the gateway is stopping"`,
-a host-supplied reason string, or `null` for an ordinary end of stream.
+a host-supplied reason string, or `null` for an ordinary end of stream. A
+`terminal.closed` carries its own close code: **1000** for a release, a
+takeover or an ordinary end of stream, and **1001** when the gateway is
+stopping — that last one means *reconnect later*, not *something broke*.
 
 ### Error codes
 
 | `code` | Condition | Close |
 | --- | --- | --- |
-| `bad_request` | No `terminal.open` within 10 s, a malformed or oversized open, geometry outside `1..=1024`, an unparseable command, or a binary message from the client. | `1002` at handshake; no close for a mid-session bad command |
+| `bad_request` | No `terminal.open` within 10 s, a malformed open, geometry outside `1..=1024`, an unparseable or over-long command, or a binary message from the client. | `1002` at handshake; no close for a mid-session bad command |
 | `forbidden` | The scope cannot hold the mode (`read` asking for `control`), or the mode forbids the message (an observer's `terminal.input`). | `1008` at handshake; no close for a later refusal |
 | `host_unavailable` | The host is not configured, not connected, or the session could not be opened. | `1011` |
 | `host_busy` | The **gateway's** single ssh transport slot for that host is taken. Retry later. | `1013` |
-| `busy` | The **pane's** single attach slot on the host is held by another controller. Retry with `takeover: true`. | `1013` |
+| `busy` | The **pane's** single attach slot on the host is held by another controller (retry with `takeover: true`), or the host has a read in progress on that pane and says to retry (a transient state; takeover is not the remedy — read the `message`). | `1013` |
 | `pane_not_found` | The host is reachable but has no such pane. | `1000` |
 | `unsupported` | An observer's `terminal.scroll`. | none — the session continues |
-| `internal` | The gateway's fault. | `1011` |
+| `internal` | The gateway's fault, and also a host-side stream that failed mid-session — a frame over `MAX_FRAME_SIZE`, a framing error, or a read error. | `1011` |
 
 `host_busy` and `busy` are different layers and a client should treat them
-differently: `host_busy` means *wait*, `busy` means *offer "take over"*.
+differently: `host_busy` means *wait*, `busy` usually means *offer "take
+over"* — except for the read-in-progress wording, which means *retry*.
 
 Real transcripts, all from the lab:
 
@@ -871,7 +964,7 @@ so it runs anywhere `python3` does.
 
 ```bash
 python3 scripts/fork/ws-client.py <ws-url> \
-  [-H 'Name: value']…      # extra request headers, e.g. Authorization
+  [-H|--header 'Name: value']…  # extra request headers, e.g. Authorization
   [--send JSON]…           # text messages to send after connecting, in order
   [--send-stdin]           # send all of stdin as one text message
   [--max-messages N]       # stop after N printed messages
@@ -879,22 +972,29 @@ python3 scripts/fork/ws-client.py <ws-url> \
   [--binary hex|len]       # print binary messages as hex, or as a byte count (default)
 ```
 
-It prints one line per message (`text …`, `binary …`, `close <code>`), which is
-what makes the transcripts above greppable.
+It prints one line per message on stdout — `text …`, `binary …`,
+`close <code>`, plus `handshake <status>` if the HTTP upgrade itself is refused
+— which is what makes the transcripts above greppable. A close frame's reason
+goes to stderr, and a failure path exits non-zero.
 
 ---
 
 ## Shutting down
 
-`SIGINT` or `SIGTERM` stops the gateway with exit **0**. In order: stop
-accepting, end the event and terminal streams (so a WebSocket does not hold the
-drain open), drain HTTP for at most 5 s, close terminal sessions and drop their
-transports, stop the fleet connector, remove `gateway.json`, return.
+`SIGINT` or `SIGTERM` stops the gateway with exit **0**. (On Windows only
+Ctrl-C does: `SIGTERM` has no counterpart there, so a supervisor has to stop
+the process another way.) In order: end every `/api/events` stream so an open
+WebSocket does not hold graceful shutdown open, stop accepting and drain HTTP
+for at most 5 s, then close the terminal sessions — each gets
+`terminal.closed {"reason":"the gateway is stopping"}` and close **1001** —
+drop their transports, stop the fleet connector, remove `gateway.json`, return.
 
-Verified against the lab with terminals open: exit `0` within a couple of
-seconds, `gateway.json` gone, and every `/tmp/herdr-remote-<pid>-gateway-…`
-forward socket removed. A crash instead leaves `gateway.json` behind, which is
-why `status` and `pair` check that the recorded pid is alive.
+Verified against the lab with a terminal stream and an events stream both open:
+exit `0` in **27 ms**, `gateway.json` gone, both clients closed with `1001`
+(`fleet runtime stopped` and `gateway stopping`), and every
+`herdr-remote-<pid>-gateway-…` forward socket removed. A crash instead leaves
+`gateway.json` behind, which is why `status` and `pair` check that the recorded
+pid is alive.
 
 ---
 
@@ -957,15 +1057,17 @@ reconnecting in a loop.
 bridged stream is in use. Close the other terminal on it and retry; local hosts
 never do this.
 
-**A host is stuck `unavailable`** — read its `reason` in `/api/fleet`. For an
-ssh host, the usual cause is that the key needs a passphrase or the host key is
-unknown: the gateway's bridges are `BatchMode=yes`, so they fail instead of
-prompting. Test the same target by hand with
+**A host is stuck `unavailable` or `connecting`** — read its `reason` in
+`/api/fleet`. For an ssh host, the usual cause is that the key needs a
+passphrase or the host key is unknown. The gateway's *bridges* are
+`BatchMode=yes` and fail instead of prompting, but the discovery probe that
+runs first is still interactive, so such a host can sit in `connecting` until
+ssh gives up. Test the same target by hand with
 `ssh -o BatchMode=yes <target> true`.
 
-**Stale `/tmp/herdr-remote-<pid>-gateway-…` sockets** — left by a gateway that
-was `SIGKILL`ed. They are named by pid, so they never collide with a new run;
-delete them at leisure.
+**Stale `herdr-remote-<pid>-gateway-…` sockets in the temp dir** — left by a
+gateway that was `SIGKILL`ed. They are named by pid, so they never collide with
+a new run; delete them at leisure.
 
 **`herdr gateway status` says `not running` but a process exists** — the pid in
 `gateway.json` is not alive, so the marker is stale (a crash), or two gateways
@@ -987,10 +1089,11 @@ Recorded deliberately, so nobody rediscovers them as bugs:
   memory. A bad store at startup is still a refusal.
 - **On Windows a file stamp has no inode**, so two rotations inside one mtime
   tick could be missed.
-- **`pair`, `status` and `rotate-token` ignore `--config`.** They follow
-  `XDG_CONFIG_HOME` like the token store, and `pair` prefers the running
-  gateway's marker for the address — so a daemon started with `--config` could
-  have a `public_url` these commands do not see.
+- **`pair`, `status` and `rotate-token` ignore `--config`.** The store follows
+  `XDG_CONFIG_HOME`, `pair` prefers the running gateway's marker for the
+  address, and the config file these commands read is the default one (or
+  `HERDR_CONFIG_PATH`) — so a daemon started with `--config` could have a
+  `public_url` they do not see.
 - **A one-time pairing URL is burned by a link previewer.**
 - **Rotating a token does not end a live control session**; scope is fixed at
   the terminal handshake.
@@ -1000,6 +1103,13 @@ Recorded deliberately, so nobody rediscovers them as bugs:
   observer cannot share one ssh host today.
 - **There is no revoke-one-device command**; `rotate-token <scope>` revokes all
   of that scope's devices.
+- **A `[gateway]` value of the wrong TOML type resets every section**, because
+  the config file is deserialized in one pass. The diagnostic says
+  `config parse error: …; using defaults`.
+- **`SIGTERM` is a unix-only stop.** On Windows the gateway waits on Ctrl-C.
+- **An ssh host whose key needs a passphrase stalls in *discovery*,** which is
+  still interactive upstream code, rather than failing fast the way the
+  noninteractive bridge does.
 
 ---
 

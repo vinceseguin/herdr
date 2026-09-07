@@ -223,9 +223,11 @@ recording.
 - **Backpressure belongs in the gateway, not in the host.** Each terminal
   session bridges the host to the WebSocket through bounded channels of depth 2,
   so a slow phone applies backpressure to the server's own render lane rather
-  than making the gateway buffer. The gateway therefore never holds more than two
-  frames per open terminal — the property that lets "one gateway for the whole
-  fleet" scale without a memory story.
+  than making the gateway buffer. The gateway therefore buffers at most two
+  frames per open terminal (four counting the one a blocked reader holds and the
+  one in flight to the socket) — a small constant rather than a queue, which is
+  the property that lets "one gateway for the whole fleet" scale without a
+  memory story.
 - **The server's semantics leak through as vocabulary, and that is correct.**
   A pane has one attach slot, so a second controller gets `busy` and the answer
   is `takeover: true`; the evicted controller gets
