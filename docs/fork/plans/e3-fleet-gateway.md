@@ -3218,6 +3218,79 @@ systemd-analyze --user verify scripts/fork/systemd/herdr-gateway.service; echo "
   unit. Every later `[gateway]` key or endpoint is documented in
   `gateway.md` in the same PR that adds it.
 
+**Landed** (merged; gate `EXIT=0` for both `ci` and `ci-no-default`)
+
+- **`docs/fork/gateway.md` is the reference, and it is written against the
+  binary, not against this plan.** Every command, status code, JSON body,
+  transcript and header in it was produced by a real gateway on the fleet lab
+  and pasted back with secrets replaced by `<placeholder>`. The doc covers what
+  the *Files* section asked for, plus a *Client messages* section and an
+  *Accepted limitations* list that collects, in one place, every residual PRs 4,
+  6, 7 and 8 recorded.
+- **The review pass found thirty factual defects in the first draft**, which is
+  the point of writing docs from source rather than from a plan. The ones that
+  would have cost a later epic real time:
+  - **`agent_added.agent` is `MergedAgent`, not `AgentReport`.** The events
+    stream's agent payload spells its identity `pane`/`workspace`/`tab` as
+    single `host/id` strings; `/api/fleet`'s `agents[]` spells the same thing
+    `ref`/`host`/`pane_id`/`workspace_id`/`tab_id`. A client that assumed one
+    shape for both — which the draft invited — would have failed on the first
+    delta. **E4 must upsert keyed by `agent.pane`.**
+  - **Terminal streams end *with* the transports, after `serve` returns**, not
+    before the HTTP drain (only the *fleet* stopper is latched inside the
+    shutdown future). Measured live with a terminal and an events stream open:
+    `SIGTERM` → exit 0 in **27 ms**, the terminal getting
+    `terminal.closed {reason:"the gateway is stopping"}` + close **1001** (a
+    close code the draft never listed) and the events socket 1001
+    `fleet runtime stopped`.
+  - **The passive-reader guarantee is about the fleet connector and observers.**
+    A **control** session resizes the pane's real PTY — that is what PR 7 is —
+    so "the gateway never resizes anybody's panes" is false as an unqualified
+    sentence.
+  - **`busy` is not always answered by `takeover: true`.** It also carries the
+    host's "has a read in progress; retry" wording, where the remedy is to wait.
+    E4 must not offer *Take over* for that message.
+  - **A malformed `[gateway]` section is not section-local.** The
+    "keeping current gateway settings" wording belongs to the live-reload path;
+    a parse failure at startup resets **every** section to defaults with
+    `config parse error: …; using defaults`.
+  - **Discovery is still interactive**, so an ssh host that needs a passphrase
+    stalls in the probe *before* the noninteractive bridge ever runs — the
+    `BatchMode` switch does not make every ssh failure fast.
+  - Smaller corrections now in the doc: `public_url` alone unlocks a
+    non-loopback bind; the origin check runs *before* the public-path check, so
+    `/health` is not exempt from it; `Sec-Fetch-Site: same-site` is refused
+    alongside `cross-site`; an accepted cookie stats `devices.json` twice; a
+    wider-mode gateway directory you own is silently tightened rather than
+    refused; `terminal.ready` is sent unconfirmed after the 10 s attach timeout;
+    `terminal.input` with *neither* `text` nor `bytes` sends empty input; an
+    oversize `terminal.open` is a bare WebSocket close, not `bad_request`; the
+    gateway buffers two frames per terminal but the true ceiling is four; and
+    every `terminal.*` sample is key-sorted on the wire while `/api/fleet` and
+    `/api/events` keep struct order.
+- **`scripts/fork/systemd/herdr-gateway.service`** is `%h`-relative
+  (`ExecStart=%h/.local/bin/herdr gateway`), `Restart=on-failure`,
+  `TimeoutStopSec=15` against the real `SHUTDOWN_DRAIN = 5 s`, and sets no
+  `Environment=`. `Wants=/After=network-online.target` was **removed**: that
+  unit does not exist in the user manager, so it only produced a log line.
+  `systemd-analyze --user verify` exits 0 with `ExecStart` pointed at a real
+  binary; against the shipped file its only diagnostic is that
+  `%h/.local/bin/herdr` does not exist until E8 installs it.
+- **The dead-code janitoring is done.** `FleetHandle::{host_connection,
+  host_spec}` lost their allows (PR 6's terminal route consumes both);
+  `HostId::{as_str, is_local}` lost theirs (production callers in
+  `fleet/transport/ssh.rs`, `gateway/protocol.rs` and `fleet/machines.rs`, in
+  both feature configurations); `ApiError::status` became `#[cfg(test)]`, which
+  is what it always was. `DeviceStore::revoke_id` keeps its allow, naming the
+  revoke-device command that is not E3's — it is the only one left in
+  `src/gateway/`.
+- **ADR 0001 gained an E3 review** (tokens on loopback, the passive hello
+  closing E1's caveat, noninteractive ssh as a separate switch, scoped forward
+  sockets and the one-stream ssh bridge, backpressure in the gateway, the
+  server's semantics leaking through as vocabulary, and two stores that must
+  reload). **ADR 0002's "E3 decides" item is closed** with decision (r):
+  `[fleet] include_machines`, default `false`.
+
 ## Critical files referenced (reuse, don't reinvent)
 
 - `src/fleet/connector.rs` — `FleetConnector::{start, take_events,
