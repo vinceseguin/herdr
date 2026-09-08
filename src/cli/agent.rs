@@ -544,6 +544,19 @@ fn agent_switch_account(args: &[String]) -> std::io::Result<i32> {
         && timeout_ms <= crate::app::MAX_AGENT_START_TIMEOUT.as_millis() as u64)
         .then_some(timeout_ms);
 
+    // Read the source agent's screen once, before anything is sent, so the
+    // confirmation can say *why* the switch is being asked for. Best effort:
+    // an unknown target, a server that will not answer or a screen that
+    // matches nothing all mean "herdr saw no limit", and the preflight below
+    // is what actually refuses an agent it cannot switch.
+    let limit = super::account::agent_explain(&target).and_then(|explain| {
+        if !crate::accounts::limit::matched_usage_limit(&explain) {
+            return None;
+        }
+        let screen = super::account::detection_screen(&target).unwrap_or_default();
+        crate::accounts::limit::classify(&explain, &screen)
+    });
+
     let input = crate::accounts::switch::SwitchInput {
         target: target.clone(),
         to: profile.clone(),
@@ -553,6 +566,7 @@ fn agent_switch_account(args: &[String]) -> std::io::Result<i32> {
             force,
             timeout_ms,
         },
+        limit: limit.clone(),
     };
 
     let mut confirm = |question: &str| confirm_switch(question, yes);
@@ -572,6 +586,9 @@ fn agent_switch_account(args: &[String]) -> std::io::Result<i32> {
                     "to": result.to,
                     "session_id": result.session_id,
                     "account_state": result.account_state.as_str(),
+                    // What the preflight saw, so a caller that automated the
+                    // switch can record why it happened.
+                    "limit": limit,
                 });
                 println!("{rendered}");
             } else {

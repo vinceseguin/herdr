@@ -65,6 +65,10 @@ pub const ESCAPE_SETTLE_MS: Millis = 300;
 /// fails with a message instead of being poked forever.
 const MAX_EXIT_ATTEMPTS: u8 = 3;
 
+/// The one thing this protocol ever submits to an agent. A constant, never
+/// anything a caller supplied.
+const EXIT_COMMAND: &str = "/exit";
+
 /// The rejection code a driver reports when a send never got an answer. A
 /// server that *refused* a send wrote nothing to the pane; a request that was
 /// lost in transit may or may not have, so the machine counts the pane as
@@ -196,6 +200,13 @@ pub enum Action {
     SendKeys(Vec<String>),
     /// `agent.prompt` on the pinned pane.
     Prompt(String),
+    /// `pane.send_text` on the pinned pane, with a trailing carriage return.
+    ///
+    /// The last resort for a `/exit` the server will not accept as a prompt.
+    /// See [`SwitchMachine::on_exit`]: it is only ever reached for an agent
+    /// the preflight saw a usage limit on, and the text is always the
+    /// constant `/exit`.
+    SubmitText(String),
     /// Re-read the agent on the pinned pane.
     PollAgent,
     /// Re-read the pinned pane's processes and agent ownership.
@@ -561,6 +572,12 @@ enum Phase {
     Exit {
         attempts: u8,
     },
+    /// The pinned agent is being read once more, because the next action
+    /// writes raw bytes into the pane with none of `agent.prompt`'s checks.
+    RecheckExitText,
+    /// `/exit` typed into the pane, after the prompt path was refused for a
+    /// usage-limited agent.
+    ExitText,
     AwaitShell {
         deadline: Millis,
     },
@@ -580,6 +597,11 @@ pub struct SwitchInput {
     pub to: AccountProfile,
     pub to_inspection: ProfileInspection,
     pub options: SwitchOptions,
+    /// What herdr's detector said about the source agent's account usage, read
+    /// once before the protocol starts. Text only: it never gates a phase and
+    /// never changes what is sent, it only tells the human answering the
+    /// confirmation *why* they are being asked.
+    pub limit: Option<crate::accounts::limit::UsageLimit>,
 }
 
 /// The switch protocol.
@@ -654,6 +676,8 @@ impl SwitchMachine {
             Phase::Escape { attempts } => self.on_escape(attempts, observation),
             Phase::EscapeSettle { attempts } => self.on_escape_settle(attempts, observation),
             Phase::Exit { attempts } => self.on_exit(now, attempts, observation),
+            Phase::RecheckExitText => self.on_recheck_exit_text(observation),
+            Phase::ExitText => self.on_exit_text(now, observation),
             Phase::AwaitShell { deadline } => self.on_await_shell(now, deadline, observation),
             Phase::Relaunch => self.on_relaunch(now, observation),
             Phase::AwaitSession { deadline } => self.on_await_session(now, deadline, observation),
@@ -817,6 +841,16 @@ impl SwitchMachine {
                  screen.",
             );
         }
+        // Why this switch is being asked for, when herdr can see it. Stated
+        // after the warnings so the last thing read is still a warning when
+        // there is one.
+        if let Some(limit) = self.input.limit.as_ref() {
+            let reset = match limit.reset_text.as_deref() {
+                Some(reset) => format!(", which resets {reset}"),
+                None => String::new(),
+            };
+            text.push_str(&format!("\n  herdr sees a usage limit on {from}{reset}."));
+        }
         text
     }
 
@@ -835,6 +869,44 @@ impl SwitchMachine {
         }
     }
 
+    /// What "still the agent that was confirmed" means: same terminal, same
+    /// name, same conversation. Shared, because it is checked once before the
+    /// protocol sends anything and once more before the typed `/exit`, and the
+    /// two must not be allowed to drift apart.
+    fn pinned_identity_error(&self, agent: Option<&AgentSnapshot>) -> Option<SwitchError> {
+        let changed = |detail: String| {
+            Some(SwitchError::AgentChanged {
+                pane_id: self.pane_id.clone(),
+                detail,
+            })
+        };
+        let Some(agent) = agent else {
+            return changed("there is no agent on that pane any more".into());
+        };
+        if agent.terminal_id != self.terminal_id {
+            return changed("the pane is now another terminal".into());
+        }
+        if agent.name.as_deref() != Some(self.name.as_str()) {
+            return changed(format!(
+                "it is now named {}, not {:?}",
+                agent
+                    .name
+                    .as_ref()
+                    .map(|name| format!("{name:?}"))
+                    .unwrap_or_else(|| "nothing".to_string()),
+                self.name
+            ));
+        }
+        match agent.session.as_ref() {
+            Some(session) if session.value == self.session_id => None,
+            Some(session) => changed(format!(
+                "its session id is now {:?}, not {:?}",
+                session.value, self.session_id
+            )),
+            None => changed("it no longer reports a session id".into()),
+        }
+    }
+
     /// The agent must still be the one that was confirmed: same terminal, same
     /// name, same conversation, and not working unless that was agreed to.
     /// Its status is taken from this read, not the first one, because that is
@@ -843,39 +915,18 @@ impl SwitchMachine {
         let Observation::Agent(agent) = observation else {
             return self.out_of_order("recheck");
         };
-        let changed = |detail: String| SwitchError::AgentChanged {
-            pane_id: self.pane_id.clone(),
-            detail,
+        let agent = *agent;
+        if let Some(error) = self.pinned_identity_error(agent.as_ref()) {
+            return self.fail(error);
+        }
+        let Some(agent) = agent else {
+            // Unreachable: a missing agent is the first thing the check above
+            // refuses. Spelled out rather than unwrapped.
+            return self.fail(SwitchError::AgentChanged {
+                pane_id: self.pane_id.clone(),
+                detail: "there is no agent on that pane any more".into(),
+            });
         };
-        let Some(agent) = *agent else {
-            return self.fail(changed("there is no agent on that pane any more".into()));
-        };
-        if agent.terminal_id != self.terminal_id {
-            return self.fail(changed("the pane is now another terminal".into()));
-        }
-        if agent.name.as_deref() != Some(self.name.as_str()) {
-            return self.fail(changed(format!(
-                "it is now named {}, not {:?}",
-                agent
-                    .name
-                    .as_ref()
-                    .map(|name| format!("{name:?}"))
-                    .unwrap_or_else(|| "nothing".to_string()),
-                self.name
-            )));
-        }
-        match agent.session.as_ref() {
-            Some(session) if session.value == self.session_id => {}
-            Some(session) => {
-                return self.fail(changed(format!(
-                    "its session id is now {:?}, not {:?}",
-                    session.value, self.session_id
-                )));
-            }
-            None => {
-                return self.fail(changed("it no longer reports a session id".into()));
-            }
-        }
         if agent.status == AgentStatus::Working && !self.input.options.interrupt {
             return self.fail(SwitchError::AgentWorking {
                 name: self.name.clone(),
@@ -905,7 +956,7 @@ impl SwitchMachine {
             }
             _ => {
                 self.phase = Phase::Exit { attempts: 0 };
-                Action::Prompt("/exit".to_string())
+                Action::Prompt(EXIT_COMMAND.to_string())
             }
         }
     }
@@ -929,7 +980,7 @@ impl SwitchMachine {
         match observation {
             Observation::Tick => {
                 self.phase = Phase::Exit { attempts };
-                Action::Prompt("/exit".to_string())
+                Action::Prompt(EXIT_COMMAND.to_string())
             }
             _ => self.out_of_order("interrupt"),
         }
@@ -948,8 +999,20 @@ impl SwitchMachine {
             // race with the Escape that was meant to unblock it, so a bounded
             // number of retries goes back through Escape rather than failing on
             // a timing artefact.
+            //
+            // A usage limit is the one blocked state Escape cannot clear: the
+            // notice stays on screen until the account's window rolls over, so
+            // `agent.prompt` would be refused for as long as the limit lasts —
+            // and switching away from it is the entire point of the command.
+            // For that case, and only that case, `/exit` is typed into the
+            // pane instead. The agent is still at a prompt that accepts
+            // typing; what it cannot do is work.
             Observation::SendRejected { code, detail } => {
                 self.touched_pane |= code == TRANSPORT_ERROR_CODE;
+                if code == "agent_blocked" && self.input.limit.is_some() {
+                    self.phase = Phase::RecheckExitText;
+                    return Action::PollAgent;
+                }
                 if code == "agent_blocked" && attempts + 1 < MAX_EXIT_ATTEMPTS {
                     self.phase = Phase::Escape {
                         attempts: attempts + 1,
@@ -958,6 +1021,46 @@ impl SwitchMachine {
                 } else {
                     self.fail(SwitchError::ExitRefused { code, detail })
                 }
+            }
+            _ => self.out_of_order("exit"),
+        }
+    }
+
+    /// One more read before raw bytes reach the pty.
+    ///
+    /// `pane.send_text` writes to a *pane id* with none of `agent.prompt`'s
+    /// checks: it does not care which terminal now holds the pane, which agent
+    /// is in it, or what conversation that agent is running. The refusal that
+    /// led here proved only that some blocked agent answered on this pane a
+    /// round trip ago, so the pinned identity is re-established immediately
+    /// before `/exit` is typed. A pane that changed hands in the meantime
+    /// fails the switch instead of being typed into.
+    fn on_recheck_exit_text(&mut self, observation: Observation) -> Action {
+        let Observation::Agent(agent) = observation else {
+            return self.out_of_order("exit");
+        };
+        if let Some(error) = self.pinned_identity_error((*agent).as_ref()) {
+            return self.fail(error);
+        }
+        self.phase = Phase::ExitText;
+        Action::SubmitText(EXIT_COMMAND.to_string())
+    }
+
+    /// The typed `/exit`. One attempt: it went into the pty or it did not, and
+    /// a second copy of a command that may already have landed could be typed
+    /// at whatever the pane holds next.
+    fn on_exit_text(&mut self, now: Millis, observation: Observation) -> Action {
+        match observation {
+            Observation::Sent => {
+                self.touched_pane = true;
+                self.phase = Phase::AwaitShell {
+                    deadline: now.saturating_add(self.input.options.timeout_ms),
+                };
+                Action::PollPane
+            }
+            Observation::SendRejected { code, detail } => {
+                self.touched_pane |= code == TRANSPORT_ERROR_CODE;
+                self.fail(SwitchError::ExitRefused { code, detail })
             }
             _ => self.out_of_order("exit"),
         }
@@ -1156,7 +1259,38 @@ mod tests {
             to: profile("work"),
             to_inspection: healthy(),
             options,
+            limit: None,
         })
+    }
+
+    /// The reason for the switch, in the question the human answers. A TUI
+    /// modal (PR 8) renders the same string, which is why it lives in the
+    /// machine rather than in the CLI.
+    #[test]
+    fn a_usage_limit_is_named_in_the_confirmation() {
+        let mut machine = SwitchMachine::new(SwitchInput {
+            target: "a1".to_string(),
+            to: profile("work"),
+            to_inspection: healthy(),
+            options: SwitchOptions::default(),
+            limit: Some(crate::accounts::limit::UsageLimit {
+                reset_text: Some("3pm".to_string()),
+            }),
+        });
+        let action = machine.next(0, Observation::agent(Some(agent())));
+        let Action::AskConfirm(text) = &action else {
+            panic!("expected a confirmation, got {action:?}");
+        };
+        assert!(text.contains("usage limit on perso"), "{text}");
+        assert!(text.contains("resets 3pm"), "{text}");
+
+        // …and nothing is invented when the detector saw nothing.
+        let mut quiet = switching(SwitchOptions::default());
+        let action = quiet.next(0, Observation::agent(Some(agent())));
+        let Action::AskConfirm(text) = &action else {
+            panic!("expected a confirmation, got {action:?}");
+        };
+        assert!(!text.contains("usage limit"), "{text}");
     }
 
     fn finished(action: &Action) -> &Result<SwitchResult, SwitchError> {
@@ -1621,6 +1755,159 @@ mod tests {
         assert!(matches!(error_of(&action), SwitchError::ExitRefused { .. }));
     }
 
+    /// The regression this PR would otherwise have shipped: the usage-limit
+    /// rule makes a limited agent `blocked`, the stock server refuses
+    /// `agent.prompt` for a blocked agent, and Escape cannot clear a limit —
+    /// so `switch-account`, the one command that gets a human out of a limit,
+    /// would refuse every limited agent. `/exit` is typed instead.
+    #[test]
+    fn a_usage_limited_agent_is_asked_to_exit_by_typing() {
+        let mut blocked = agent();
+        blocked.status = AgentStatus::Blocked;
+        let mut machine = SwitchMachine::new(SwitchInput {
+            target: "a1".to_string(),
+            to: profile("work"),
+            to_inspection: healthy(),
+            options: SwitchOptions::default(),
+            limit: Some(crate::accounts::limit::UsageLimit { reset_text: None }),
+        });
+        let blocked_again = blocked.clone();
+        machine.next(0, Observation::agent(Some(blocked.clone())));
+        machine.next(1, Observation::Confirmed(true));
+        let action = machine.next(2, Observation::agent(Some(blocked)));
+
+        // Escape first, as for any blocked agent…
+        assert!(matches!(action, Action::SendKeys(_)), "{action:?}");
+        let action = machine.next(3, Observation::Sent);
+        assert!(matches!(action, Action::Wait(_)), "{action:?}");
+        let action = machine.next(4, Observation::Tick);
+        assert_eq!(action, Action::Prompt("/exit".to_string()));
+
+        // …and when the server refuses the prompt, the pinned agent is read
+        // once more — `pane.send_text` checks nothing — and only then typed.
+        let action = machine.next(
+            5,
+            Observation::SendRejected {
+                code: "agent_blocked".to_string(),
+                detail: "agent is blocked".to_string(),
+            },
+        );
+        assert_eq!(action, Action::PollAgent);
+        let action = machine.next(6, Observation::agent(Some(blocked_again)));
+        assert_eq!(action, Action::SubmitText("/exit".to_string()));
+        assert_eq!(machine.next(7, Observation::Sent), Action::PollPane);
+        assert!(machine.touched_pane());
+    }
+
+    /// The guard on the one send that carries no server-side checks: a pane
+    /// that changed hands between the refused prompt and the typed `/exit` is
+    /// never typed into.
+    #[test]
+    fn a_pane_that_changed_hands_is_not_typed_into() {
+        let mut blocked = agent();
+        blocked.status = AgentStatus::Blocked;
+        let mut machine = SwitchMachine::new(SwitchInput {
+            target: "a1".to_string(),
+            to: profile("work"),
+            to_inspection: healthy(),
+            options: SwitchOptions::default(),
+            limit: Some(crate::accounts::limit::UsageLimit { reset_text: None }),
+        });
+        machine.next(0, Observation::agent(Some(blocked.clone())));
+        machine.next(1, Observation::Confirmed(true));
+        machine.next(2, Observation::agent(Some(blocked.clone())));
+        machine.next(3, Observation::Sent);
+        machine.next(4, Observation::Tick);
+        let action = machine.next(
+            5,
+            Observation::SendRejected {
+                code: "agent_blocked".to_string(),
+                detail: "agent is blocked".to_string(),
+            },
+        );
+        assert_eq!(action, Action::PollAgent);
+
+        let mut stranger = blocked;
+        stranger.terminal_id = "another-terminal".to_string();
+        let action = machine.next(6, Observation::agent(Some(stranger)));
+        assert!(
+            matches!(error_of(&action), SwitchError::AgentChanged { .. }),
+            "{action:?}"
+        );
+        // The Escape that opened the exit did reach the pane, so the failure is
+        // still reported as "touched" — the point is that no `/exit` was typed
+        // into whatever now holds the pane.
+        assert!(machine.touched_pane());
+    }
+
+    /// Only for a limit. Any other blocked agent keeps the old, guarded path,
+    /// because `pane.send_text` carries none of `agent.prompt`'s checks.
+    #[test]
+    fn an_ordinary_blocked_agent_is_never_typed_into() {
+        let mut blocked = agent();
+        blocked.status = AgentStatus::Blocked;
+        let mut machine = switching(SwitchOptions::default());
+        machine.next(0, Observation::agent(Some(blocked.clone())));
+        machine.next(1, Observation::Confirmed(true));
+        let mut action = machine.next(2, Observation::agent(Some(blocked.clone())));
+        for step in 3..50 {
+            action = match action {
+                Action::Wait(_) => machine.next(step, Observation::Tick),
+                Action::SendKeys(_) => machine.next(step, Observation::Sent),
+                Action::PollAgent => machine.next(step, Observation::agent(Some(blocked.clone()))),
+                Action::Prompt(_) => machine.next(
+                    step,
+                    Observation::SendRejected {
+                        code: "agent_blocked".to_string(),
+                        detail: "agent is blocked".to_string(),
+                    },
+                ),
+                Action::SubmitText(_) => panic!("nothing may be typed into a blocked pane"),
+                Action::Finish(_) => break,
+                other => panic!("unexpected action {other:?}"),
+            };
+        }
+        assert!(matches!(error_of(&action), SwitchError::ExitRefused { .. }));
+    }
+
+    /// One attempt only: a typed line that may already have landed is never
+    /// sent twice.
+    #[test]
+    fn a_refused_typed_exit_is_not_retried() {
+        let mut blocked = agent();
+        blocked.status = AgentStatus::Blocked;
+        let mut machine = SwitchMachine::new(SwitchInput {
+            target: "a1".to_string(),
+            to: profile("work"),
+            to_inspection: healthy(),
+            options: SwitchOptions::default(),
+            limit: Some(crate::accounts::limit::UsageLimit { reset_text: None }),
+        });
+        machine.next(0, Observation::agent(Some(blocked.clone())));
+        machine.next(1, Observation::Confirmed(true));
+        machine.next(2, Observation::agent(Some(blocked.clone())));
+        machine.next(3, Observation::Sent);
+        machine.next(4, Observation::Tick);
+        let action = machine.next(
+            5,
+            Observation::SendRejected {
+                code: "agent_blocked".to_string(),
+                detail: "blocked".to_string(),
+            },
+        );
+        assert_eq!(action, Action::PollAgent);
+        let action = machine.next(6, Observation::agent(Some(blocked)));
+        assert_eq!(action, Action::SubmitText("/exit".to_string()));
+        let action = machine.next(
+            7,
+            Observation::SendRejected {
+                code: "pane_not_found".to_string(),
+                detail: "gone".to_string(),
+            },
+        );
+        assert!(matches!(error_of(&action), SwitchError::ExitRefused { .. }));
+    }
+
     #[test]
     fn a_declined_confirmation_sends_nothing() {
         let mut machine = switching(SwitchOptions::default());
@@ -1652,6 +1939,7 @@ mod tests {
                 ..healthy()
             },
             options: SwitchOptions::default(),
+            limit: None,
         });
         let action = machine.next(0, Observation::agent(Some(agent())));
         assert!(matches!(
@@ -1667,6 +1955,7 @@ mod tests {
                 ..healthy()
             },
             options: SwitchOptions::default(),
+            limit: None,
         });
         let action = machine.next(0, Observation::agent(Some(agent())));
         assert!(matches!(
@@ -1686,6 +1975,7 @@ mod tests {
                 force: true,
                 ..SwitchOptions::default()
             },
+            limit: None,
         });
         let action = machine.next(0, Observation::agent(Some(agent())));
         let Action::AskConfirm(text) = &action else {

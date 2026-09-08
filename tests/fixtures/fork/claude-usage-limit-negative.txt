@@ -1,0 +1,13 @@
+⏺ Read(docs/fork/plans/e9-claude-accounts.md)
+  ⎿  Read 1261 lines
+
+⏺ PR 9 adds a usage limit rule to the Claude manifest. When an account is rate
+  limited, the notice "Claude usage limit reached" appears in the footer, and
+  the same footer says when the limit resets at 14:00 on that account. herdr
+  should read that as blocked rather than idle, but it must not read *this*
+  paragraph that way: nothing here is a control, it is a transcript.
+
+────────────────────────────────────────────────────────────────
+❯ why did the account hit its usage limit before 3pm?
+────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · ? for shortcuts

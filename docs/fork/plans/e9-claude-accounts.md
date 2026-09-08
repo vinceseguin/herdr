@@ -352,7 +352,7 @@ implementation starts only after E3 is ✅.
 | 6 | feat(fleet): fleet report and change stream carry agent metadata tokens | C · Fleet | 1 | ✅ |
 | 7 | feat(accounts): tui account picker to start claude in a pane | D · TUI | 4 | ✅ |
 | 8 | feat(accounts): tui switch-account action with confirmation | D · TUI | 5, 7 | ⬜ |
-| 9 | feat(detect): claude usage-limit rule and account limit hints | E · Limits | 3, 5 | ⬜ |
+| 9 | feat(detect): claude usage-limit rule and account limit hints | E · Limits | 3, 5 | ✅ |
 | 10 | feat(accounts): herdr account watch labels usage-limited agents | E · Limits | 9 | ⬜ |
 | 11 | docs(accounts): accounts guide, adr, readme and roadmap drift | F · Docs | 2, 6, 8, 10 | ⬜ |
 
@@ -1774,6 +1774,120 @@ rule).
 **Downstream.** PR 10 reuses `classify`. The fixture is the only evidence
 until a real limited account is available (see the live checklist).
 
+**As built (PR 9, merged).** The rule, the fixture and the hints are as
+specified; the three corrections below are what PRs 10 and 11 must code
+against, and they win over the prose above.
+
+- **The region is `after_last_horizontal_rule`, not `bottom_non_empty_lines(12)`.**
+  The plan's region reads the bottom of the buffer, which is *history* as well
+  as state, and that broke the epic's own flow: after `switch-account` relaunches
+  Claude in the same pane, the previous session's limit notice is still inside a
+  bottom-N window, so the freshly resumed agent reads as blocked and the launch
+  readiness wait fails. It was observed exactly that way in the lab.
+  `after_last_horizontal_rule` is the status area below the live prompt box —
+  the same region `live_blocked_form` uses — so a notice above the current box
+  is history, and a transcript is *structurally* incapable of matching rather
+  than merely unlikely to. `a_limit_notice_above_the_live_prompt_box_is_history`
+  in `src/accounts/limit.rs` pins it. The residual live risk moves with the
+  region: if the real notice is not in the footer, the rule never fires (see the
+  live checklist).
+- **`herdr agent switch-account` needed a typed-`/exit` fallback, or the rule
+  would have broken the command it advertises.** Marking the limit `blocked`
+  makes the stock server refuse `agent.prompt` (`src/app/api/agents.rs:138`
+  rejects any agent whose state is `Blocked`), and Escape cannot clear a usage
+  limit — the notice stays until the account's window rolls over. So the one
+  command that gets a human out of a limit would have refused every limited
+  agent. `Action::SubmitText` (driven by `client::submit_pane_text`, a
+  `pane.send_text` of the constant `EXIT_COMMAND` plus `\r`) is reached **only**
+  from `Phase::Exit` when the refusal code is `agent_blocked` **and**
+  `SwitchInput.limit.is_some()`; every other blocked agent keeps the old,
+  guarded Escape/prompt path with its bounded retries. One attempt only: a typed
+  line that may already have landed is never sent twice. Three unit tests in
+  `src/accounts/switch.rs` pin all three properties.
+- **`hint()` is called by `account status`, not by the switch preflight.** The
+  plan put the hint in the preflight, but a user running `switch-account` is
+  already switching; being told to switch is noise. `status` is where a human
+  learns *which* agent is limited and what to do, so the hint (which names
+  `herdr agent switch-account <pane> <other>`) is printed there, on stderr
+  beside the existing notes and warnings so `--json` stays a clean document.
+  The preflight instead carries `SwitchInput.limit` into the **confirmation
+  text** (`"herdr sees a usage limit on <account>, which resets <time>."`), which
+  is what PR 8's TUI modal renders too, and into `switch-account --json` as a
+  `limit` key.
+- **Shapes PR 10 codes against.** `crate::accounts::limit`:
+  `USAGE_LIMIT_RULE_ID`, `UsageLimit { reset_text: Option<String> }`,
+  `matched_usage_limit(&Value) -> bool` (check this *before* paying for a screen
+  read), `classify(&Value, &str) -> Option<UsageLimit>`,
+  `reset_text(&str) -> Option<String>`, `hint(&UsageLimit, Option<&str>, &str,
+  &[&str]) -> String`, `alternatives(&[&str], Option<&str>) -> Vec<&str>`.
+  `limit.rs` is the ninth entry in `src/accounts/mod.rs::PURE_MODULES`.
+  `status::AgentFact` gained `.limit` plus `AgentFact::with_limit(…)` — a
+  builder rather than a field `from_agent_info` fills in, because the limit
+  costs an `agent.explain` round trip and only the caller can decide to pay it.
+  `AccountStatus.agents[].limit` is `skip_serializing_if = "Option::is_none"`:
+  an absent key means "nobody asked", never "not limited".
+- **`agent.explain` is asked only for a *blocked Claude* agent.** `status` on a
+  busy machine must not become one explain per pane; an idle or working agent is
+  not waiting on a limit, and a non-Claude agent has no account. The detection
+  screen (`agent.read --source detection`) is read only *after* the rule has
+  already matched, since it contributes nothing but the reset text. Both calls
+  are on demand — nothing here is polled or reachable from a render path.
+- **Remote-manifest shadowing is real, and the mitigation is two-part.**
+  `manifest.rs::read_remote_manifest` prefers a cached remote manifest whose
+  version is **greater than or equal to** the bundled one, so an installation
+  that has run `herdr server update-agent-manifests` against upstream's catalog
+  would lose the fork's rule the moment upstream publishes a `claude.toml` at or
+  above `2026.09.07.1`. (1) The fork's bundled version is dated ahead of
+  upstream's `2026.09.04.1`, so today's cached upstream manifest is *ignored* as
+  older. (2) The durable fix is `[update] manifest_check = false` in
+  `config.toml`, which stops the background fetch entirely
+  (`src/app/mod.rs:542`). PR 11 must document (2) in `docs/fork/accounts.md`;
+  `herdr agent explain <pane> --json` shows `manifest_source` and
+  `cached_remote_version`, which is how a user checks.
+- **The fake stub grew two things.** `/limit` prints the limit screen on demand
+  (a real limit arrives mid-session, and driving it that way lets one test
+  assert the healthy screen *and* the limit screen on the same agent), and the
+  stub now draws Claude's prompt box once at startup. The box is not decoration:
+  herdr's live-UI regions are defined relative to its horizontal rules, and a
+  line-printing stub without one leaves the previous session's screen inside the
+  new session's live region. A `printf '\033[2J'` was tried first and rejected —
+  it wipes the scrollback `pane read --source recent` returns and broke PR 5's
+  `switch_account_resumes_the_same_session_under_the_new_profile`.
+- **Hardening found during PR 9's review** (all fixed in the same PR). The
+  region change opened a false positive the plan's region did not have:
+  `after_last_horizontal_rule` returns the *whole screen* when the screen holds
+  no `─` rule at all (a Claude not drawing its prompt box — the upstream live
+  capture `claude_blocker_with_background_shell_remains_blocked` is one), so a
+  wrapped transcript paragraph could satisfy both gates. It was reproduced
+  against the bundled manifest, and the rule now vetoes a region containing a
+  transcript turn bullet `⏺` (U+23FA) or tool-result gutter `⎿` (U+23BF), which
+  the live footer never carries. The `not` list also gained `waiting for
+  permission` and `do you want to allow this connection?`, the two blockers
+  `legacy_no_prompt_blocker` owns that `usage_limit` outranked without
+  deferring to them, and a new fixture
+  `claude-usage-limit-with-dialog.txt` pins the priority ladder the comment
+  claims (a real limit footer under a `live_blocked_form` dialog is reported as
+  the dialog). Separately, `Action::SubmitText` gained a `Phase::RecheckExitText`
+  step: `pane.send_text` resolves a pane id and writes bytes with no terminal,
+  agent or session check, and the `agent_blocked` refusal only proves *some*
+  blocked agent answered one round trip earlier — so the pinned identity is
+  re-established (via a shared `pinned_identity_error`, extracted from
+  `on_recheck` so the two checks cannot drift) before a byte is typed. Finally
+  the negative integration test was repointed: it drove an *idle* agent and so
+  returned at `usage_limit_of`'s `agent_status != Blocked` early exit, and would
+  have passed with detection entirely broken.
+- **The residual false positive, stated exactly.** A screen with no prompt box,
+  no transcript markers, and both controls present still matches — verified
+  live, and accepted: no real Claude Code screen has that shape, since Claude
+  draws either its prompt box or its `⏺`/`⎿` transcript markers. Both conditions
+  must hold at once.
+- **The fixture is reconstructed, not captured, and says so.**
+  `tests/fixtures/fork/README.md` carries a provenance table and the exact
+  live-verification checklist; the manifest comment repeats the caveat next to
+  the rule. This is the one `AGENTS.md` "screen detection is evidence-based"
+  requirement E9 cannot satisfy locally, and it is recorded rather than papered
+  over.
+
 ### PR 10 — feat(accounts): herdr account watch labels usage-limited agents · deps: 9
 
 **Goal.** An opt-in, event-driven helper that turns the limit into a sidebar
@@ -1782,6 +1896,17 @@ hint on stock servers: `herdr account watch [--json]` subscribes to
 `blocked` on a Claude agent, and reports `state_labels.blocked = "usage
 limit"` plus `tokens.account_state = limited` (cleared back to `ok` on the
 next non-blocked transition). It never switches.
+
+**What PR 9 shipped that this builds on** (see its *As built*):
+`crate::accounts::limit::{matched_usage_limit, classify, reset_text, hint,
+alternatives, UsageLimit, USAGE_LIMIT_RULE_ID}`. Call `matched_usage_limit`
+first and read the detection screen only when it says yes — that is the shape
+`herdr account status` already uses, and it keeps one explain per transition
+rather than an explain plus a read. The rule's region is
+`after_last_horizontal_rule`, so a limit that has scrolled above the live prompt
+box stops matching by itself; `WatchState`'s `Clear` therefore has to fire on
+*any* non-blocked transition, not only on an explicit recovery. The `blocked`
+transition PR 10 subscribes to is exactly what the new rule produces.
 
 **Files**
 
@@ -1818,6 +1943,15 @@ attached to show the row text `usage limit` and `$account_state` `limited`;
 **Goal.** User docs and the decision record.
 
 **Files**
+
+PR 9 left two things for this PR to document: **(a)** that a cached remote
+agent-detection manifest at or above the fork's bundled `claude.toml` version
+shadows the fork's `usage_limit` rule, and that `[update] manifest_check =
+false` in `config.toml` is the durable mitigation (`herdr agent explain <pane>
+--json` shows `manifest_source` and `cached_remote_version`); and **(b)** that
+the `usage_limit` rule ships from a *reconstructed* fixture — the live checklist
+lives in `tests/fixtures/fork/README.md` and must be summarised for users as
+"best-effort until verified against a real rate-limited account".
 
 - `docs/fork/accounts.md` (new): concepts, `[[accounts]]` reference,
   `profiles.toml`, the share/copy/private list (from `layout.rs`, kept in
@@ -1976,10 +2110,32 @@ plan's *As built* notes):
   `--resume` of an id the new profile cannot see (transcripts not shared)
   starts a *new* conversation — herdr must report `SessionMismatch` and name
   the original id, and the original transcript must still be on disk.
-- The `usage_limit` rule against the real screen (capture with `herdr agent
-  read <pane> --source detection --format text` and `--format ansi`), the
-  reset-time wording, and that permission prompts never match it.
-- Whether a cached remote manifest shadows the fork's bundled rule on an
-  installation that has run `herdr server update-agent-manifests`.
+- **(PR 9) The `usage_limit` rule against the real screen.** This is the one
+  E9 requirement that could not be met locally: the shipped rule comes from a
+  *reconstructed* fixture, so it is proven not to fire on healthy screens and
+  is **not** proven to fire on the real one. Capture the limit screen with
+  `herdr agent read <pane> --source detection --format text` and `--format
+  ansi`, replace `tests/fixtures/fork/claude-usage-limit.txt`, and check the
+  five items in `tests/fixtures/fork/README.md`. In order of risk: **(1)
+  placement** — the rule reads `after_last_horizontal_rule`, the status area
+  below the live prompt box, and accepts the notice at the start of a line or
+  as a `·`/`∙`-separated footer segment; a notice that lives only in the
+  transcript above the box will *not* match and the region must then be
+  widened; **(2) wording** — `<N>-hour limit reached`, `Weekly limit reached`,
+  `Claude usage limit reached`, and the reset clause (`resets 3pm`, `resets at
+  14:00`, `Your limit will reset at …`); **(3)** that no permission prompt, MCP
+  dialog or `/upgrade` menu ever matches it while the account is healthy.
+- **(PR 9) `switch-account` from a real limit screen.** `agent.prompt` is
+  refused for any blocked agent, so the switch types `/exit` into the pane with
+  `pane.send_text` instead. Confirm against a real Claude that a typed `/exit`
+  on the limit screen exits cleanly, that the pane returns to its own shell
+  prompt inside the 20 s budget, and that the resumed session comes back with
+  the same id. If the real screen swallows a typed `/exit`, the fallback needs
+  an Escape in front of it or a different key sequence.
+- **(PR 9) Remote manifest shadowing.** On an installation that has run
+  `herdr server update-agent-manifests`, confirm `herdr agent explain <pane>
+  --json` reports `manifest_source: "bundled"` and not a cached remote one, and
+  that `[update] manifest_check = false` keeps it that way after upstream
+  publishes a newer `claude.toml`.
 - macOS: the probe returns `unverified` (expected) and the export line works
   in the default `zsh`; Windows: the `pwsh` line and the cmd refusal.
