@@ -128,9 +128,11 @@ struct SeenAgent {
     /// Remembered so a metadata-only edit — the account an agent runs under,
     /// a replacement status word — is still an observable delta: it changes
     /// neither `agent_status` nor, necessarily, `state_change_seq`, so no
-    /// other field here would notice it. Bounded by the server's own limits
-    /// (32 keys per resource, keys ≤ 32 and values ≤ 80 bytes,
-    /// `src/app/api_helpers.rs`), and held once per agent, never per frame.
+    /// other field here would notice it. Bounded by the reporting server's own
+    /// limits (at most 32 tokens per resource, token keys ≤ 32 characters and
+    /// every value ≤ 80 characters, `src/app/api_helpers.rs`; state labels are
+    /// keyed by the five status words), and held once per agent, never per
+    /// frame.
     metadata: AgentMetadata,
 }
 
@@ -765,10 +767,13 @@ impl FleetState {
             } else {
                 previous_seen.get(&agent.pane_id)
             };
-            // One map pair per agent *present in both* snapshots, built once
-            // here and moved into `next_seen` — never per render and never per
-            // frame. Cardinality is the host's agent count, the same loop that
-            // already counts the roll-up.
+            // Built once per agent per snapshot and moved into `next_seen`:
+            // the cardinality is the host's agent count, inside the loop that
+            // already folds the roll-up — never per render and never per
+            // frame. An agent that is new to this snapshot pays a second build
+            // inside `merged_agent`; handing it these maps instead would mean
+            // cloning them, which allocates exactly the same nodes, so the
+            // add-only path keeps the simpler shape.
             let metadata = AgentMetadata::of(agent);
             let fleet_change_seq = match known {
                 None => {
@@ -2514,5 +2519,205 @@ mod tests {
         let decoded: MergedAgent = serde_json::from_str(json).expect("older json decodes");
         assert!(decoded.tokens.is_empty());
         assert!(decoded.state_labels.is_empty());
+    }
+
+    /// A label edit alone is a delta, and it is tagged the documented way.
+    ///
+    /// `agent_metadata` is the string `docs/fork/fleet-core.md` publishes and
+    /// E4's reducer keys on, so the tag is part of the contract rather than an
+    /// artefact of the variant's Rust name.
+    #[test]
+    fn a_state_label_edit_alone_is_one_agent_metadata_delta() {
+        let (mut state, local, _) = two_connected_hosts();
+        let with = |state_labels: &[(&str, &str)], seq| {
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                seq,
+                vec![agent_with_metadata(
+                    "w1:p1",
+                    AgentStatus::Idle,
+                    1,
+                    &[("account", "work")],
+                    state_labels,
+                )],
+            ))
+        };
+        state.apply(&local, with(&[], 1));
+
+        let changes = state.apply(&local, with(&[("idle", "ready")], 2));
+        let metadata = changes
+            .iter()
+            .filter(|change| matches!(change, FleetChange::AgentMetadata { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(metadata.len(), 1, "exactly one delta: {changes:?}");
+        let value = serde_json::to_value(metadata[0]).expect("a change is json");
+        assert_eq!(value["kind"], "agent_metadata");
+        assert_eq!(value["pane"], "local/w1:p1");
+        assert_eq!(value["state_labels"]["idle"], "ready");
+        // Whole metadata, not a patch: the untouched token rides along.
+        assert_eq!(value["tokens"]["account"], "work");
+        assert_eq!(
+            state
+                .merged_agents()
+                .first()
+                .map(|agent| agent.state_labels.clone()),
+            Some(BTreeMap::from([("idle".to_string(), "ready".to_string())])),
+        );
+        state.assert_invariants_for_test();
+    }
+
+    /// A host that contributes no agents may not contribute a delta about one.
+    #[test]
+    fn a_host_that_is_not_connected_reports_no_metadata_delta() {
+        let (mut state, local, _) = two_connected_hosts();
+        let with = |tokens: &[(&str, &str)], seq| {
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                seq,
+                vec![agent_with_metadata(
+                    "w1:p1",
+                    AgentStatus::Idle,
+                    1,
+                    tokens,
+                    &[],
+                )],
+            ))
+        };
+        state.apply(&local, with(&[("account", "perso")], 1));
+        state.apply(
+            &local,
+            HostEvent::Unavailable {
+                reason: "host closed the connection".to_string(),
+                retry_in: None,
+            },
+        );
+
+        // A host on its way down can still deliver one more projection. It is
+        // folded — the fleet keeps its snapshot for a dimmed rendering — but it
+        // owes readers no agent delta while it contributes no agents.
+        let changes = state.apply(&local, with(&[("account", "work")], 2));
+        assert!(
+            !changes
+                .iter()
+                .any(|change| matches!(change, FleetChange::AgentMetadata { .. })),
+            "an unavailable host must contribute no agent delta: {changes:?}"
+        );
+        assert!(
+            state.merged_agents().is_empty(),
+            "an unavailable host contributes no agents"
+        );
+
+        // Coming back announces the agent it has now, metadata and all.
+        let changes = state.apply(
+            &local,
+            HostEvent::Connected {
+                server_version: "0.9.0-fork".to_string(),
+                methods: Vec::new(),
+            },
+        );
+        let added = changes
+            .iter()
+            .filter_map(|change| match change {
+                FleetChange::AgentAdded { agent } => Some(agent.tokens.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            added,
+            vec![BTreeMap::from([(
+                "account".to_string(),
+                "work".to_string()
+            )])],
+            "the republished agent carries the metadata it has now: {changes:?}"
+        );
+        assert!(
+            !changes
+                .iter()
+                .any(|change| matches!(change, FleetChange::AgentMetadata { .. })),
+            "republishing is an upsert, not an edit: {changes:?}"
+        );
+        state.assert_invariants_for_test();
+    }
+
+    /// An agent that leaves and comes back is added again, never edited.
+    #[test]
+    fn an_agent_that_returns_carries_its_metadata_on_the_add() {
+        let (mut state, local, _) = two_connected_hosts();
+        let present = |seq| {
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                seq,
+                vec![agent_with_metadata(
+                    "w1:p1",
+                    AgentStatus::Idle,
+                    1,
+                    &[("account", "work")],
+                    &[],
+                )],
+            ))
+        };
+        state.apply(&local, present(1));
+        let changes = state.apply(&local, HostEvent::Snapshot(snapshot("boot-a", 2, vec![])));
+        assert!(
+            changes
+                .iter()
+                .any(|change| matches!(change, FleetChange::AgentRemoved { .. })),
+            "the agent left: {changes:?}"
+        );
+
+        let changes = state.apply(&local, present(3));
+        let added = changes
+            .iter()
+            .filter_map(|change| match change {
+                FleetChange::AgentAdded { agent } => Some(agent.tokens.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            added,
+            vec![BTreeMap::from([(
+                "account".to_string(),
+                "work".to_string()
+            )])],
+            "a returning agent carries its metadata: {changes:?}"
+        );
+        assert!(
+            !changes
+                .iter()
+                .any(|change| matches!(change, FleetChange::AgentMetadata { .. })),
+            "a returning agent is an add, not an edit: {changes:?}"
+        );
+        state.assert_invariants_for_test();
+    }
+
+    /// The wire is a list, so a peer may repeat a key. The last pair wins,
+    /// which is how a client shell reader folds the same list.
+    #[test]
+    fn a_repeated_token_key_folds_to_the_last_pair() {
+        let (mut state, local, _) = two_connected_hosts();
+        state.apply(
+            &local,
+            HostEvent::Snapshot(snapshot(
+                "boot-a",
+                1,
+                vec![agent_with_metadata(
+                    "w1:p1",
+                    AgentStatus::Idle,
+                    1,
+                    &[("account", "perso"), ("account", "work")],
+                    &[("idle", "first"), ("idle", "last")],
+                )],
+            )),
+        );
+        let merged = state.merged_agents().first().cloned().expect("one agent");
+        assert_eq!(
+            merged.tokens,
+            BTreeMap::from([("account".to_string(), "work".to_string())])
+        );
+        assert_eq!(
+            merged.state_labels,
+            BTreeMap::from([("idle".to_string(), "last".to_string())])
+        );
+        state.assert_invariants_for_test();
     }
 }
