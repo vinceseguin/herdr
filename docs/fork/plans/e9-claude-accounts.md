@@ -353,7 +353,7 @@ implementation starts only after E3 is ✅.
 | 7 | feat(accounts): tui account picker to start claude in a pane | D · TUI | 4 | ✅ |
 | 8 | feat(accounts): tui switch-account action with confirmation | D · TUI | 5, 7 | ✅ |
 | 9 | feat(detect): claude usage-limit rule and account limit hints | E · Limits | 3, 5 | ✅ |
-| 10 | feat(accounts): herdr account watch labels usage-limited agents | E · Limits | 9 | ⬜ |
+| 10 | feat(accounts): herdr account watch labels usage-limited agents | E · Limits | 9 | ✅ |
 | 11 | docs(accounts): accounts guide, adr, readme and roadmap drift | F · Docs | 2, 6, 8, 10 | ⬜ |
 
 **Wave preview:** W1 `[1]` → W2 `[2, 4, 6]` → W3 `[3, 5, 7]` → W4 `[8, 9]`
@@ -2041,11 +2041,116 @@ attached to show the row text `usage limit` and `$account_state` `limited`;
 **Downstream.** E6 (push) can reuse `WatchState` semantics for
 "blocked by limit" notifications.
 
+**As built (PR 10, merged).** The vocabulary and the label lifecycle are as
+specified; the observation loop is not. The corrections below win over the prose
+above and are what PR 11 documents.
+
+- **It polls `agent.list`; it does not subscribe to
+  `pane.agent_status_changed`.** That subscription is *per pane* on a stock
+  server — `Subscription::PaneAgentStatusChanged` requires a `pane_id`
+  (`src/api/schema/events.rs`) and there is no global variant — so a watcher
+  covering every Claude agent would need one subscription per pane and a
+  reconnect whenever a pane appears. Widening it is a change under `src/api/`,
+  which E9 forbids. One `agent.list` per interval is the same cost whatever the
+  pane count, and it has the property the event stream does not: it re-reads the
+  labels the server *actually holds*, which is what repairs a restart (tokens
+  are in-memory only) instead of missing it forever, because no status change
+  follows to announce that they are gone.
+- **The reports carry `agent = "claude"` and no `applies_to_source`** — measured
+  in the lab, not reasoned about. `applies_to_source` gates a *presentation*
+  report on the pane's hook authority
+  (`TerminalState::metadata_guards_match`), which the Claude hook's session-id
+  report does not claim (`herdr:claude` is a reserved state source, PR 5), so
+  the token half landed and the state label was silently dropped. `agent =
+  "claude"` buys what the scoping was for: the same guard hides the label the
+  moment herdr stops seeing Claude in the pane,
+  `metadata_report_blocked_by_process_exit` refuses a report racing the exit,
+  and the exit sweep clears metadata whose `agent_label` is the agent that left.
+  **Correction to PR 1's *Real current state*:** only the *presentation* half is
+  exit-scoped. `TerminalState::metadata_tokens` is never touched by the exit
+  path, so `tokens.account`/`account_state` outlive the agent — which is exactly
+  why the watcher's tokens are leased.
+- **The lifecycle contract.** Poll interval `--interval MS`, default 5 000,
+  refused outside 500..300 000 (a refusal, not a clamp: a mistyped `10` must not
+  silently become 500). Every report carries `ttl_ms = 4 × interval` floored at
+  15 s (`watch::lease_for`), renewed at half the lease, so a watcher that is
+  killed, crashes or loses its machine leaves a `limited` badge for seconds, not
+  for the session — verified live, both keys gone at ~20 s with the agent still
+  blocked. Ctrl-C/SIGTERM (`ctrlc`, the same handler `src/client/mod.rs`
+  installs) clears every label it still holds and exits 0; a second interrupt
+  exits 130 immediately. `--keep-labels` skips the clear, and `--once` does too
+  — a one-shot pass has no lifetime for a label to belong to, so it leaves what
+  it found to the lease rather than being an expensive no-op. A closed stdout on
+  unix ends the watcher by `SIGPIPE` like every other herdr CLI, and the leases
+  cover it.
+- **Reconnect.** A server that is not running is not a failure: one `note:` on
+  stderr, capped exponential backoff (500 ms → 30 s), one `note:` on recovery,
+  and the next successful poll reconciles what the watcher believes against what
+  the server holds and re-labels whatever went missing. Only a protocol mismatch
+  is fatal (exit 1), because waiting cannot fix it; `--once` against no server
+  exits 1.
+- **Lease expiry deletes `account_state`; it does not restore what the launcher
+  wrote.** The token is removed rather than reverted to `ok`, and
+  `watch::restorable_state` refuses to ever *restore* `limited` — a watcher that
+  arrives while a previous one's leased badge is still up would otherwise adopt
+  `limited` as "the state I am replacing" and write it back **without a TTL**,
+  turning an expiring badge into a permanent one. Absent is the honest answer:
+  that watcher never saw what the state was before the limit.
+- **Explain budget.** `agent.explain` is asked only for a *blocked Claude agent
+  carrying an `account` token*, at most once per `EXPLAIN_DEBOUNCE` (5 s), and
+  after `EPISODE_EXPLAIN_BUDGET` (3) verdicts of "not a limit" in one blocked
+  episode it drops to one look per `BLOCKED_RECHECK` (60 s) — so an agent parked
+  on a permission prompt costs one round trip a minute, not one per poll.
+  `usage_limit_on` additionally requires `explain.agent == "claude"` before
+  reading the rule id: the poll is one round trip old and the answer is another,
+  so a pane whose Claude exited in between is refused rather than labelled from
+  a verdict about something else.
+- **Shapes.** `crate::accounts::watch`: `LIMIT_LABEL = "usage limit"`,
+  `LIMIT_LABEL_STATE = "blocked"`, `WatchAgent::from_agent_info`,
+  `WatchState::{observe, observe_agent, explained, drain_clears, label_failed,
+  clear_failed}` and `WatchAction::{Explain, Label, Clear, Nothing}` — an enum
+  with **no** variant that types, prompts, switches or kills, which is how
+  decision (d) is enforced rather than promised. `clear_failed` returns `bool`
+  and gives up after `CLEAR_ATTEMPT_BUDGET` (5), safe precisely because the label
+  was leased. `watch.rs` is the tenth entry in `PURE_MODULES`; a second
+  architecture test
+  (`client.rs::the_watch_driver_only_reads_and_reports_metadata`) slices the
+  driver's own section and asserts it never reaches `pane.send_text`,
+  `agent.prompt`, `agent.send_keys`, `agent.start` or the switch driver, since
+  `client.rs` legitimately types into panes elsewhere.
+- **`scripts/fork/fake-claude.sh` gained `/redraw`**, which reprints the prompt
+  box. It is the only way to drive a limit back *out* of
+  `after_last_horizontal_rule`: the notice never scrolls itself away, Escape
+  cannot clear a limit, and `agent.prompt` is refused on a blocked agent — so
+  every test and every hand-run that clears a label types `/redraw` through
+  `pane.send_text`.
+- **No `src/platform/` edit.** An interrupt handler was drafted there and
+  dropped: `ctrlc` is already a dependency with the `termination` feature and is
+  the house pattern (`src/client/mod.rs`, `src/server/headless.rs`). The plan's
+  "PR 4 only" claim on `src/platform/mod.rs` therefore still holds.
+- **`tests/support/accounts_lab.rs` gained `Lab::herdr_spawn`** (a `Child` with
+  piped stdout/stderr): the only honest way to test what a long-running process
+  does while it runs, and what it leaves behind when interrupted.
+
 ### PR 11 — docs(accounts): accounts guide, adr, readme and roadmap drift · deps: 2, 6, 8, 10
 
 **Goal.** User docs and the decision record.
 
 **Files**
+
+PR 10 left four things for this PR to document: **(a)** that `herdr account
+watch` labels are **leases** — `ttl_ms = 4 × --interval`, floored at 15 s — so a
+watcher that stops leaves a `limited` badge for seconds and then the server drops
+both the label and the `account_state` token; **(b)** that expiry *removes*
+`account_state` rather than restoring what the launcher wrote, so a limited agent
+whose watcher died shows `account` with no `account_state` until something writes
+one (the same is true of every `--once` pass, which deliberately leaves its label
+to the lease); **(c)** that `Ctrl-C`/`SIGTERM` clears the labels and exits 0
+while `--keep-labels`, `--once` and a closed pipe leave them to expire; and
+**(d)** the sidebar snippet the label is for —
+`[ui.sidebar.agents.rows_by_agent] claude = [["state_icon","workspace","tab"],
+["agent","$account","$account_state"]]` — plus the `state_text` swap
+`state_labels.blocked = "usage limit"` produces.
 
 PR 9 left two things for this PR to document: **(a)** that a cached remote
 agent-detection manifest at or above the fork's bundled `claude.toml` version

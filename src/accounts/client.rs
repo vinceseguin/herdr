@@ -895,9 +895,606 @@ fn observation_of_send(response: std::io::Result<serde_json::Value>, method: &st
     }
 }
 
+// ---------------------------------------------------------------------------
+// The watcher (PR 10).
+//
+// `crate::accounts::watch` decides *what* to label; this half carries it out
+// against a stock server and owns the two things a long-running process has to
+// get right: it must survive the server going away and coming back, and it
+// must not leave anything behind when it stops.
+//
+// Nothing here sends input to a pane. The only writes are
+// `pane.report_metadata`, and the only reads are `agent.list`, `agent.explain`
+// and `agent.read` — the same three `herdr account status` already makes, on
+// the same terms.
+// ---------------------------------------------------------------------------
+
+/// How the watcher runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchOptions {
+    /// How often the agent list is read.
+    pub interval: Duration,
+    /// Do one pass and stop, leaving whatever it labelled in place. The label
+    /// is still leased, so a `--once` run that finds a limit leaves a badge
+    /// that expires by itself rather than one that lasts forever.
+    pub once: bool,
+    /// One JSON object per line instead of one sentence per line. Newline
+    /// delimited on purpose: a watcher is a stream, and a JSON array would
+    /// never close.
+    pub json: bool,
+    /// Leave the labels in place on exit and let their leases expire instead.
+    pub keep_labels: bool,
+}
+
+impl Default for WatchOptions {
+    fn default() -> Self {
+        Self {
+            interval: DEFAULT_WATCH_INTERVAL,
+            once: false,
+            json: false,
+            keep_labels: false,
+        }
+    }
+}
+
+/// Default poll interval: fast enough that a limit shows up while the human is
+/// still looking at the screen, slow enough to be free on a machine with
+/// dozens of panes (one `agent.list` per interval, whatever the pane count).
+pub const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The narrowest and widest intervals accepted.
+///
+/// The floor keeps a mistyped `--interval 1` from turning into a request loop;
+/// the ceiling keeps the lease (four intervals) inside the server's own TTL
+/// range and keeps `Ctrl-C` responsive.
+pub const MIN_WATCH_INTERVAL: Duration = Duration::from_millis(500);
+pub const MAX_WATCH_INTERVAL: Duration = Duration::from_secs(300);
+
+/// How long the loop sleeps between interrupt checks.
+///
+/// The interval is slept in slices so `Ctrl-C` is answered in well under a
+/// second even when someone asks for a five-minute poll.
+const INTERRUPT_POLL: Duration = Duration::from_millis(100);
+
+/// How long to wait after a failed poll before trying again, and the cap.
+const RECONNECT_BACKOFF_START: Duration = Duration::from_millis(500);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Why the loop stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchEnd {
+    /// `--once` finished its pass.
+    Once,
+    /// `SIGINT`/`SIGTERM`.
+    Interrupted,
+    /// Something no amount of waiting fixes.
+    Failed,
+}
+
+/// Run the watcher until it is interrupted, or once with
+/// [`WatchOptions::once`].
+///
+/// Exit codes are the caller's, but the shape is: [`WatchEnd::Once`] and
+/// [`WatchEnd::Interrupted`] are success, [`WatchEnd::Failed`] is not. A server
+/// that is not running is *not* a failure — it is the ordinary state of a
+/// machine whose herdr is being restarted, and the watcher waits for it.
+pub fn watch(options: &WatchOptions) -> WatchEnd {
+    let interrupted = install_interrupt_handler();
+
+    let lease = crate::accounts::watch::lease_for(options.interval);
+    let mut state = crate::accounts::watch::WatchState::new();
+    let mut backoff = RECONNECT_BACKOFF_START;
+    let mut connected = true;
+    let mut warned_overflow = false;
+    let mut end = WatchEnd::Interrupted;
+
+    loop {
+        if interrupted.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        match poll_agents() {
+            Ok(agents) => {
+                if !connected {
+                    eprintln!("note: reconnected to the herdr server");
+                    connected = true;
+                }
+                backoff = RECONNECT_BACKOFF_START;
+                // A stdout that can no longer be written is a request to stop,
+                // not a failure — the clears below still run.
+                if !apply(&mut state, &agents, lease, options) {
+                    break;
+                }
+                if state.overflowed() && !warned_overflow {
+                    warned_overflow = true;
+                    eprintln!(
+                        "warning: more than {} panes with account agents; the rest are not \
+                         watched",
+                        crate::accounts::watch::MAX_TRACKED_PANES
+                    );
+                }
+            }
+            Err(PollError::Fatal(message)) => {
+                eprintln!("herdr account watch: {message}");
+                end = WatchEnd::Failed;
+                break;
+            }
+            Err(PollError::Unavailable(message)) => {
+                // Nothing is written and nothing is forgotten. A server that
+                // restarted lost every token (`src/persist/snapshot.rs` carries
+                // none) and a server that is merely unreachable kept them; the
+                // watcher cannot tell the two apart from here and does not have
+                // to, because the next successful poll compares what it
+                // believes against what the server actually holds and re-labels
+                // whatever went missing.
+                if connected {
+                    eprintln!("note: {message}; waiting for it to come back");
+                    connected = false;
+                }
+                if options.once {
+                    end = WatchEnd::Failed;
+                    break;
+                }
+                if !sleep_interruptibly(backoff, &interrupted) {
+                    break;
+                }
+                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                continue;
+            }
+        }
+        if options.once {
+            end = WatchEnd::Once;
+            break;
+        }
+        if !sleep_interruptibly(options.interval, &interrupted) {
+            break;
+        }
+    }
+
+    // Take the labels back off before leaving. Their leases would expire on
+    // their own, but seconds of a stale `usage limit` badge on a recovered
+    // agent is seconds of a reader being told the wrong thing.
+    //
+    // `--once` is the exception, and deliberately so: a one-shot pass has no
+    // lifetime for a label to belong to, so it leaves what it found and lets
+    // the lease expire it. Clearing on the way out would make `--once` a very
+    // expensive no-op.
+    //
+    // A fatal end is the one case where they are not even attempted: the only
+    // fatal today is a protocol the client cannot speak, so every clear would
+    // fail — and `send_request` re-prints the mismatch on each one.
+    if !options.keep_labels && !options.once && connected && end != WatchEnd::Failed {
+        for action in state.drain_clears() {
+            let crate::accounts::watch::WatchAction::Clear {
+                pane_id,
+                name,
+                account,
+                restore_state,
+            } = &action
+            else {
+                continue;
+            };
+            match write_clear(pane_id, restore_state.as_deref()) {
+                // Nobody may be reading stdout any more; the write that matters
+                // on the way out is the one that already reached the server.
+                Ok(()) => {
+                    let _ = print_event(
+                        options,
+                        "cleared",
+                        pane_id,
+                        name.as_deref(),
+                        account,
+                        &crate::accounts::limit::UsageLimit::default(),
+                    );
+                }
+                Err(err) => eprintln!(
+                    "warning: could not clear the usage-limit label on pane {pane_id} \
+                     (account {account}): {err}; it expires by itself within {}s",
+                    lease.as_secs()
+                ),
+            }
+        }
+    }
+
+    end
+}
+
+/// One poll: read the agents, act on what changed.
+///
+/// Returns false when stdout has gone away (`herdr account watch --json | head`
+/// is an ordinary thing to type), which is a request to stop rather than a
+/// failure — the same reading `herdr fleet watch` gives a closed pipe.
+#[must_use]
+fn apply(
+    state: &mut crate::accounts::watch::WatchState,
+    agents: &[crate::accounts::watch::WatchAgent],
+    lease: Duration,
+    options: &WatchOptions,
+) -> bool {
+    use crate::accounts::watch::WatchAction;
+
+    let mut queue = state.observe(agents, lease, Instant::now());
+    let mut guard = 0usize;
+    let mut writable = true;
+    while let Some(action) = queue.pop() {
+        // A bound on the follow-up work one poll can generate. `Explain` is the
+        // only action that produces another action, and it produces at most
+        // one, so this can only trip if that ever changes.
+        guard += 1;
+        if guard > agents.len().saturating_mul(2) + 8 {
+            break;
+        }
+        match action {
+            WatchAction::Explain { pane_id } => {
+                let Some(agent) = agents.iter().find(|agent| agent.pane_id == pane_id) else {
+                    continue;
+                };
+                let limit = usage_limit_on(&pane_id);
+                match state.explained(agent, limit, lease, Instant::now()) {
+                    WatchAction::Nothing => {}
+                    next => queue.push(next),
+                }
+            }
+            WatchAction::Label {
+                pane_id,
+                name,
+                account,
+                limit,
+                lease,
+                announce,
+            } => match write_label(&pane_id, lease) {
+                Ok(()) => {
+                    if announce {
+                        writable &= print_event(
+                            options,
+                            "limited",
+                            &pane_id,
+                            name.as_deref(),
+                            &account,
+                            &limit,
+                        );
+                    }
+                }
+                Err(err) => {
+                    state.label_failed(&pane_id);
+                    eprintln!("warning: could not label pane {pane_id}: {err}");
+                }
+            },
+            WatchAction::Clear {
+                pane_id,
+                name,
+                account,
+                restore_state,
+            } => match write_clear(&pane_id, restore_state.as_deref()) {
+                Ok(()) => {
+                    writable &= print_event(
+                        options,
+                        "cleared",
+                        &pane_id,
+                        name.as_deref(),
+                        &account,
+                        &crate::accounts::limit::UsageLimit::default(),
+                    );
+                }
+                Err(err) => {
+                    if state.clear_failed(
+                        &pane_id,
+                        crate::accounts::limit::UsageLimit::default(),
+                        Instant::now(),
+                    ) {
+                        eprintln!("warning: could not clear the label on pane {pane_id}: {err}");
+                    } else {
+                        eprintln!(
+                            "warning: could not clear the label on pane {pane_id}: {err}; \
+                             giving up on it — it expires by itself within {}s",
+                            lease.as_secs()
+                        );
+                    }
+                }
+            },
+            WatchAction::Nothing => {}
+        }
+    }
+    writable
+}
+
+/// One line per label change, in the shape the caller asked for.
+///
+/// Returns false when the line could not be written, which stops the watcher
+/// the way an interrupt does — clears included — instead of `println!`'s panic.
+///
+/// On unix a closed pipe usually never gets here: `begin_cli_output` puts
+/// `SIGPIPE` back to `SIG_DFL` so `herdr account watch --json | head -3` ends by
+/// signal like every other herdr CLI, and the labels it was holding are left to
+/// their leases (which is what the leases are for). This is the rest of it —
+/// Windows, where the write returns an error instead, and any other write
+/// failure on a redirected stdout — where a panic would unwind straight past
+/// the clears the exit path owes the server. `herdr fleet watch` draws the same
+/// distinction (`src/cli/fleet.rs`).
+#[must_use]
+fn print_event(
+    options: &WatchOptions,
+    event: &str,
+    pane_id: &str,
+    name: Option<&str>,
+    account: &str,
+    limit: &crate::accounts::limit::UsageLimit,
+) -> bool {
+    use std::io::Write as _;
+
+    let line = if options.json {
+        let mut record = serde_json::Map::new();
+        record.insert("event".into(), event.into());
+        record.insert("pane_id".into(), pane_id.into());
+        if let Some(name) = name {
+            record.insert("name".into(), name.into());
+        }
+        record.insert("account".into(), account.into());
+        if let Some(reset) = limit.reset_text.as_deref() {
+            record.insert("reset_text".into(), reset.into());
+        }
+        serde_json::Value::Object(record).to_string()
+    } else {
+        let who = match name {
+            Some(name) => format!("{name} ({pane_id})"),
+            None => pane_id.to_string(),
+        };
+        match limit.reset_text.as_deref() {
+            Some(reset) => format!("{event} {who} account={account} resets {reset}"),
+            None => format!("{event} {who} account={account}"),
+        }
+    };
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{line}").and_then(|()| out.flush()).is_ok()
+}
+
+/// Why a poll did not produce an agent list.
+enum PollError {
+    /// No server, or one that went away. Worth waiting for.
+    Unavailable(String),
+    /// Nothing gets better by waiting.
+    Fatal(String),
+}
+
+/// The running agents, reduced to what the fold needs.
+fn poll_agents() -> Result<Vec<crate::accounts::watch::WatchAgent>, PollError> {
+    let response = crate::cli::send_request(&Request {
+        id: "cli:accounts:watch:agent_list".into(),
+        method: Method::AgentList(crate::api::schema::EmptyParams::default()),
+    })
+    .map_err(|err| {
+        if crate::cli::protocol_mismatch_was_reported(&err) {
+            // The guard printed the mismatch already; waiting cannot fix a
+            // server the client cannot speak to.
+            PollError::Fatal("incompatible server protocol".to_string())
+        } else if crate::cli::server_not_running_was_reported(&err) {
+            PollError::Unavailable("no herdr server is running".to_string())
+        } else {
+            PollError::Unavailable(format!("could not list agents ({err})"))
+        }
+    })?;
+    if let Some(error) = response.get("error") {
+        return Err(PollError::Unavailable(format!(
+            "could not list agents ({error})"
+        )));
+    }
+    let agents: Vec<AgentInfo> = serde_json::from_value(response["result"]["agents"].clone())
+        .map_err(|err| PollError::Unavailable(format!("could not read the agent list ({err})")))?;
+    Ok(agents
+        .iter()
+        .map(crate::accounts::watch::WatchAgent::from_agent_info)
+        .collect())
+}
+
+/// What herdr's detector says about one blocked pane's account usage.
+///
+/// The same two calls `herdr account status` makes, in the same order: the
+/// verdict first, and the screen only once the rule has already matched. Every
+/// failure answers `None`, which the fold reads as "no limit seen" and looks
+/// again — never as "not limited".
+fn usage_limit_on(pane_id: &str) -> Option<crate::accounts::limit::UsageLimit> {
+    let explain = crate::cli::account::agent_explain(pane_id)?;
+    // The agent list this pane came from is one round trip old, and the answer
+    // is another. `explain.agent` is the detector's own view of what is in the
+    // pane *now*, so it is the cheapest possible re-check that the evidence
+    // being read still belongs to a Claude agent: a pane whose Claude exited
+    // and whose next agent started in between is refused here rather than
+    // labelled from a verdict about something else. It also pins the rule id to
+    // the manifest that defines it, since `usage_limit` is a name another
+    // agent's (possibly remotely fetched) manifest could reuse.
+    if explain.get("agent").and_then(serde_json::Value::as_str) != Some(AGENT_LABEL) {
+        return None;
+    }
+    if !crate::accounts::limit::matched_usage_limit(&explain) {
+        return None;
+    }
+    let screen = crate::cli::account::detection_screen(pane_id).unwrap_or_default();
+    crate::accounts::limit::classify(&explain, &screen)
+}
+
+/// Report the limit onto the pane, as a lease.
+///
+/// `ttl_ms` is the whole reason a stopped watcher is safe: the server drops
+/// both the label and the token when the lease runs out
+/// (`MetadataTokens::expire_at`, `TerminalState::agent_metadata_is_expired`),
+/// so a watcher that was killed, crashed or lost its machine cannot strand a
+/// `limited` badge on an agent that recovered hours ago.
+fn write_label(pane_id: &str, lease: Duration) -> Result<(), String> {
+    let mut state_labels = std::collections::HashMap::new();
+    state_labels.insert(
+        crate::accounts::watch::LIMIT_LABEL_STATE.to_string(),
+        crate::accounts::watch::LIMIT_LABEL.to_string(),
+    );
+    let mut tokens = std::collections::HashMap::new();
+    tokens.insert(
+        ACCOUNT_STATE_TOKEN.to_string(),
+        Some(AccountState::Limited.as_str().to_string()),
+    );
+    report_metadata(pane_id, state_labels, tokens, false, Some(lease))
+}
+
+/// Take the label back off, restoring the `account_state` it replaced.
+///
+/// `None` removes the token rather than writing `ok`: the watcher only knows
+/// what it overwrote, and inventing a verified state for an agent it never
+/// verified is exactly the silent wrong answer the account tooling exists to
+/// avoid.
+fn write_clear(pane_id: &str, restore_state: Option<&str>) -> Result<(), String> {
+    let mut tokens = std::collections::HashMap::new();
+    tokens.insert(
+        ACCOUNT_STATE_TOKEN.to_string(),
+        restore_state.map(str::to_string),
+    );
+    report_metadata(
+        pane_id,
+        std::collections::HashMap::new(),
+        tokens,
+        true,
+        None,
+    )
+}
+
+/// The one write the watcher makes, in the epic's own vocabulary.
+///
+/// The report is pinned with `agent = "claude"` and **not** with
+/// `applies_to_source`, which is a correction to the plan and was measured in
+/// the lab. `applies_to_source` gates a *presentation* report on the pane's
+/// hook authority (`TerminalState::metadata_guards_match`): a state label
+/// reported with it is silently dropped unless a `herdr:claude` hook has
+/// already claimed the terminal, which the session-id report the Claude hook
+/// makes does not do (`herdr:claude` is a reserved state source, PR 5). The
+/// token half landed and the label half did not, which is the worst of both.
+///
+/// `agent = "claude"` buys everything the scoping was for. It is checked on the
+/// same guard, so the label only shows while herdr still sees Claude in that
+/// pane; `metadata_report_blocked_by_process_exit` refuses a report that races
+/// the process exiting; and the exit sweep in `TerminalState` clears any
+/// metadata whose `agent_label` is the agent that just left. Tokens were never
+/// exit-scoped at all — they live in `TerminalState::metadata_tokens`, which
+/// the exit path does not touch — which is precisely why the watcher leases
+/// them.
+fn report_metadata(
+    pane_id: &str,
+    state_labels: std::collections::HashMap<String, String>,
+    tokens: std::collections::HashMap<String, Option<String>>,
+    clear_state_labels: bool,
+    lease: Option<Duration>,
+) -> Result<(), String> {
+    let response = crate::cli::send_request(&Request {
+        id: "cli:accounts:watch:report_metadata".into(),
+        method: Method::PaneReportMetadata(PaneReportMetadataParams {
+            pane_id: pane_id.to_string(),
+            source: METADATA_SOURCE.to_string(),
+            agent: Some(AGENT_LABEL.to_string()),
+            applies_to_source: None,
+            title: None,
+            display_agent: None,
+            state_labels,
+            tokens,
+            clear_title: false,
+            clear_display_agent: false,
+            clear_state_labels,
+            seq: None,
+            ttl_ms: lease.map(|lease| {
+                u64::try_from(lease.as_millis())
+                    .unwrap_or(u64::MAX)
+                    .clamp(1, 86_400_000)
+            }),
+        }),
+    })
+    .map_err(|err| err.to_string())?;
+    match response.get("error") {
+        Some(error) => Err(error.to_string()),
+        None => Ok(()),
+    }
+}
+
+/// Catch `Ctrl-C` (and `SIGTERM`/`SIGHUP`, through ctrlc's `termination`
+/// feature) so the watcher can take its labels off before it goes.
+///
+/// The same handler `src/client/mod.rs` and `src/server/headless.rs` install,
+/// for the same reason: the process owns something a sudden exit would leave
+/// behind. Failing to install one is a warning, not a refusal — the leases
+/// still expire — and a *second* interrupt leaves immediately, because by then
+/// the user has asked twice and the labels are the server's problem.
+fn install_interrupt_handler() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&interrupted);
+    if let Err(err) = ctrlc::set_handler(move || {
+        if flag.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            std::process::exit(130);
+        }
+    }) {
+        tracing::warn!(%err, "failed to install a termination handler for account watch");
+        eprintln!(
+            "warning: could not catch Ctrl-C ({err}); labels will expire on their own instead \
+             of being cleared on exit"
+        );
+    }
+    interrupted
+}
+
+/// Sleep `total`, in slices, answering an interrupt between them.
+///
+/// Returns false when the sleep was cut short by an interrupt.
+fn sleep_interruptibly(total: Duration, interrupted: &std::sync::atomic::AtomicBool) -> bool {
+    let deadline = Instant::now() + total;
+    loop {
+        if interrupted.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        std::thread::sleep(INTERRUPT_POLL.min(deadline.saturating_duration_since(now)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The watcher writes metadata onto agents it did not start, and the whole
+    /// safety argument for that is that metadata is *all* it can write:
+    /// decision (d) of the epic is "detect and suggest, never auto-switch".
+    /// `crate::accounts::watch` pins the decision half by giving the action
+    /// enum no vocabulary for typing; this pins the runtime half. The guard is
+    /// scoped to the watcher's section rather than the file because `client.rs`
+    /// legitimately types into panes for the launch and the switch — which is
+    /// exactly why a driver that grew a `pane.send_text` here would look
+    /// unremarkable in review.
+    #[test]
+    fn the_watch_driver_only_reads_and_reports_metadata() {
+        const SOURCE: &str = include_str!("client.rs");
+        const SECTION_START: &str = "// The watcher (PR 10).";
+
+        let section = SOURCE
+            .split_once(SECTION_START)
+            .expect("the watcher section is still marked in this file")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("the watcher section still ends where the tests begin")
+            .0;
+        assert!(
+            section.contains("Method::PaneReportMetadata"),
+            "the slice must really be the watcher"
+        );
+        for reaches_a_pane in [
+            "PaneSendText",
+            "AgentSendKeys",
+            "AgentPrompt",
+            "AgentStart",
+            "submit_pane_text",
+            "apply_env",
+            "switch_account",
+        ] {
+            assert!(
+                !section.contains(reaches_a_pane),
+                "the watcher must never reach {reaches_a_pane}: it looks and labels, \
+                 nothing else"
+            );
+        }
+    }
 
     const WORK: &str = "/p/work";
 

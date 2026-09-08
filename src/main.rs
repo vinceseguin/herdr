@@ -657,6 +657,7 @@ fn main() -> io::Result<()> {
         println!("       herdr account default <name>");
         println!("       herdr account status [<name>] [--json]");
         println!("       herdr account login <name> [--pane <id>]");
+        println!("       herdr account watch [--interval <ms>] [--once] [--json]");
         #[cfg(feature = "gateway")]
         println!("       {}", crate::gateway::GATEWAY_COMMAND_LINE);
         println!("       herdr config <subcommand> ...");

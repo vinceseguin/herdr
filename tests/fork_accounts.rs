@@ -2878,3 +2878,422 @@ fn the_tui_switch_refuses_an_agent_with_no_session_id() {
     );
     assert_eq!(agent_of(&lab, "a1")["tokens"]["account"], DEFAULT_PROFILE);
 }
+
+// ---------------------------------------------------------------------------
+// PR 10 — `herdr account watch`
+//
+// The watcher is a long-running process that writes metadata onto agents it did
+// not start, so every test below asserts on both halves of that: what it puts
+// on an agent it is allowed to write to, and what it does *not* put on one it
+// is not. `--once` drives the deterministic assertions; the label lifecycle is
+// driven through a real background watcher, because "the badge appears while
+// you are looking at it and goes away again" is the whole feature.
+// ---------------------------------------------------------------------------
+
+/// A pane whose `claude` prints the reconstructed limit screen on `/limit`.
+fn start_limitable_agent(lab: &Lab, name: &str, pane: &str, account: &[&str]) {
+    let fixture = format!(
+        "FAKE_CLAUDE_LIMIT_FILE='{}'",
+        usage_limit_fixture().display()
+    );
+    start_agent_in(lab, name, pane, &[&fixture], account);
+}
+
+/// Drive the stub with a raw `pane.send_text`, not `agent.prompt`.
+///
+/// A limited agent is `blocked`, and the stock server refuses `agent.prompt` on
+/// a blocked agent (`src/app/api/agents.rs`) — the same refusal PR 5's switch
+/// protocol has to work around. Typing into the pane is what a human does.
+fn type_into_pane(lab: &Lab, pane: &str, line: &str) {
+    let sent = lab.herdr(&["pane", "send-text", pane, &format!("{line}\r")]);
+    assert!(sent.status.success(), "{}", stderr_of(&sent));
+}
+
+/// The three facts every watch assertion is about.
+fn label_of(lab: &Lab, target: &str) -> (Option<String>, Option<String>) {
+    let agent = agent_of(lab, target);
+    (
+        agent["tokens"]["account_state"]
+            .as_str()
+            .map(str::to_string),
+        agent["state_labels"]["blocked"]
+            .as_str()
+            .map(str::to_string),
+    )
+}
+
+/// Poll until the pane carries (or stops carrying) the watcher's label.
+fn wait_for_label(lab: &Lab, target: &str, want: Option<&str>) -> (Option<String>, Option<String>) {
+    let mut last = (None, None);
+    for _ in 0..120 {
+        last = label_of(lab, target);
+        let matches = match want {
+            Some(label) => last.1.as_deref() == Some(label),
+            None => last.1.is_none(),
+        };
+        if matches {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("agent {target} never reached state_labels.blocked = {want:?}; last: {last:?}");
+}
+
+/// Drain a running watcher's `--json` events into a channel as they arrive.
+///
+/// A watcher is a stream. `wait_with_output` can only say what it printed once
+/// it is dead, which is no use to a test that has to know when the watcher has
+/// *seen* something before it does the next thing — and a pipe nobody drains is
+/// a pipe that can fill under a chatty run.
+fn watcher_events(child: &mut std::process::Child) -> std::sync::mpsc::Receiver<serde_json::Value> {
+    let stdout = child.stdout.take().expect("the watcher's stdout is piped");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: serde_json::Value =
+                serde_json::from_str(&line).expect("one JSON object per line");
+            if sender.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    receiver
+}
+
+/// Wait until the watcher reports `event`, or give up.
+fn next_event(
+    events: &std::sync::mpsc::Receiver<serde_json::Value>,
+    event: &str,
+) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match events.recv_timeout(left) {
+            Ok(value) if value["event"] == event => return value,
+            Ok(_) => continue,
+            Err(_) => panic!("the watcher never reported a {event:?} event"),
+        }
+    }
+}
+
+/// Ctrl-C the watcher and wait for it, the way a human ends one.
+fn interrupt(child: &mut std::process::Child) -> std::process::ExitStatus {
+    let sent = std::process::Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("send SIGINT to the watcher");
+    assert!(sent.success());
+    child.wait().expect("the watcher exits")
+}
+
+/// The whole feature, through a watcher that is really running: a limit arrives
+/// mid-session, the badge appears within one interval, and when the limit lifts
+/// the badge goes away and the account state the launcher wrote comes back.
+#[test]
+fn account_watch_labels_a_limited_agent_and_clears_it_again() {
+    let mut lab = Lab::new("watch");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    start_limitable_agent(&lab, "a1", &pane, &["--account", DEFAULT_PROFILE]);
+    assert_eq!(
+        label_of(&lab, "a1"),
+        (Some("ok".to_string()), None),
+        "the launcher's state, before any watcher"
+    );
+
+    let watcher = lab.herdr_spawn(&["account", "watch", "--interval", "500", "--json"]);
+
+    type_into_pane(&lab, &pane, "/limit");
+    wait_for_agent_status(&lab, "a1", "blocked");
+    let labelled = wait_for_label(&lab, "a1", Some("usage limit"));
+    assert_eq!(
+        labelled,
+        (Some("limited".to_string()), Some("usage limit".to_string())),
+        "a limited agent carries both the token and the label"
+    );
+
+    // The limit lifts. On screen that is Claude redrawing its prompt box, which
+    // is what pushes the notice out of `after_last_horizontal_rule`.
+    type_into_pane(&lab, &pane, "/redraw");
+    let cleared = wait_for_label(&lab, "a1", None);
+    assert_eq!(
+        cleared,
+        (Some("ok".to_string()), None),
+        "the clear restores the account state the label replaced"
+    );
+
+    // Interrupting the watcher is a clean exit, and it takes nothing with it
+    // that was not already gone.
+    let interrupted = std::process::Command::new("kill")
+        .args(["-INT", &watcher.id().to_string()])
+        .status()
+        .expect("send SIGINT to the watcher");
+    assert!(interrupted.success());
+    let output = watcher.wait_with_output().expect("watcher exits");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Ctrl-C is a clean exit: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<serde_json::Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+        .collect();
+    assert!(!events.is_empty(), "the watcher reported nothing at all");
+    assert_eq!(events[0]["event"], "limited", "{events:#?}");
+    assert_eq!(events[0]["account"], DEFAULT_PROFILE, "{events:#?}");
+    assert_eq!(events[0]["reset_text"], "3pm", "{events:#?}");
+    assert_eq!(events[0]["pane_id"].as_str(), Some(pane.as_str()));
+    assert!(
+        events.iter().any(|event| event["event"] == "cleared"),
+        "the watcher says when a limit lifted: {events:#?}"
+    );
+}
+
+/// The rule that keeps the watcher honest against a real server: an agent whose
+/// account herdr cannot name is never written to, however limited it looks.
+#[test]
+fn account_watch_leaves_an_agent_without_an_account_alone() {
+    let mut lab = Lab::new("watch-none");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    start_limitable_agent(&lab, "a1", &pane, &["--account", "none"]);
+    let before = agent_of(&lab, "a1");
+    assert!(
+        before["tokens"].get("account").is_none(),
+        "the fixture must have no account token: {before:#?}"
+    );
+
+    type_into_pane(&lab, &pane, "/limit");
+    wait_for_matched_rule(&lab, "a1", "usage_limit");
+    wait_for_agent_status(&lab, "a1", "blocked");
+
+    // A positive control in the very same pass, so this test cannot pass with
+    // the watcher broken: an agent herdr *can* attribute, limited on the same
+    // reconstructed screen, must come back labelled from the same `--once`.
+    let other = split_pane(&lab);
+    start_limitable_agent(&lab, "a2", &other, &["--account", DEFAULT_PROFILE]);
+    type_into_pane(&lab, &other, "/limit");
+    wait_for_agent_status(&lab, "a2", "blocked");
+
+    let watched = lab.herdr(&["account", "watch", "--once", "--json"]);
+    assert!(watched.status.success(), "{}", stderr_of(&watched));
+    let events: Vec<serde_json::Value> = stdout_of(&watched)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one of the two limited agents is the watcher's business: {events:#?}"
+    );
+    assert_eq!(events[0]["event"], "limited", "{events:#?}");
+    assert_eq!(
+        events[0]["pane_id"].as_str(),
+        Some(other.as_str()),
+        "{events:#?}"
+    );
+    assert_eq!(
+        label_of(&lab, "a2"),
+        (Some("limited".to_string()), Some("usage limit".to_string())),
+        "the agent whose account herdr knows is labelled"
+    );
+    assert_eq!(
+        label_of(&lab, "a1"),
+        (None, None),
+        "a genuinely limited agent with no account token is left exactly as it was"
+    );
+}
+
+/// The hand-over and the exit promise, on one pane.
+///
+/// A watcher does not always start on a clean machine: a killed one, a `--once`
+/// pass or a second `watch` in another terminal leaves a *leased* `limited`
+/// behind, and the next watcher's first sight of that pane must not read its
+/// own label as the account state it is replacing — restoring that on the way
+/// out writes `limited` with no TTL and turns an expiring badge into a
+/// permanent one. Then the opposite promise, `--keep-labels`, on the same pane.
+#[test]
+fn account_watch_takes_over_a_label_and_takes_it_off_on_exit() {
+    let mut lab = Lab::new("watch-2nd");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    start_limitable_agent(&lab, "a1", &pane, &["--account", DEFAULT_PROFILE]);
+    type_into_pane(&lab, &pane, "/limit");
+    wait_for_agent_status(&lab, "a1", "blocked");
+
+    // Stand in for a watcher that stopped without clearing: a lease long enough
+    // that nothing but another watcher can take this label off.
+    let first = lab.herdr(&["account", "watch", "--once", "--interval", "60000"]);
+    assert!(first.status.success(), "{}", stderr_of(&first));
+    assert_eq!(
+        label_of(&lab, "a1"),
+        (Some("limited".to_string()), Some("usage limit".to_string()))
+    );
+
+    let mut second = lab.herdr_spawn(&["account", "watch", "--interval", "500", "--json"]);
+    let events = watcher_events(&mut second);
+    next_event(&events, "limited");
+    assert_eq!(
+        interrupt(&mut second).code(),
+        Some(0),
+        "Ctrl-C is a clean exit"
+    );
+    assert_eq!(
+        label_of(&lab, "a1"),
+        (None, None),
+        "the label comes off, and the watcher's own `limited` is never restored          as the state it replaced — that would outlive every lease"
+    );
+
+    let mut kept = lab.herdr_spawn(&[
+        "account",
+        "watch",
+        "--interval",
+        "500",
+        "--json",
+        "--keep-labels",
+    ]);
+    let kept_events = watcher_events(&mut kept);
+    next_event(&kept_events, "limited");
+    assert_eq!(interrupt(&mut kept).code(), Some(0));
+    assert_eq!(
+        label_of(&lab, "a1"),
+        (Some("limited".to_string()), Some("usage limit".to_string())),
+        "--keep-labels leaves the badge to its lease instead"
+    );
+}
+
+/// Tokens are in-memory only, so a server restart takes every label with it and
+/// no status change follows to announce that. The watcher reconciles what the
+/// server holds against what it believes on every pass, which is what repairs
+/// that — driven here by stripping the label out from under it.
+#[test]
+fn account_watch_reports_a_label_that_went_missing_again() {
+    let mut lab = Lab::new("watch-again");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    start_limitable_agent(&lab, "a1", &pane, &["--account", DEFAULT_PROFILE]);
+    type_into_pane(&lab, &pane, "/limit");
+    wait_for_agent_status(&lab, "a1", "blocked");
+
+    let first = lab.herdr(&["account", "watch", "--once", "--json"]);
+    assert!(first.status.success(), "{}", stderr_of(&first));
+    assert_eq!(
+        label_of(&lab, "a1"),
+        (Some("limited".to_string()), Some("usage limit".to_string()))
+    );
+
+    // `--once` leaves what it labelled to its lease rather than clearing it,
+    // which is what makes a one-shot pass useful at all.
+    let stripped = lab.herdr(&[
+        "pane",
+        "report-metadata",
+        &pane,
+        "--source",
+        "fork:accounts",
+        "--agent",
+        "claude",
+        "--clear-token",
+        "account_state",
+        "--clear-state-labels",
+    ]);
+    assert!(stripped.status.success(), "{}", stderr_of(&stripped));
+    assert_eq!(label_of(&lab, "a1"), (None, None));
+
+    let second = lab.herdr(&["account", "watch", "--once", "--json"]);
+    assert!(second.status.success(), "{}", stderr_of(&second));
+    assert_eq!(
+        label_of(&lab, "a1"),
+        (Some("limited".to_string()), Some("usage limit".to_string())),
+        "the next pass puts the label back"
+    );
+}
+
+/// The safety property a long-running labeller owes: a watcher that stops —
+/// killed, crashed, machine gone — cannot leave a `limited` badge behind. The
+/// label is a lease the server expires on its own.
+#[test]
+fn account_watch_labels_expire_without_a_watcher() {
+    let mut lab = Lab::new("watch-ttl");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    start_limitable_agent(&lab, "a1", &pane, &["--account", DEFAULT_PROFILE]);
+    type_into_pane(&lab, &pane, "/limit");
+    wait_for_agent_status(&lab, "a1", "blocked");
+
+    // The shortest interval the CLI accepts, so the lease is its floor.
+    let watched = lab.herdr(&["account", "watch", "--once", "--interval", "500"]);
+    assert!(watched.status.success(), "{}", stderr_of(&watched));
+    assert_eq!(
+        label_of(&lab, "a1"),
+        (Some("limited".to_string()), Some("usage limit".to_string()))
+    );
+
+    // No watcher is running now, and the agent is still blocked on the limit.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    loop {
+        if label_of(&lab, "a1") == (None, None) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the label outlived its lease: {:?}",
+            label_of(&lab, "a1")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assert_eq!(
+        agent_of(&lab, "a1")["agent_status"],
+        "blocked",
+        "the agent is still limited; only the watcher's claim about it expired"
+    );
+    assert_eq!(
+        agent_of(&lab, "a1")["tokens"]["account"],
+        DEFAULT_PROFILE,
+        "the launcher's untimed account token is untouched by the lease"
+    );
+}
+
+/// A mistyped interval is a refusal, not a silently different watcher.
+#[test]
+fn account_watch_refuses_an_interval_it_cannot_honour() {
+    let mut lab = Lab::new("watch-args");
+    assert!(lab.up().status.success());
+
+    for args in [
+        vec!["account", "watch", "--interval", "1"],
+        vec!["account", "watch", "--interval", "600000"],
+        vec!["account", "watch", "--interval"],
+        vec!["account", "watch", "--interval", "soon"],
+        vec!["account", "watch", "--nope"],
+    ] {
+        let output = lab.herdr(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?} must be a usage error: {}{}",
+            stdout_of(&output),
+            stderr_of(&output)
+        );
+        assert!(
+            stdout_of(&output).is_empty(),
+            "a refused watch prints nothing on stdout: {}",
+            stdout_of(&output)
+        );
+    }
+}

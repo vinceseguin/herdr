@@ -17,9 +17,10 @@
 //!
 //! [`switch`] is the protocol that moves a *running* agent to another
 //! account without losing its conversation, expressed as a state machine over
-//! observations.
+//! observations, and [`watch`] the fold that decides when a usage limit is
+//! worth labelling on the pane and when the label has to come back off.
 //!
-//! Those nine are pure: sync, socket-free, and free of `tokio`, `ratatui` and
+//! Those ten are pure: sync, socket-free, and free of `tokio`, `ratatui` and
 //! the client. [`client`] is the one runtime driver — it composes stock API
 //! methods into the two-step launch and drives [`switch`] — and the
 //! architecture test below keeps the split honest.
@@ -34,13 +35,14 @@ pub mod status;
 pub mod store;
 pub mod switch;
 pub mod tokens;
+pub mod watch;
 
 #[cfg(test)]
 mod tests {
     /// Modules that must stay pure data, and the paths that would end that.
     /// Precedent: `scripts/test_ui_hot_path_architecture.py` guards the render
     /// hot path the same way.
-    const PURE_MODULES: [(&str, &str); 9] = [
+    const PURE_MODULES: [(&str, &str); 10] = [
         ("config.rs", include_str!("config.rs")),
         ("launch.rs", include_str!("launch.rs")),
         ("layout.rs", include_str!("layout.rs")),
@@ -50,6 +52,7 @@ mod tests {
         ("store.rs", include_str!("store.rs")),
         ("switch.rs", include_str!("switch.rs")),
         ("tokens.rs", include_str!("tokens.rs")),
+        ("watch.rs", include_str!("watch.rs")),
     ];
 
     const FORBIDDEN: [&str; 7] = [

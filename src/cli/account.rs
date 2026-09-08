@@ -41,6 +41,7 @@ pub(super) const ACCOUNT_USAGE: &str = "Usage:
   herdr account default <name>
   herdr account status [<name>] [--json]
   herdr account login <name> [--pane <id>]
+  herdr account watch [--interval <ms>] [--once] [--json] [--keep-labels]
 
 An account is one Claude config directory (CLAUDE_CONFIG_DIR) with its own
 credentials. Declare profiles as [[accounts]] in config.toml, or let
@@ -51,8 +52,14 @@ shared state are symlinked, settings and .claude.json are copied with the
 identity keys removed, and credentials are never copied — the new profile is
 logged out until `herdr account login <name>`.
 
-status and login talk to the local herdr server; the rest contact none. No
-command ever reads or prints the contents of a credentials file.";
+status, login and watch talk to the local herdr server; the rest contact none.
+No command ever reads or prints the contents of a credentials file.
+
+watch is an opt-in helper that keeps a usage limit visible. It polls the agent
+list, asks herdr's detector about blocked Claude agents whose account herdr
+knows, and labels those it finds limited. It never types into a pane and never
+switches an account. Every label it writes is leased, so a watcher that stops
+cannot strand one; Ctrl-C takes them off immediately.";
 
 const ADD_USAGE: &str = "usage: herdr account add <name> [--config-dir <path>] [--from <profile>] \
 [--dry-run] [--force] [--print-config] [--no-hook] [--json]";
@@ -78,6 +85,7 @@ pub(super) fn run_account_command(args: &[String]) -> std::io::Result<i32> {
         Some("remove") => remove(&args[1..]),
         Some("status") => status(&args[1..]),
         Some("login") => login(&args[1..]),
+        Some("watch") => watch(&args[1..]),
         Some("default") => set_default(&args[1..]),
         Some("help" | "--help" | "-h") if args.len() == 1 => {
             println!("{ACCOUNT_USAGE}");
@@ -1445,6 +1453,139 @@ fn print_rows(rows: &[AccountListRow]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// watch
+// ---------------------------------------------------------------------------
+
+const WATCH_USAGE: &str = "usage: herdr account watch [--interval <ms>] [--once] [--json] \
+[--keep-labels]";
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WatchArgs {
+    interval_ms: Option<u64>,
+    once: bool,
+    json: bool,
+    keep_labels: bool,
+}
+
+fn parse_watch(args: &[String]) -> Result<WatchArgs, String> {
+    let mut parsed = WatchArgs::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--interval" => {
+                if parsed.interval_ms.is_some() {
+                    return Err("--interval was given more than once".to_string());
+                }
+                // A flag where a number belongs is a typo, and silently taking
+                // the default would hide it for as long as the watcher runs.
+                match args.get(index + 1) {
+                    Some(value) if !value.starts_with('-') => {
+                        parsed.interval_ms =
+                            Some(value.parse::<u64>().map_err(|_| {
+                                format!("--interval expects milliseconds: {value}")
+                            })?);
+                        index += 1;
+                    }
+                    _ => return Err("--interval expects a value in milliseconds".to_string()),
+                }
+            }
+            value if value.starts_with("--interval=") => {
+                if parsed.interval_ms.is_some() {
+                    return Err("--interval was given more than once".to_string());
+                }
+                let value = &value["--interval=".len()..];
+                parsed.interval_ms = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("--interval expects milliseconds: {value}"))?,
+                );
+            }
+            "--once" => parsed.once = true,
+            "--json" => parsed.json = true,
+            "--keep-labels" => parsed.keep_labels = true,
+            other => return Err(format!("unexpected argument: {other}")),
+        }
+        index += 1;
+    }
+    Ok(parsed)
+}
+
+/// Turn the parsed flags into the driver's options, or say why not.
+///
+/// The bounds are refusals rather than clamps: someone who typed
+/// `--interval 10` wants ten milliseconds, and quietly giving them five hundred
+/// would leave them measuring a watcher that is not doing what they asked.
+fn watch_options(parsed: &WatchArgs) -> Result<crate::accounts::client::WatchOptions, String> {
+    use crate::accounts::client::{MAX_WATCH_INTERVAL, MIN_WATCH_INTERVAL};
+
+    let interval = match parsed.interval_ms {
+        Some(ms) => std::time::Duration::from_millis(ms),
+        None => crate::accounts::client::DEFAULT_WATCH_INTERVAL,
+    };
+    if interval < MIN_WATCH_INTERVAL || interval > MAX_WATCH_INTERVAL {
+        return Err(format!(
+            "--interval must be between {} and {} ms",
+            MIN_WATCH_INTERVAL.as_millis(),
+            MAX_WATCH_INTERVAL.as_millis()
+        ));
+    }
+    Ok(crate::accounts::client::WatchOptions {
+        interval,
+        once: parsed.once,
+        json: parsed.json,
+        keep_labels: parsed.keep_labels,
+    })
+}
+
+/// `herdr account watch` — label usage-limited Claude agents, and nothing else.
+///
+/// Exit codes follow the rest of `herdr account`: 0 for a clean stop
+/// (`--once` finished, or `Ctrl-C`), 1 when the watcher gave up on something
+/// waiting cannot fix, 2 for a usage error. A server that is not running is not
+/// a failure — the watcher waits for it and re-labels when it returns, because
+/// tokens do not survive a restart.
+fn watch(args: &[String]) -> std::io::Result<i32> {
+    let parsed = match parse_watch(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("herdr account watch: {message}");
+            eprintln!("{WATCH_USAGE}");
+            return Ok(2);
+        }
+    };
+    let options = match watch_options(&parsed) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("herdr account watch: {message}");
+            eprintln!("{WATCH_USAGE}");
+            return Ok(2);
+        }
+    };
+
+    // Configuration problems are worth saying once, up front: a watcher with no
+    // profiles configured will never label anything, and silence would read as
+    // "nothing is limited".
+    let config = crate::config::Config::load().config;
+    let (profiles, diagnostics) = load_profiles(&config);
+    for diagnostic in &diagnostics {
+        eprintln!("{diagnostic}");
+    }
+    if profiles.names().is_empty() {
+        eprintln!(
+            "note: no account profiles are configured, so no agent can be attributed to an \
+             account (see `herdr account add <name>`)"
+        );
+    }
+
+    crate::platform::begin_cli_output();
+    match crate::accounts::client::watch(&options) {
+        crate::accounts::client::WatchEnd::Once
+        | crate::accounts::client::WatchEnd::Interrupted => Ok(0),
+        crate::accounts::client::WatchEnd::Failed => Ok(1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1678,6 +1819,95 @@ mod tests {
         assert!(error.contains("lives inside it"), "{error}");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `watch` runs unattended for hours, so a mistyped flag has to be a
+    /// refusal now rather than a watcher that quietly polls at the wrong rate.
+    #[test]
+    fn watch_parses_its_flags_and_refuses_the_rest() {
+        let parse =
+            |args: &[&str]| parse_watch(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+
+        assert_eq!(
+            parse(&[]).expect("bare"),
+            WatchArgs {
+                interval_ms: None,
+                once: false,
+                json: false,
+                keep_labels: false,
+            }
+        );
+        assert_eq!(
+            parse(&["--interval", "2000", "--once", "--json", "--keep-labels"]).expect("all"),
+            WatchArgs {
+                interval_ms: Some(2000),
+                once: true,
+                json: true,
+                keep_labels: true,
+            }
+        );
+        assert_eq!(
+            parse(&["--interval=2000"]).expect("joined"),
+            WatchArgs {
+                interval_ms: Some(2000),
+                once: false,
+                json: false,
+                keep_labels: false,
+            }
+        );
+
+        for bad in [
+            vec!["--interval"],
+            vec!["--interval", "--json"],
+            vec!["--interval", "soon"],
+            vec!["--interval", "1000", "--interval", "2000"],
+            vec!["--interval=x"],
+            vec!["--unknown"],
+            vec!["extra"],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?} must not parse");
+        }
+    }
+
+    /// The bounds are refusals, not clamps: someone who asked for a 10 ms poll
+    /// must not end up measuring a 500 ms one.
+    #[test]
+    fn watch_refuses_an_interval_it_cannot_honour() {
+        use crate::accounts::client::{
+            DEFAULT_WATCH_INTERVAL, MAX_WATCH_INTERVAL, MIN_WATCH_INTERVAL,
+        };
+
+        let options = |ms: Option<u64>| {
+            watch_options(&WatchArgs {
+                interval_ms: ms,
+                once: false,
+                json: false,
+                keep_labels: false,
+            })
+        };
+
+        assert_eq!(
+            options(None).expect("default").interval,
+            DEFAULT_WATCH_INTERVAL
+        );
+        assert_eq!(
+            options(Some(MIN_WATCH_INTERVAL.as_millis() as u64))
+                .expect("floor")
+                .interval,
+            MIN_WATCH_INTERVAL
+        );
+        assert_eq!(
+            options(Some(MAX_WATCH_INTERVAL.as_millis() as u64))
+                .expect("ceiling")
+                .interval,
+            MAX_WATCH_INTERVAL
+        );
+        assert!(options(Some(1)).is_err(), "below the floor");
+        assert!(options(Some(0)).is_err(), "zero would be a request loop");
+        assert!(
+            options(Some(MAX_WATCH_INTERVAL.as_millis() as u64 + 1)).is_err(),
+            "above the ceiling"
+        );
     }
 
     #[test]
