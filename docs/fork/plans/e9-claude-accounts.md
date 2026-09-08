@@ -351,7 +351,7 @@ implementation starts only after E3 is ✅.
 | 5 | feat(accounts): switch a running claude agent to another profile keeping its session | B · CLI | 4 | ✅ |
 | 6 | feat(fleet): fleet report and change stream carry agent metadata tokens | C · Fleet | 1 | ✅ |
 | 7 | feat(accounts): tui account picker to start claude in a pane | D · TUI | 4 | ✅ |
-| 8 | feat(accounts): tui switch-account action with confirmation | D · TUI | 5, 7 | ⬜ |
+| 8 | feat(accounts): tui switch-account action with confirmation | D · TUI | 5, 7 | ✅ |
 | 9 | feat(detect): claude usage-limit rule and account limit hints | E · Limits | 3, 5 | ✅ |
 | 10 | feat(accounts): herdr account watch labels usage-limited agents | E · Limits | 9 | ⬜ |
 | 11 | docs(accounts): accounts guide, adr, readme and roadmap drift | F · Docs | 2, 6, 8, 10 | ⬜ |
@@ -1677,6 +1677,102 @@ progress lines; `agent get a1` shows the same `agent_session.value` and
 read` unchanged).
 
 **Downstream.** None beyond documentation (PR 11).
+
+**As built (PR 8, merged).** The action is the picker in a second mode, not a
+second modal, and the confirmation is a step inside it. The corrections below
+win over the prose above.
+
+- **The confirmation is a step of `ClientAccountPickerOverlay`, not a
+  `ClientAccountSwitchConfirm` overlay.** A new `ClientShellOverlay` variant
+  would have been a second added arm in `state.rs`, and the mergeability
+  discipline gives that file exactly one delegating line per concept. The
+  overlay grew `confirm: Option<String>`, which holds
+  `Action::AskConfirm`'s text **verbatim** — the machine's own wording, so what
+  the modal promises and what the protocol does cannot drift — and
+  `account_overlay_render::render_switch_confirm` draws it in
+  `ClientConfirmCloseOverlay`'s language (red panel, body, `↵ confirm` /
+  `esc cancel`), wrapping the text with a local `wrap_question`.
+- **The worker blocks on the modal.** `AccountJobEvent::Confirm(String)` carries
+  the question up; `AccountJob.answers: Option<Sender<Confirmation>>` carries
+  the answer back, and the `confirm` closure the driver calls is a
+  `answers.recv()`. A dropped channel is `Confirmation::Unavailable`, which the
+  machine turns into `ConfirmationRequired` with nothing sent — so a closed
+  modal, a detached job or a client shutdown all refuse rather than assume.
+  `AccountJob::detach` drops the sender for exactly that reason.
+- **The stall limit is suspended while a question is up.** The 90 s budget
+  exists because the socket calls carry no timeout; a worker waiting on a
+  *person* is not stalled, and a modal that timed out under a question would
+  answer it by accident. `AccountJob.awaiting_confirm` gates `stalled()`.
+- **`i` toggles interrupt on the picker, not on the confirmation.** The plan put
+  it on the confirm step, but PR 5's preflight refuses a working agent
+  *before* it ever emits `AskConfirm`, so by the time the question is on screen
+  the decision has already been made. The toggle is therefore a picker-screen
+  knob (shown in the filter line as `i: interrupt if working — on/off`), and a
+  switch refused with `AgentWorking` adds the note "press i to allow
+  interrupting it, then pick the account again".
+- **A refusal that reached nothing does not settle the modal.** PR 7's split is
+  extended with the one fact only the switch can prove:
+  `AccountJobResult::Failed.refused` is `!SwitchFailure::touched_pane`, so a
+  declined confirmation, a preflight refusal or an `AgentWorking` stop leaves
+  the picker armed for another row — while anything that reached the pane
+  settles it and shows the warnings and `recovery_hint()`.
+- **The menu item cannot gate on the session id.** `ClientShellAgent` carries no
+  session field and widening the wire for a menu item is forbidden, so
+  `switch_account_context_item` gates on `agent_kind == "claude"` and
+  `accounts_available >= 2` only. A `claude` with no managed name or no
+  reported session id therefore *gets* the item and is refused by the protocol
+  with nothing typed, in the modal. `open_account_switch_picker` still withholds
+  the picker for an unnamed agent, since `agent.start` would have no name to
+  resume under.
+- **`switch_account_with_progress(input, confirm, launch, on_phase)`** is the
+  shared driver; `switch_account` delegates to it with a no-op. The phase comes
+  from the `Action` about to be carried out (`phase_of`), not from
+  `SwitchMachine`'s private `Phase`, so the machine keeps one public surface and
+  a progress line cannot claim a step that is not running.
+- **The TUI has its own relaunch** (`account_overlay::switch_relaunch`) rather
+  than `cli::agent::relaunch_under_account`: on a failed `agent.start` it must
+  call `AppliedLine::take_note()` and put the stranded-line note in the modal,
+  because the CLI's version drops the guard and its `Drop` prints with
+  `eprintln!` — under a rendered screen that is lost. Everything else is the
+  same three steps.
+- **`SwitchOptions::force` is always false from the TUI.** Overriding a
+  logged-out target or a no-op switch is a deliberate command-line act; the
+  picker refuses the current account itself, before a thread is spawned.
+- **The switch is pinned to the agent's *name*, not only its pane.**
+  `SwitchInput` gained `expected_name: Option<String>` and `switch.rs` gained
+  `SwitchError::NotTheAgent { pane_id, expected, actual }`, checked first in
+  preflight — before the Claude-kind check, so a pane that now runs something
+  else says which agent. The client-side preflight already compares the name
+  against the shell snapshot, but the read that actually *pins* the pane is the
+  machine's own `agent.get <pane id>` on the worker thread a moment later, and
+  it used to take whatever ran there. The CLI passes `None`: a name on the
+  command line is what the server resolves, and a pane id there means whatever
+  runs in it. **PRs 9 and 10 must fill the new field** when they build a
+  `SwitchInput`.
+- **The confirmation has a 500 ms arming delay for *yes* only**
+  (`CONFIRM_ARM_DELAY`). The question replaces the picker within ~100 ms of the
+  Enter or row click that submitted it, and `hits.overlay_primary` is still the
+  picker's button until the next paint, so a double tap, a key repeat or the
+  second half of a double-click answered it before anyone could read three
+  lines about stopping their agent. A yes inside the window is ignored and the
+  question stays up; a no is never delayed, because a spurious no costs nothing.
+- **The stall clock restarts when the question is answered.** It is suspended
+  while the question is up, but `last_event` still dated from when the question
+  *arrived*, so a user who took more than 90 s over it had the just-released
+  worker declared silent on the very next tick, detached, and the switch left to
+  run unobserved — losing exactly the warnings that say a resume landed on a
+  different conversation.
+- **No notification path.** The plan said a job outliving its modal should land
+  in `notifications.rs`; PR 7 made the modal undismissable while a job runs, so
+  the only ways to lose it are an endpoint reset or client exit. The worker
+  still runs to a terminal state (never half-switched) and only its report is
+  lost; a client killed mid-protocol leaves the pane at its shell with the
+  conversation on disk, exactly as Ctrl-C on the CLI does.
+- **Line numbers in *Real current state* for `src/client/shell/**` remain
+  stale** after the upstream v0.9.0 sync; PR 7's *As built* is the map. The one
+  correction PR 8 adds: the pane context menu grows a `Swap with focused pane`
+  item when the right-clicked pane is not the focused one, which moves the
+  account items down a row — a pty test must count the items, not the keystrokes.
 
 ### PR 9 — feat(detect): claude usage-limit rule and account limit hints · deps: 3, 5
 
