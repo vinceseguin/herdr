@@ -175,7 +175,7 @@ Owned by `implement-roadmap`. Legend: ✅ done · 🔨 in progress · ⬜ not st
 | E6 | Push notifications to the phone | E4, E5 | ⬜ | — |
 | E7 | Control from phone and console (approvals, prompts, start) | E3, E4 | ⬜ | — |
 | E8 | Fork release and install pipeline | E3, E4 | ⬜ | — |
-| E9 | Claude account profiles per agent, switchable mid-session | E0 | 🔨 | `docs/fork/plans/e9-claude-accounts.md` |
+| E9 | Claude account profiles per agent, switchable mid-session | E0 | ✅ | `docs/fork/plans/e9-claude-accounts.md` |
 
 ---
 
@@ -705,6 +705,40 @@ just a Claude config directory with its own `.credentials.json` and
   units, launch-command construction per shell, the switch state machine on
   `AppState::test_new()`, and a real-server validation that starts two fake
   `claude` stubs under two throwaway profile directories and switches one.
+
+**Validation outcome (2026-09-08).** Eleven planned PRs plus one docs fix
+merged (fork #51–#62). The plan's end-to-end validation passes on a fresh
+build against real servers with the fake `claude` stub: profiles listed,
+added (seeded without credentials), logged in; agents started under a chosen
+or default profile with `/proc`-verified environments; the account visible in
+`agent get`, the sidebar, `herdr fleet status` and therefore the gateway; the
+CLI and TUI switch keeping the same session id while a neighbour agent stays
+untouched; a declined confirmation sending nothing; the usage-limit rule
+marking the agent blocked, `account status` hinting the switch, and
+`account watch` leasing the label and clearing it on Ctrl-C; refusals that
+touch nothing. One defect found by validation (the guide's sidebar snippet
+lacked `state_text`, so the promised label could not render) was fixed in
+#62. **Real Claude Code was never invoked:** the seed list, `claude auth
+login`, `/exit` and `--resume` behaviour, and above all the reconstructed
+usage-limit fixture must be verified by a human against a real installation
+and a really rate-limited account — the consolidated checklist with commands
+is in `docs/fork/accounts.md`.
+
+**Constraints for E4 and E7 (honor these).** `agents[].tokens.account` and
+`tokens.account_state` are `#[serde(default)]`; the state vocabulary is
+`ok | unverified | mismatch | limited | logged_out` (`logged_out` reserved,
+no producer yet) — show an unknown value verbatim, never guess, and never
+render an absent state or `unverified` as `ok`. `state_labels.blocked` is a
+leased fact with a TTL of four watch intervals; tokens are in-memory on the
+server, so after a restart the account is absent, not wrong. The event
+reducer skips unknown `FleetChange` kinds, including `agent_metadata`, which
+deliberately does not advance `fleet_change_seq`. A phone-side switch calls
+the same stock methods the CLI does, with the mandatory confirmation text
+taken verbatim from the switch machine, the post-confirmation recheck, and
+the `touched_pane` exit-code contract; the `/proc` probe is local, so an
+agent on a remote host grades `unverified` unless the driver runs there.
+Fork wiring inside `src/client/**` is limited to the arms listed in ADR
+0002's re-apply table; every upstream sync re-applies them.
 
 **Depends on:** E0 (phone-side display and switch action: E7).
 **Decisions (resolved):** (a) profile layout — separate `CLAUDE_CONFIG_DIR`
