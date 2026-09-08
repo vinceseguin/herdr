@@ -25,6 +25,9 @@ pub(super) fn render_account_picker(
     picker: &ClientAccountPickerOverlay,
     p: &Palette,
 ) -> Option<OverlayRender> {
+    if let Some(question) = picker.confirm.as_deref() {
+        return render_switch_confirm(b, picker, question, p);
+    }
     let popup_height = (picker.entries.len().saturating_mul(2) + 9).clamp(14, 26) as u16;
     let popup = popup(b.area, 84, popup_height)?;
     let inner = panel(b, popup, p.accent, p.panel_bg)?;
@@ -68,10 +71,13 @@ pub(super) fn render_account_picker(
             })
             .bg(p.panel_bg),
     );
-    let count = if filtered.len() == picker.entries.len() {
-        format!("{} accounts", picker.entries.len())
-    } else {
-        format!("{}/{} accounts", filtered.len(), picker.entries.len())
+    let count = match (picker.interrupt(), filtered.len() == picker.entries.len()) {
+        // The switch's one knob, always visible so its state is never a
+        // surprise when the confirmation warns about an interrupt.
+        (Some(true), _) => "i: interrupt if working — on".to_owned(),
+        (Some(false), _) => "i: interrupt if working — off".to_owned(),
+        (None, true) => format!("{} accounts", picker.entries.len()),
+        (None, false) => format!("{}/{} accounts", filtered.len(), picker.entries.len()),
     };
     put_right_text(
         b,
@@ -213,7 +219,15 @@ pub(super) fn render_account_picker(
     }
 
     let settled = picker.settled;
-    let buttons = row(inner, &[16, 12], 2, inner.height.saturating_sub(1));
+    // Wide enough for the switch's longer verb; the start picker keeps the
+    // width every other herdr modal uses.
+    let primary_width = if picker.interrupt().is_some() { 19 } else { 16 };
+    let buttons = row(
+        inner,
+        &[primary_width, 12],
+        2,
+        inner.height.saturating_sub(1),
+    );
     let [primary, cancel] = buttons.as_slice() else {
         return None;
     };
@@ -224,6 +238,8 @@ pub(super) fn render_account_picker(
             " working... "
         } else if settled {
             " ↵ close "
+        } else if picker.interrupt().is_some() {
+            " ↵ switch account "
         } else {
             " ↵ start claude "
         },
@@ -263,6 +279,122 @@ pub(super) fn render_account_picker(
     })
 }
 
+/// The switch's confirmation: the machine's own question, and two answers.
+///
+/// Drawn like `ClientConfirmCloseOverlay` — a red panel, a body, `confirm` and
+/// `cancel` — because it is the same kind of decision: something the user owns
+/// is about to be stopped and started again. The body is
+/// `SwitchMachine`'s text verbatim, so what the modal promises and what the
+/// protocol does cannot drift apart.
+///
+/// No row or search rectangle goes out: while the question is up, the only two
+/// things on the modal that do anything are its buttons.
+fn render_switch_confirm(
+    b: &mut Buffer,
+    picker: &ClientAccountPickerOverlay,
+    question: &str,
+    p: &Palette,
+) -> Option<OverlayRender> {
+    let width = 72_u16;
+    let lines = wrap_question(question, width.saturating_sub(4) as usize);
+    let height = (lines.len() as u16).saturating_add(6).clamp(8, 24);
+    let popup = popup(b.area, width, height)?;
+    let inner = panel(b, popup, p.red, p.panel_bg)?;
+    put_text(
+        b,
+        inner.x,
+        inner.y,
+        inner.width,
+        &format!(" {}", picker.title()),
+        Style::default()
+            .fg(p.red)
+            .bg(p.panel_bg)
+            .add_modifier(Modifier::BOLD),
+    );
+    put_right_text(
+        b,
+        inner,
+        inner.y,
+        &format!("pane {}", picker.pane_id),
+        Style::default().fg(p.overlay0).bg(p.panel_bg),
+    );
+    // The body stops where the button row starts, so a question longer than
+    // the panel is truncated rather than drawn over the answers.
+    let body_rows = inner.height.saturating_sub(3);
+    for (index, line) in lines.iter().take(body_rows as usize).enumerate() {
+        put_text(
+            b,
+            inner.x,
+            inner.y.saturating_add(2).saturating_add(index as u16),
+            inner.width,
+            &format!(" {line}"),
+            Style::default().fg(p.text).bg(p.panel_bg),
+        );
+    }
+
+    let buttons = row(inner, &[13, 12], 2, inner.height.saturating_sub(1));
+    let [ok, cancel] = buttons.as_slice() else {
+        return None;
+    };
+    button(
+        b,
+        *ok,
+        " ↵ confirm ",
+        Style::default()
+            .fg(contrast(p))
+            .bg(p.red)
+            .add_modifier(Modifier::BOLD),
+    );
+    button(
+        b,
+        *cancel,
+        " esc cancel ",
+        Style::default()
+            .fg(p.text)
+            .bg(p.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+    Some(OverlayRender {
+        primary: *ok,
+        clear: Rect::default(),
+        cancel: *cancel,
+        worktree_search: Rect::default(),
+        worktree_rows: Vec::new(),
+        cursor: None,
+        ..OverlayRender::default()
+    })
+}
+
+/// Break the machine's question into panel-width lines.
+///
+/// It arrives as a few `\n`-separated sentences, some of them indented
+/// continuations, and each can be far wider than the panel. Words are never
+/// split; a word longer than the width is put on its own line and truncated by
+/// `put_text` rather than silently dropped.
+fn wrap_question(question: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for paragraph in question.split('\n') {
+        let indent = if paragraph.starts_with(' ') { "  " } else { "" };
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            let candidate = if current.is_empty() {
+                format!("{indent}{word}")
+            } else {
+                format!("{current} {word}")
+            };
+            if display_width(&candidate) as usize > width && !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current = format!("{indent}{word}");
+            } else {
+                current = candidate;
+            }
+        }
+        lines.push(current);
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +412,7 @@ mod tests {
             logged_in: true,
             hook_installed: true,
             is_default: name == "work",
+            is_current: false,
         }
     }
 
@@ -370,6 +503,132 @@ mod tests {
         let cursor = rendered.cursor.expect("the filter has the cursor");
         assert_eq!(cursor.y, rendered.worktree_search.y);
         assert!(cursor.x < rendered.worktree_search.right());
+    }
+
+    fn switch_picker() -> ClientAccountPickerOverlay {
+        ClientAccountPickerOverlay::idle(
+            "pane_2".to_owned(),
+            PickerMode::Switch {
+                agent_name: "a1".to_owned(),
+                current: Some("acct-0".to_owned()),
+                interrupt: false,
+            },
+            (0..2)
+                .map(|index| entry(&format!("acct-{index}")))
+                .collect(),
+            1,
+        )
+    }
+
+    #[test]
+    fn the_confirmation_offers_two_answers_and_nothing_to_click_past_them() {
+        let palette = palette();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 40));
+        let mut picker = switch_picker();
+        picker.confirm = Some(
+            "Switch agent \"a1\" in pane pane_2 from perso to \"work\"?\n  Claude will be \
+             asked to exit (Escape if needed, then /exit) and started again with `--resume \
+             abc-123` under the new profile."
+                .to_owned(),
+        );
+        let rendered = render_account_picker(&mut buffer, &picker, &palette).expect("rendered");
+        assert!(!rendered.primary.is_empty(), "confirm");
+        assert!(!rendered.cancel.is_empty(), "cancel");
+        assert!(
+            rendered.worktree_rows.is_empty() && rendered.worktree_search.is_empty(),
+            "no row or filter may be clicked while the question is up"
+        );
+        assert!(rendered.cursor.is_none());
+
+        let drawn = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The three facts the user is answering about are on screen.
+        assert!(drawn.contains("switch claude account"), "{drawn}");
+        assert!(drawn.contains("pane pane_2"), "{drawn}");
+        assert!(drawn.contains("abc-123"), "{drawn}");
+        assert!(
+            drawn.contains("confirm") && drawn.contains("cancel"),
+            "{drawn}"
+        );
+    }
+
+    #[test]
+    fn every_terminal_size_renders_the_confirmation_without_panicking() {
+        let palette = palette();
+        for cols in 1..=40_u16 {
+            for rows in 1..=14_u16 {
+                let mut buffer = Buffer::empty(Rect::new(0, 0, cols, rows));
+                let mut picker = switch_picker();
+                picker.confirm = Some(format!(
+                    "Switch agent \"a1\"?\n  {}\n  {}",
+                    "x".repeat(300),
+                    "word ".repeat(80)
+                ));
+                let _ = render_account_picker(&mut buffer, &picker, &palette);
+            }
+        }
+    }
+
+    #[test]
+    fn the_switch_picker_shows_the_interrupt_toggle_and_its_own_button() {
+        let palette = palette();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 40));
+        let drawn = |picker: &ClientAccountPickerOverlay, buffer: &mut Buffer| {
+            render_account_picker(buffer, picker, &palette).expect("rendered");
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let text = drawn(&switch_picker(), &mut buffer);
+        assert!(text.contains("interrupt if working — off"), "{text}");
+        assert!(text.contains("switch account"), "{text}");
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 40));
+        let mut interrupting = switch_picker();
+        if let PickerMode::Switch { interrupt, .. } = &mut interrupting.mode {
+            *interrupt = true;
+        }
+        let text = drawn(&interrupting, &mut buffer);
+        assert!(text.contains("interrupt if working — on"), "{text}");
+
+        // The start picker keeps the account count and its own verb.
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 40));
+        let text = drawn(&picker(3), &mut buffer);
+        assert!(text.contains("3 accounts"), "{text}");
+        assert!(text.contains("start claude"), "{text}");
+    }
+
+    #[test]
+    fn wrapping_never_splits_a_word_and_never_drops_one() {
+        let wrapped = wrap_question("alpha beta gamma delta", 11);
+        assert_eq!(wrapped, vec!["alpha beta", "gamma delta"]);
+        // An indented continuation keeps its indent on every line it takes.
+        let wrapped = wrap_question("head\n  one two three", 9);
+        assert_eq!(wrapped, vec!["head", "  one two", "  three"]);
+        // A word wider than the panel gets a line of its own rather than
+        // pushing the rest off the end.
+        let wrapped = wrap_question("short verylongwordindeed tail", 8);
+        assert_eq!(wrapped, vec!["short", "verylongwordindeed", "tail"]);
+        // Every word survives, whatever the width.
+        for width in 1..=40 {
+            let joined = wrap_question("a bb ccc dddd eeeee", width).join(" ");
+            assert_eq!(
+                joined.split_whitespace().collect::<Vec<_>>(),
+                vec!["a", "bb", "ccc", "dddd", "eeeee"],
+                "width {width}"
+            );
+        }
     }
 
     #[test]

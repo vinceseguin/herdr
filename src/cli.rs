@@ -22,7 +22,7 @@ macro_rules! println {
     }};
 }
 
-mod account;
+pub(crate) mod account;
 pub(crate) mod agent;
 mod api;
 mod completion;

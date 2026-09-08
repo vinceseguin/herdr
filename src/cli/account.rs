@@ -1038,7 +1038,7 @@ fn usage_limit_of(agent: &AgentInfo) -> Option<crate::accounts::limit::UsageLimi
 }
 
 /// One `agent.explain`, or `None` if anything at all went wrong.
-pub(super) fn agent_explain(target: &str) -> Option<serde_json::Value> {
+pub(crate) fn agent_explain(target: &str) -> Option<serde_json::Value> {
     let response = crate::cli::send_request(&Request {
         id: "cli:accounts:explain".into(),
         method: Method::AgentExplain(AgentTarget {
@@ -1055,7 +1055,7 @@ pub(super) fn agent_explain(target: &str) -> Option<serde_json::Value> {
 /// The same bottom-buffer text the detector matched against, so the reset time
 /// is read from the screen that produced the verdict rather than from the
 /// user-visible viewport (which the user can scroll).
-pub(super) fn detection_screen(target: &str) -> Option<String> {
+pub(crate) fn detection_screen(target: &str) -> Option<String> {
     let response = crate::cli::send_request(&Request {
         id: "cli:accounts:read".into(),
         method: Method::AgentRead(AgentReadParams {

@@ -527,6 +527,72 @@ pub struct SwitchOutcome {
     pub warnings: Vec<String>,
 }
 
+/// Where the switch has got to, for a caller that shows progress.
+///
+/// Derived from the action the driver is about to carry out rather than from
+/// [`SwitchMachine`]'s private phase, so the machine keeps exactly one public
+/// surface — the `Observation`/`Action` pair — and a progress line can never
+/// disagree with what is actually being done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchPhase {
+    /// Reading the agent for the first time and checking it can be switched.
+    Preflight,
+    /// Waiting for the user's answer.
+    Confirm,
+    /// Reading the agent again, after the answer, before anything is sent.
+    Recheck,
+    /// `Escape` and `/exit` on their way to Claude.
+    Exit,
+    /// Waiting for the pane to be a plain shell again.
+    AwaitShell,
+    /// The two-step relaunch under the new profile.
+    Relaunch,
+    /// Waiting for the hook to report the same conversation back.
+    AwaitSession,
+    /// Reading the relaunched process's environment and recording the account.
+    Grade,
+}
+
+impl SwitchPhase {
+    /// A line short enough for a modal, in the imperative present the rest of
+    /// the account UI uses.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Preflight => "checking the agent...",
+            Self::Confirm => "waiting for confirmation...",
+            Self::Recheck => "re-checking the agent...",
+            Self::Exit => "asking claude to exit...",
+            Self::AwaitShell => "waiting for the shell...",
+            Self::Relaunch => "resuming under the new account...",
+            Self::AwaitSession => "waiting for the conversation...",
+            Self::Grade => "verifying account...",
+        }
+    }
+}
+
+/// Which phase an action belongs to.
+///
+/// `PollAgent` is the only ambiguous one: the same action reads the agent at
+/// preflight, again after the confirmation, and once more while waiting for
+/// the resumed conversation, so the driver's own two flags disambiguate it.
+fn phase_of(action: &Action, confirmed: bool, launched: bool) -> Option<SwitchPhase> {
+    match action {
+        Action::AskConfirm(_) => Some(SwitchPhase::Confirm),
+        Action::SendKeys(_) | Action::Prompt(_) | Action::SubmitText(_) => Some(SwitchPhase::Exit),
+        Action::PollPane => Some(SwitchPhase::AwaitShell),
+        Action::Launch(_) => Some(SwitchPhase::Relaunch),
+        Action::Grade => Some(SwitchPhase::Grade),
+        Action::PollAgent => Some(match (launched, confirmed) {
+            (true, _) => SwitchPhase::AwaitSession,
+            (false, true) => SwitchPhase::Recheck,
+            (false, false) => SwitchPhase::Preflight,
+        }),
+        // A sleep belongs to whatever it is waiting for, and the end of the
+        // protocol is not a phase.
+        Action::Wait(_) | Action::Finish(_) => None,
+    }
+}
+
 /// Run the switch protocol against the local server.
 ///
 /// `confirm` is asked exactly once, before anything is sent. `launch` performs
@@ -540,13 +606,37 @@ pub fn switch_account(
     // fat `Err` on every `Result` in the loop is what clippy's
     // `result_large_err` objects to.
 ) -> Result<SwitchOutcome, Box<SwitchFailure>> {
+    switch_account_with_progress(input, confirm, launch, &mut |_| {})
+}
+
+/// [`switch_account`], reporting each phase it enters.
+///
+/// The TUI shows these in its modal, because the protocol blocks for seconds
+/// at a time and a modal that says nothing looks hung. `on_phase` is called
+/// only when the phase *changes*, and never between a decision and a send: it
+/// is a notification, not a hook a caller can act on.
+pub fn switch_account_with_progress(
+    input: SwitchInput,
+    confirm: &mut dyn FnMut(&str) -> Confirmation,
+    launch: &mut dyn FnMut(&LaunchRequest) -> Result<AppliedLine, SwitchError>,
+    on_phase: &mut dyn FnMut(SwitchPhase),
+) -> Result<SwitchOutcome, Box<SwitchFailure>> {
     let mut machine = SwitchMachine::new(input);
     let clock = Instant::now();
     let mut applied: Option<AppliedLine> = None;
     let mut warnings: Vec<String> = Vec::new();
     let mut action = machine.start();
+    let mut confirmed = false;
+    let mut launched = false;
+    let mut reported: Option<SwitchPhase> = None;
 
     loop {
+        if let Some(phase) = phase_of(&action, confirmed, launched) {
+            if reported != Some(phase) {
+                reported = Some(phase);
+                on_phase(phase);
+            }
+        }
         let observation = match action {
             Action::Finish(result) => {
                 return match *result {
@@ -555,7 +645,10 @@ pub fn switch_account(
                 };
             }
             Action::AskConfirm(text) => match confirm(&text) {
-                Confirmation::Yes => Observation::Confirmed(true),
+                Confirmation::Yes => {
+                    confirmed = true;
+                    Observation::Confirmed(true)
+                }
                 Confirmation::No => Observation::Confirmed(false),
                 Confirmation::Unavailable => Observation::ConfirmUnavailable,
             },
@@ -578,6 +671,7 @@ pub fn switch_account(
             Action::Launch(request) => match launch(&request) {
                 Ok(line) => {
                     applied = Some(line);
+                    launched = true;
                     Observation::launched(Ok(()))
                 }
                 Err(error) => Observation::launched(Err(error)),

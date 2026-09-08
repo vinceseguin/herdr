@@ -559,6 +559,8 @@ fn agent_switch_account(args: &[String]) -> std::io::Result<i32> {
 
     let input = crate::accounts::switch::SwitchInput {
         target: target.clone(),
+        // The server resolves a name, and a pane id means whatever runs there.
+        expected_name: None,
         to: profile.clone(),
         to_inspection: inspection,
         options: crate::accounts::switch::SwitchOptions {

@@ -298,6 +298,14 @@ pub enum SwitchError {
         pane_id: String,
         detail: String,
     },
+    /// The caller named the agent it meant (a TUI pinned a pane *and* the
+    /// managed name it showed the user), and the pane now holds another one.
+    /// Nothing was sent.
+    NotTheAgent {
+        pane_id: String,
+        expected: String,
+        actual: Option<String>,
+    },
     /// Not a terminal, and no `--yes`.
     ConfirmationRequired,
     Declined,
@@ -413,6 +421,19 @@ impl std::fmt::Display for SwitchError {
                 formatter,
                 "the agent in pane {pane_id} changed while the switch was being confirmed: \
                  {detail}; nothing was sent to the pane. Look at it and retry"
+            ),
+            Self::NotTheAgent {
+                pane_id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "pane {pane_id} now holds {}, not agent {expected:?}; nothing was sent to the \
+                 pane. Look at it and start the switch again",
+                match actual {
+                    Some(actual) => format!("agent {actual:?}"),
+                    None => "an agent with no name".to_string(),
+                }
             ),
             Self::ConfirmationRequired => write!(
                 formatter,
@@ -544,6 +565,7 @@ impl SwitchFailure {
             | SwitchError::ProfileLoggedOut { .. }
             | SwitchError::AgentWorking { .. }
             | SwitchError::AgentChanged { .. }
+            | SwitchError::NotTheAgent { .. }
             | SwitchError::ConfirmationRequired
             | SwitchError::Declined
             | SwitchError::AgentStillRunning { .. }
@@ -594,6 +616,14 @@ enum Phase {
 pub struct SwitchInput {
     /// What the user named on the command line, kept for messages.
     pub target: String,
+    /// The managed name the agent is expected to have, when the caller knows
+    /// it independently of `target`. A TUI addresses the pane the user
+    /// right-clicked by id — a name could have moved to another pane — but
+    /// what the user chose is *the agent that was in it*, so the first read
+    /// must find that name there or refuse before anything is asked or sent.
+    /// The CLI leaves this `None`: a name given on the command line is what
+    /// the server resolves, and a pane id names whatever runs there.
+    pub expected_name: Option<String>,
     pub to: AccountProfile,
     pub to_inspection: ProfileInspection,
     pub options: SwitchOptions,
@@ -725,6 +755,18 @@ impl SwitchMachine {
                 target: self.input.target.clone(),
             });
         };
+
+        // Before anything else: is this the agent the caller meant? A pane
+        // id says where to look, not what was there when the user chose.
+        if let Some(expected) = self.input.expected_name.as_deref() {
+            if agent.name.as_deref() != Some(expected) {
+                return self.fail(SwitchError::NotTheAgent {
+                    pane_id: agent.pane_id.clone(),
+                    expected: expected.to_string(),
+                    actual: agent.name.clone(),
+                });
+            }
+        }
 
         if agent.agent.as_deref() != Some(AGENT_LABEL) {
             return self.fail(SwitchError::NotClaude {
@@ -1256,6 +1298,7 @@ mod tests {
     fn switching(options: SwitchOptions) -> SwitchMachine {
         SwitchMachine::new(SwitchInput {
             target: "a1".to_string(),
+            expected_name: None,
             to: profile("work"),
             to_inspection: healthy(),
             options,
@@ -1270,6 +1313,7 @@ mod tests {
     fn a_usage_limit_is_named_in_the_confirmation() {
         let mut machine = SwitchMachine::new(SwitchInput {
             target: "a1".to_string(),
+            expected_name: None,
             to: profile("work"),
             to_inspection: healthy(),
             options: SwitchOptions::default(),
@@ -1509,6 +1553,65 @@ mod tests {
         let action = machine.next(0, Observation::agent(Some(unnamed)));
         assert!(matches!(error_of(&action), SwitchError::Unnamed { .. }));
         assert!(!machine.touched_pane());
+    }
+
+    /// A caller that pins a pane *and* the name it showed the user gets the
+    /// agent it meant or a refusal — never whatever happens to run there now.
+    #[test]
+    fn an_expected_name_that_is_not_on_the_pane_is_refused_before_asking() {
+        let expecting = |name: &str| {
+            SwitchMachine::new(SwitchInput {
+                target: "1:2".to_string(),
+                expected_name: Some(name.to_string()),
+                to: profile("work"),
+                to_inspection: healthy(),
+                limit: None,
+                options: SwitchOptions::default(),
+            })
+        };
+
+        // The agent that was there is still there: the protocol proceeds.
+        let mut machine = expecting("a1");
+        assert!(matches!(
+            machine.next(0, Observation::agent(Some(agent()))),
+            Action::AskConfirm(_)
+        ));
+
+        // Another named agent took the pane, or one nobody named did.
+        let mut renamed = agent();
+        renamed.name = Some("b2".to_string());
+        let mut unnamed = agent();
+        unnamed.name = None;
+        for (now_there, expected_detail) in [(renamed, "agent \"b2\""), (unnamed, "no name")] {
+            let mut machine = expecting("a1");
+            let action = machine.next(0, Observation::agent(Some(now_there)));
+            let SwitchError::NotTheAgent {
+                pane_id, expected, ..
+            } = error_of(&action)
+            else {
+                panic!("expected NotTheAgent, got {action:?}");
+            };
+            assert_eq!(pane_id, "1:2");
+            assert_eq!(expected, "a1");
+            assert!(!machine.touched_pane());
+            let message = error_of(&action).to_string();
+            assert!(message.contains(expected_detail), "{message}");
+            assert!(message.contains("nothing was sent"), "{message}");
+            // No question was asked, and nothing can be squeezed out of it.
+            assert!(matches!(
+                machine.next(1, Observation::Confirmed(true)),
+                Action::Finish(_)
+            ));
+        }
+
+        // The name is checked before the kind, so a pane that now runs
+        // another agent says which agent, not merely "not claude".
+        let mut codex = agent();
+        codex.name = Some("c1".to_string());
+        codex.agent = Some("codex".to_string());
+        let mut machine = expecting("a1");
+        let action = machine.next(0, Observation::agent(Some(codex)));
+        assert!(matches!(error_of(&action), SwitchError::NotTheAgent { .. }));
     }
 
     /// Before preflight the target is whatever the user typed; afterwards every
@@ -1766,6 +1869,7 @@ mod tests {
         blocked.status = AgentStatus::Blocked;
         let mut machine = SwitchMachine::new(SwitchInput {
             target: "a1".to_string(),
+            expected_name: None,
             to: profile("work"),
             to_inspection: healthy(),
             options: SwitchOptions::default(),
@@ -1808,6 +1912,7 @@ mod tests {
         blocked.status = AgentStatus::Blocked;
         let mut machine = SwitchMachine::new(SwitchInput {
             target: "a1".to_string(),
+            expected_name: None,
             to: profile("work"),
             to_inspection: healthy(),
             options: SwitchOptions::default(),
@@ -1878,6 +1983,7 @@ mod tests {
         blocked.status = AgentStatus::Blocked;
         let mut machine = SwitchMachine::new(SwitchInput {
             target: "a1".to_string(),
+            expected_name: None,
             to: profile("work"),
             to_inspection: healthy(),
             options: SwitchOptions::default(),
@@ -1933,6 +2039,7 @@ mod tests {
     fn a_target_profile_that_is_missing_or_logged_out_is_refused() {
         let mut machine = SwitchMachine::new(SwitchInput {
             target: "a1".to_string(),
+            expected_name: None,
             to: profile("work"),
             to_inspection: ProfileInspection {
                 dir_exists: false,
@@ -1949,6 +2056,7 @@ mod tests {
 
         let mut machine = SwitchMachine::new(SwitchInput {
             target: "a1".to_string(),
+            expected_name: None,
             to: profile("work"),
             to_inspection: ProfileInspection {
                 logged_in: false,
@@ -1966,6 +2074,7 @@ mod tests {
         // …but --force takes it, with the warning spelled out.
         let mut machine = SwitchMachine::new(SwitchInput {
             target: "a1".to_string(),
+            expected_name: None,
             to: profile("work"),
             to_inspection: ProfileInspection {
                 logged_in: false,

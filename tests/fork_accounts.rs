@@ -2122,24 +2122,87 @@ impl Tui {
             .unwrap_or_default()
     }
 
-    /// Wait until the client has written `needle`, and say what it wrote if it
+    /// What the client *wrote*, with the escape sequences that addressed it
+    /// removed.
+    ///
+    /// A terminal draws a frame as runs of styled cells separated by cursor
+    /// moves, and ratatui writes only the cells that changed, so a phrase that
+    /// is one line on screen is several runs in the stream with escapes
+    /// between them. Matching the raw bytes therefore misses text that is
+    /// plainly visible, and *which* text it misses depends on what the
+    /// previous frame happened to hold — which is how a raw match turns into a
+    /// flake on a slower machine. Every assertion below matches this instead.
+    fn visible_screen(&self) -> String {
+        visible(&self.screen())
+    }
+
+    fn contains(&self, needle: &str) -> bool {
+        self.visible_screen().contains(needle)
+    }
+
+    /// Wait until the client has shown `needle`, and say what it showed if it
     /// never does.
     fn wait_for(&self, needle: &str) {
         for _ in 0..150 {
-            if self.screen().contains(needle) {
+            if self.contains(needle) {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         panic!(
-            "the client never wrote {needle:?}; it wrote:\n{}",
-            self.screen()
+            "the client never showed {needle:?}; it wrote:\n{}",
+            self.visible_screen()
         );
     }
+}
 
-    fn contains(&self, needle: &str) -> bool {
-        self.screen().contains(needle)
+/// Strip ANSI escape sequences from a pty stream.
+///
+/// CSI (`ESC [ … final`), OSC (`ESC ] … BEL` or `ESC \`), and the two-byte
+/// escapes in between. Everything else is text.
+fn visible(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\u{1b}' {
+            out.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() || next == '@' || next == '~' {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\u{1b}' {
+                        // `ESC \` terminates a string; anything else is the
+                        // start of a new sequence this loop should not eat.
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            Some('P') | Some('X') | Some('^') | Some('_') => {
+                while let Some(next) = chars.next() {
+                    if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
     }
+    out
 }
 
 impl Drop for Tui {
@@ -2157,13 +2220,41 @@ fn right_click(tui: &mut Tui, column: u16, row: u16) {
     tui.send(&format!("\x1b[<2;{column};{row}m"));
 }
 
+/// Right-click until herdr's pane menu is actually on screen.
+///
+/// The client draws its sidebar — session name included — before it has a
+/// snapshot with a pane surface in it, so a right-click sent the moment the
+/// session name appears can land on a client that has no pane at those
+/// coordinates yet, and `open_pane_context_menu` returns without doing
+/// anything. On a loaded machine that window is wide enough to lose the click.
+/// Retrying is the honest fix: what a test wants is "the menu for this pane",
+/// not "one click", and a right-click on the same spot is idempotent — it
+/// re-opens the same menu.
+fn open_pane_menu(tui: &mut Tui, column: u16, row: u16) {
+    let menus = |tui: &Tui| tui.visible_screen().matches("Rename pane").count();
+    let before = menus(tui);
+    for _ in 0..20 {
+        right_click(tui, column, row);
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if menus(tui) > before {
+                return;
+            }
+        }
+    }
+    panic!(
+        "the pane menu never opened at ({column},{row}); the client showed:\n{}",
+        tui.visible_screen()
+    );
+}
+
 /// Right-click the pane and open the account picker on it.
 ///
 /// The pane menu's items are fixed for a focused, unlabelled pane with no
 /// agent: `Rename pane` then the account item, so one `Down` highlights it.
 fn open_account_picker(tui: &mut Tui) {
     tui.wait_for("accounts-lab");
-    right_click(tui, 80, 10);
+    open_pane_menu(tui, 80, 10);
     tui.wait_for("Start Claude as account...");
     tui.send("\x1b[B");
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -2182,7 +2273,7 @@ fn the_tui_picker_starts_claude_under_the_account_it_was_given() {
     assert!(
         tui.contains(&format!("pane {pane}")),
         "the modal names the pane it was opened on: {}",
-        tui.screen()
+        tui.visible_screen()
     );
     assert!(tui.contains(&lab.profile_dir(SECOND_PROFILE).display().to_string()));
 
@@ -2209,7 +2300,7 @@ fn the_tui_picker_starts_claude_under_the_account_it_was_given() {
     assert!(
         !agent.is_null(),
         "the picker never started an agent; the client wrote:\n{}",
-        tui.screen()
+        tui.visible_screen()
     );
     assert_eq!(agent["name"], "claude", "{agent:#?}");
     assert_eq!(agent["pane_id"].as_str(), Some(pane.as_str()));
@@ -2262,15 +2353,14 @@ fn the_pane_menu_hides_the_account_item_without_a_configured_profile() {
 
     let mut tui = Tui::attach(&lab);
     tui.wait_for("accounts-lab");
-    right_click(&mut tui, 80, 10);
-    tui.wait_for("Rename pane");
+    open_pane_menu(&mut tui, 80, 10);
     // The rest of the pane menu is on screen, so the account item's absence is
     // a fact about this menu rather than about the menu not being drawn yet.
     tui.wait_for("Close pane");
     assert!(
         !tui.contains("Start Claude as account"),
         "with no profiles the item must be absent: {}",
-        tui.screen()
+        tui.visible_screen()
     );
 }
 
@@ -2324,20 +2414,9 @@ fn the_tui_picker_refuses_a_busy_pane_and_stays_open_to_say_so() {
     );
 
     // Esc dismisses the settled modal; the pane menu is reachable again.
-    let menus_before = tui.screen().matches("Rename pane").count();
     tui.send("\x1b");
     std::thread::sleep(std::time::Duration::from_millis(300));
-    right_click(&mut tui, 80, 10);
-    for _ in 0..50 {
-        if tui.screen().matches("Rename pane").count() > menus_before {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    panic!(
-        "the pane menu never came back after Esc; the client wrote:\n{}",
-        tui.screen()
-    );
+    open_pane_menu(&mut tui, 80, 10);
 }
 
 // ---------------------------------------------------------------------------
@@ -2522,4 +2601,280 @@ fn an_agent_blocked_for_another_reason_carries_no_limit() {
         "no switch was suggested: {}",
         stderr_of(&status)
     );
+}
+
+// ---------------------------------------------------------------------------
+// PR 8: the TUI switch action.
+//
+// The same protocol `herdr agent switch-account` runs, reached from the pane
+// context menu and gated by a confirmation modal. Every test below drives a
+// real client over a pty with real mouse and key bytes, and asserts on the
+// server's answer rather than on the screen wherever the fact matters: the
+// conversation must be the *same* one before and after, the relaunched
+// process's own environment must name the new profile, a declined
+// confirmation must leave the pane byte-for-byte as it was, and an agent the
+// protocol refuses must never have been typed into.
+// ---------------------------------------------------------------------------
+
+/// Right-click the pane and open the switch picker on the agent running in it.
+///
+/// With an agent in the pane the menu is `Rename pane`, `Switch Claude
+/// account...` (the start item is withheld — the pane is occupied), then the
+/// splits, so one `Down` highlights it.
+fn open_switch_picker(tui: &mut Tui, column: u16) {
+    tui.wait_for("accounts-lab");
+    open_pane_menu(tui, column, 10);
+    tui.wait_for("Switch Claude account...");
+    assert!(
+        !tui.contains("Start Claude as account"),
+        "a pane running an agent has nothing to start: {}",
+        tui.visible_screen()
+    );
+    // The pane menu starts with `Rename pane` and grows `Swap with focused
+    // pane` when the clicked pane is not the focused one, so the switch item
+    // is one or two rows down. Counting what is on screen keeps the test
+    // independent of which pane the click landed in.
+    let mut downs = 1;
+    if tui.contains("Swap with focused pane") {
+        downs += 1;
+    }
+    for _ in 0..downs {
+        tui.send("\x1b[B");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    tui.send("\r");
+    // The lowercase title is the picker's, not the menu item's.
+    tui.wait_for("switch claude account");
+}
+
+/// Wait until `agent get <name>` reports `tokens.account == account`.
+///
+/// Lenient about the read failing: between `/exit` and the relaunch the server
+/// has released the managed name — that is exactly what `AwaitShell` waits
+/// for — so `agent.get` answers `agent_not_found` for a moment in the middle
+/// of every successful switch.
+fn wait_for_account(lab: &Lab, name: &str, account: &str, tui: &Tui) -> serde_json::Value {
+    for _ in 0..300 {
+        let response: serde_json::Value =
+            serde_json::from_str(&stdout_of(&lab.herdr(&["agent", "get", name])))
+                .unwrap_or(serde_json::Value::Null);
+        let agent = response["result"]["agent"].clone();
+        if agent["tokens"]["account"].as_str() == Some(account) {
+            return agent;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!(
+        "agent {name} never moved to account {account}; the client wrote:\n{}",
+        tui.visible_screen()
+    );
+}
+
+/// The whole point of the action: the conversation survives, and only the
+/// agent the user right-clicked is touched.
+#[test]
+fn the_tui_switch_keeps_the_conversation_and_flips_the_account() {
+    let mut lab = Lab::new("tui-sw");
+    assert!(lab.up().status.success());
+
+    let first = lab.pane_id();
+    let second = split_pane(&lab);
+    start_agent_in(&lab, "a1", &first, &[], &["--account", DEFAULT_PROFILE]);
+    start_agent_in(&lab, "a2", &second, &[], &["--account", DEFAULT_PROFILE]);
+    let sessions = [
+        (first.clone(), "a1", session_id_of(&lab, "a1")),
+        (second.clone(), "a2", session_id_of(&lab, "a2")),
+    ];
+
+    let mut tui = Tui::attach(&lab);
+    tui.wait_for("accounts-lab");
+    open_switch_picker(&mut tui, 80);
+
+    // Which pane the click landed in is a layout detail; which pane the modal
+    // is *about* is the contract, and it says so on its own title bar.
+    let visible = tui.visible_screen();
+    let targets = sessions
+        .iter()
+        .filter(|(pane, _, _)| visible.contains(&format!("pane {pane}")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets.len(),
+        1,
+        "the modal must name exactly one pane: {visible}"
+    );
+    let (target_pane, target_agent, target_session) = targets[0].clone();
+    let (other_pane, other_agent, other_session) = sessions
+        .iter()
+        .find(|(pane, _, _)| pane != &target_pane)
+        .cloned()
+        .expect("the other agent");
+    // Captured after the attach: a client attaching resizes the panes, and a
+    // reflow would look exactly like something having been typed.
+    let other_screen_before = screen(&lab, &other_pane);
+
+    assert!(
+        tui.contains("current"),
+        "the picker says where the agent is now: {visible}"
+    );
+
+    // `perso` is where it is, so the picker opens on `work`; Enter submits.
+    tui.send("\r");
+    tui.wait_for("↵ confirm");
+    assert!(
+        tui.contains("--resume"),
+        "the confirmation says the conversation is resumed: {}",
+        tui.visible_screen()
+    );
+    // Nothing has reached the pane while the question is up.
+    assert!(
+        !screen(&lab, &target_pane).contains("/exit"),
+        "the confirmation must be answered before anything is sent"
+    );
+    // An Enter on the heels of the one that submitted the picker — a double
+    // tap, a key repeat — is not an answer: the question has to have been on
+    // screen long enough to be read.
+    tui.send("\r");
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    assert!(
+        tui.contains("↵ confirm"),
+        "a yes before the question could be read must be ignored: {}",
+        tui.visible_screen()
+    );
+    assert!(
+        !screen(&lab, &target_pane).contains("/exit"),
+        "an ignored answer sends nothing"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    tui.send("\r");
+
+    let after = wait_for_account(&lab, target_agent, SECOND_PROFILE, &tui);
+    assert_eq!(
+        after["agent_session"]["value"].as_str(),
+        Some(target_session.as_str()),
+        "the same conversation before and after: {after:#?}"
+    );
+    assert_eq!(after["tokens"]["account_state"], "ok", "{after:#?}");
+    assert_eq!(after["pane_id"].as_str(), Some(target_pane.as_str()));
+
+    // The relaunched process itself agrees: new profile, resumed conversation.
+    let launch = last_launch(&lab, SECOND_PROFILE);
+    assert_eq!(
+        launch["config_dir"].as_str(),
+        lab.profile_dir(SECOND_PROFILE).to_str()
+    );
+    assert_eq!(launch["session_start_source"], "resume");
+    assert_eq!(launch["session_id"].as_str(), Some(target_session.as_str()));
+
+    let pane_screen = screen(&lab, &target_pane);
+    assert!(pane_screen.contains("/exit"), "{pane_screen}");
+    assert!(
+        pane_screen.contains(&format!("resumed {target_session}")),
+        "the stub reports the resume on screen: {pane_screen}"
+    );
+
+    // The agent next door never moved.
+    let untouched = agent_of(&lab, other_agent);
+    assert_eq!(untouched["tokens"]["account"], DEFAULT_PROFILE);
+    assert_eq!(
+        untouched["agent_session"]["value"].as_str(),
+        Some(other_session.as_str())
+    );
+    assert_eq!(
+        screen(&lab, &other_pane),
+        other_screen_before,
+        "nothing may have been typed into the other pane"
+    );
+}
+
+/// Declining the confirmation is the negative the whole modal exists for:
+/// nothing at all reaches the pane.
+#[test]
+fn the_tui_switch_confirmation_can_be_declined_without_typing_anything() {
+    let mut lab = Lab::new("tui-no");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    start_agent_in(&lab, "a1", &pane, &[], &["--account", DEFAULT_PROFILE]);
+    let before = session_id_of(&lab, "a1");
+
+    let mut tui = Tui::attach(&lab);
+    // Captured after the attach: the client's own resize reflows the pane,
+    // and only what happens *after* that is the modal's doing.
+    tui.wait_for("accounts-lab");
+    let screen_before = screen(&lab, &pane);
+
+    open_switch_picker(&mut tui, 80);
+    tui.send("\r");
+    tui.wait_for("↵ confirm");
+    tui.send("n");
+    tui.wait_for("nothing was sent to the pane");
+
+    // The pane is exactly as it was, and so is the agent.
+    assert_eq!(
+        screen(&lab, &pane),
+        screen_before,
+        "a declined switch must not type a byte"
+    );
+    let agent = agent_of(&lab, "a1");
+    assert_eq!(agent["tokens"]["account"], DEFAULT_PROFILE);
+    assert_eq!(
+        agent["agent_session"]["value"].as_str(),
+        Some(before.as_str())
+    );
+    assert!(
+        !lab.profile_dir(SECOND_PROFILE)
+            .join("last-launch.json")
+            .exists(),
+        "nothing may have been launched under the other profile"
+    );
+
+    // The picker is usable again: a refusal that reached nothing is not an
+    // outcome, so another account can be chosen from the same modal.
+    assert!(
+        tui.contains("switch account"),
+        "the picker stays on screen: {}",
+        tui.visible_screen()
+    );
+}
+
+/// An agent with no session id: `/exit` would throw the conversation away, so
+/// the protocol refuses before a byte is typed and the modal says so.
+#[test]
+fn the_tui_switch_refuses_an_agent_with_no_session_id() {
+    let mut lab = Lab::new("tui-nose");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    start_agent_in(
+        &lab,
+        "a1",
+        &pane,
+        &["FAKE_CLAUDE_NO_SESSION=1"],
+        &["--account", DEFAULT_PROFILE],
+    );
+    assert!(
+        agent_of(&lab, "a1")["agent_session"].is_null(),
+        "the stub must have reported no session id"
+    );
+
+    let mut tui = Tui::attach(&lab);
+    tui.wait_for("accounts-lab");
+    let screen_before = screen(&lab, &pane);
+
+    open_switch_picker(&mut tui, 80);
+    tui.send("\r");
+    tui.wait_for("has no Claude session id");
+
+    // No question was ever put, and nothing reached the pane.
+    assert!(
+        !tui.contains("↵ confirm"),
+        "a switch that cannot run must not ask: {}",
+        tui.visible_screen()
+    );
+    assert_eq!(
+        screen(&lab, &pane),
+        screen_before,
+        "a refusal must not type a byte"
+    );
+    assert_eq!(agent_of(&lab, "a1")["tokens"]["account"], DEFAULT_PROFILE);
 }

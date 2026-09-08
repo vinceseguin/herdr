@@ -66,6 +66,11 @@ impl ClientContextMenuOverlay {
                     agent_kind.as_deref(),
                     *accounts_available,
                 ));
+                // Fork (E9): move the Claude running here to another profile.
+                items.extend(super::account_overlay::switch_account_context_item(
+                    agent_kind.as_deref(),
+                    *accounts_available,
+                ));
                 items.extend([
                     item("Split right", Action::SplitRight),
                     item("Split down", Action::SplitDown),
@@ -481,6 +486,9 @@ impl ClientShellState {
             }
             // Fork (E9): the picker owns the pane it was opened on.
             ClientContextMenuAction::StartClaudeAs => self.open_account_picker(pane_id, outcome),
+            ClientContextMenuAction::SwitchClaudeAccount => {
+                self.open_account_switch_picker(pane_id, outcome)
+            }
             _ => {}
         }
     }
