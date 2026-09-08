@@ -2220,13 +2220,41 @@ fn right_click(tui: &mut Tui, column: u16, row: u16) {
     tui.send(&format!("\x1b[<2;{column};{row}m"));
 }
 
+/// Right-click until herdr's pane menu is actually on screen.
+///
+/// The client draws its sidebar — session name included — before it has a
+/// snapshot with a pane surface in it, so a right-click sent the moment the
+/// session name appears can land on a client that has no pane at those
+/// coordinates yet, and `open_pane_context_menu` returns without doing
+/// anything. On a loaded machine that window is wide enough to lose the click.
+/// Retrying is the honest fix: what a test wants is "the menu for this pane",
+/// not "one click", and a right-click on the same spot is idempotent — it
+/// re-opens the same menu.
+fn open_pane_menu(tui: &mut Tui, column: u16, row: u16) {
+    let menus = |tui: &Tui| tui.visible_screen().matches("Rename pane").count();
+    let before = menus(tui);
+    for _ in 0..20 {
+        right_click(tui, column, row);
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if menus(tui) > before {
+                return;
+            }
+        }
+    }
+    panic!(
+        "the pane menu never opened at ({column},{row}); the client showed:\n{}",
+        tui.visible_screen()
+    );
+}
+
 /// Right-click the pane and open the account picker on it.
 ///
 /// The pane menu's items are fixed for a focused, unlabelled pane with no
 /// agent: `Rename pane` then the account item, so one `Down` highlights it.
 fn open_account_picker(tui: &mut Tui) {
     tui.wait_for("accounts-lab");
-    right_click(tui, 80, 10);
+    open_pane_menu(tui, 80, 10);
     tui.wait_for("Start Claude as account...");
     tui.send("\x1b[B");
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -2325,8 +2353,7 @@ fn the_pane_menu_hides_the_account_item_without_a_configured_profile() {
 
     let mut tui = Tui::attach(&lab);
     tui.wait_for("accounts-lab");
-    right_click(&mut tui, 80, 10);
-    tui.wait_for("Rename pane");
+    open_pane_menu(&mut tui, 80, 10);
     // The rest of the pane menu is on screen, so the account item's absence is
     // a fact about this menu rather than about the menu not being drawn yet.
     tui.wait_for("Close pane");
@@ -2387,20 +2414,9 @@ fn the_tui_picker_refuses_a_busy_pane_and_stays_open_to_say_so() {
     );
 
     // Esc dismisses the settled modal; the pane menu is reachable again.
-    let menus_before = tui.visible_screen().matches("Rename pane").count();
     tui.send("\x1b");
     std::thread::sleep(std::time::Duration::from_millis(300));
-    right_click(&mut tui, 80, 10);
-    for _ in 0..50 {
-        if tui.visible_screen().matches("Rename pane").count() > menus_before {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    panic!(
-        "the pane menu never came back after Esc; the client wrote:\n{}",
-        tui.visible_screen()
-    );
+    open_pane_menu(&mut tui, 80, 10);
 }
 
 // ---------------------------------------------------------------------------
@@ -2607,7 +2623,7 @@ fn an_agent_blocked_for_another_reason_carries_no_limit() {
 /// splits, so one `Down` highlights it.
 fn open_switch_picker(tui: &mut Tui, column: u16) {
     tui.wait_for("accounts-lab");
-    right_click(tui, column, 10);
+    open_pane_menu(tui, column, 10);
     tui.wait_for("Switch Claude account...");
     assert!(
         !tui.contains("Start Claude as account"),
