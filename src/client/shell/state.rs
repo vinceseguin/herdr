@@ -107,6 +107,8 @@ pub(crate) struct ClientShellConfig {
     pub(super) preferences: preferences::ClientChromePreferences,
     pub(super) startup_config_diagnostic: Option<String>,
     pub(super) startup_onboarding: bool,
+    /// Fork (E9): the merged `[[accounts]]` + `profiles.toml` view.
+    pub(super) accounts: crate::accounts::profile::Profiles,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,6 +344,8 @@ pub(super) enum ClientShellOverlayKind {
     ContextMenu,
     GlobalMenu,
     Settings,
+    // Fork (E9): the account picker; see `account_overlay.rs`.
+    AccountPicker,
 }
 
 #[derive(Debug)]
@@ -581,6 +585,8 @@ pub(super) enum ClientContextMenuAction {
     Zoom,
     ToggleRightClickPassthrough,
     ClosePane,
+    // Fork (E9): open the account picker for this pane.
+    StartClaudeAs,
 }
 
 #[derive(Debug)]
@@ -602,6 +608,10 @@ pub(super) enum ClientContextMenuTarget {
         source_pane_id: Option<String>,
         has_manual_label: bool,
         right_click_passthrough: bool,
+        /// Fork (E9): the kind of managed agent running here, if any.
+        agent_kind: Option<String>,
+        /// Fork (E9): account profiles this client can offer for this pane.
+        accounts_available: usize,
     },
 }
 
@@ -640,6 +650,8 @@ pub(super) enum ClientShellOverlay {
     ContextMenu(ClientContextMenuOverlay),
     GlobalMenu(ClientGlobalMenuOverlay),
     Settings(ClientSettingsOverlay),
+    // Fork (E9): see `account_overlay.rs`.
+    AccountPicker(account_overlay::ClientAccountPickerOverlay),
 }
 
 impl ClientShellOverlay {
@@ -658,6 +670,7 @@ impl ClientShellOverlay {
             Self::ContextMenu(_) => ClientShellOverlayKind::ContextMenu,
             Self::GlobalMenu(_) => ClientShellOverlayKind::GlobalMenu,
             Self::Settings(_) => ClientShellOverlayKind::Settings,
+            Self::AccountPicker(_) => ClientShellOverlayKind::AccountPicker,
         }
     }
 }

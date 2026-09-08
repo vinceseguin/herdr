@@ -23,7 +23,7 @@ macro_rules! println {
 }
 
 mod account;
-mod agent;
+pub(crate) mod agent;
 mod api;
 mod completion;
 mod fleet;

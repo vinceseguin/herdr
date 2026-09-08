@@ -1334,6 +1334,10 @@ impl ClientShellState {
             }
             return;
         }
+        // Fork (E9): the account picker.
+        if self.route_account_picker_mouse(mouse.kind, point, outcome) {
+            return;
+        }
         if matches!(
             self.overlay,
             Some(

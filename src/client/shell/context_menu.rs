@@ -50,6 +50,8 @@ impl ClientContextMenuOverlay {
                 source_pane_id,
                 has_manual_label,
                 right_click_passthrough,
+                agent_kind,
+                accounts_available,
                 ..
             } => {
                 let mut items = vec![item("Rename pane", Action::RenamePane)];
@@ -59,6 +61,11 @@ impl ClientContextMenuOverlay {
                 if source_pane_id.is_some() {
                     items.push(item("Swap with focused pane", Action::SwapWithFocusedPane));
                 }
+                // Fork (E9): start Claude here under a chosen account profile.
+                items.extend(super::account_overlay::start_claude_context_item(
+                    agent_kind.as_deref(),
+                    *accounts_available,
+                ));
                 items.extend([
                     item("Split right", Action::SplitRight),
                     item("Split down", Action::SplitDown),
@@ -152,13 +159,26 @@ impl ClientShellState {
             .focused_pane_id
             .clone()
             .filter(|focused| focused != &pane_id);
+        // Fork (E9): the account item needs the pane's agent and how many
+        // profiles this client can offer for the endpoint it is attached to.
+        let agent_kind = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.pane_id == pane_id && agent.name.is_some())
+            .and_then(|agent| agent.agent.clone());
+        let accounts_available = self.accounts_available_for(&self.active_endpoint_id);
+        let workspace_id = pane.workspace_id.clone();
+        let has_manual_label = pane.label.is_some();
+        let right_click_passthrough = pane.right_click_passthrough;
         self.overlay = Some(ClientShellOverlay::ContextMenu(ClientContextMenuOverlay {
             target: ClientContextMenuTarget::Pane {
                 pane_id,
-                workspace_id: pane.workspace_id.clone(),
+                workspace_id,
                 source_pane_id,
-                has_manual_label: pane.label.is_some(),
-                right_click_passthrough: pane.right_click_passthrough,
+                has_manual_label,
+                right_click_passthrough,
+                agent_kind,
+                accounts_available,
             },
             x,
             y,
@@ -463,6 +483,8 @@ impl ClientShellState {
             ClientContextMenuAction::ClosePane => {
                 self.push_endpoint_method(Method::PaneClose(PaneTarget { pane_id }), outcome)
             }
+            // Fork (E9): the picker owns the pane it was opened on.
+            ClientContextMenuAction::StartClaudeAs => self.open_account_picker(pane_id, outcome),
             _ => {}
         }
     }
