@@ -623,6 +623,10 @@ impl ClientShellState {
         if self.route_worktree_overlay_key(key, outcome) {
             return;
         }
+        // Fork (E9): the account picker.
+        if self.route_account_picker_key(key, outcome) {
+            return;
+        }
         if matches!(self.overlay, Some(ClientShellOverlay::Navigator(_))) {
             let (code, modifiers) = crate::config::normalize_key_combo((key.code, key.modifiers));
             let search_focused = matches!(

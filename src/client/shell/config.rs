@@ -142,7 +142,23 @@ impl ClientShellConfig {
             preferences: preferences::ClientChromePreferences::default(),
             startup_config_diagnostic: None,
             startup_onboarding: false,
+            // Fork (E9): filled by `with_accounts` on the one path that
+            // loads a config from disk; see that builder.
+            accounts: crate::accounts::profile::Profiles::default(),
         }
+    }
+
+    /// Fork (E9): resolve `[[accounts]]` and `accounts/profiles.toml` into the
+    /// one merged view the picker offers.
+    ///
+    /// A builder rather than part of [`ClientShellConfig::from_config`] because
+    /// resolving reads the profile store from the config directory, and
+    /// `from_config` is what unit tests call with a `Config::default()`; those
+    /// must not depend on whichever profiles the developer running them has.
+    /// Config *reloads* refresh it through `apply_live_config`.
+    pub(crate) fn with_accounts(mut self, config: &Config) -> Self {
+        self.accounts = crate::accounts::profile::load_profiles(config).0;
+        self
     }
 
     pub(crate) fn with_startup_config_diagnostic(mut self, diagnostic: Option<String>) -> Self {
@@ -325,6 +341,11 @@ impl ClientShellConfig {
                 self.right_click_passthrough_modifiers = ui.right_click_passthrough_modifiers();
                 self.redraw_on_focus_gained = ui.redraw_on_focus_gained;
             }
+        }
+
+        // Fork (E9): the picker offers what the merged profile view holds.
+        if !invalid_section("accounts") {
+            self.accounts = crate::accounts::profile::load_profiles(config).0;
         }
 
         if !invalid_section("theme") {

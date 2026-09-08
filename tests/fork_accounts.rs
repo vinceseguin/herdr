@@ -2026,3 +2026,316 @@ fn switch_account_interrupts_a_working_agent_only_with_the_flag() {
     assert!(screen.contains(&format!("resumed {before}")), "{screen}");
     assert_eq!(agent_of(&lab, "a1")["tokens"]["account"], SECOND_PROFILE);
 }
+
+// ---- PR 7: the TUI account picker, driven through a real pty ----
+
+/// The client shell attached to the lab in a pty, with everything it wrote.
+///
+/// The picker is reached by right-clicking a pane, so the only honest test of
+/// it goes through the same path a user does: a real terminal, real mouse
+/// sequences, real keys. The reader thread keeps the pty drained so herdr
+/// never blocks on a full buffer.
+struct Tui {
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    writer: Box<dyn std::io::Write + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    output: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+impl Tui {
+    fn attach(lab: &Lab) -> Self {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 36,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+        command.arg("--session");
+        command.arg(support::accounts_lab::SESSION);
+        command.arg("client");
+        command.env("XDG_CONFIG_HOME", lab.root.join("xdg"));
+        command.env("XDG_RUNTIME_DIR", lab.runtime_dir());
+        command.env("XDG_STATE_HOME", lab.root.join("state"));
+        command.env("XDG_DATA_HOME", lab.root.join("data"));
+        command.env("XDG_CACHE_HOME", lab.root.join("cache"));
+        command.env(
+            "PATH",
+            format!(
+                "{}:{}",
+                lab.root.join("bin").display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+        command.env("CLAUDE_CONFIG_DIR", lab.ambient_dir());
+        command.env("HERDR_BIN", env!("CARGO_BIN_EXE_herdr"));
+        command.env("HERDR_DISABLE_SOUND", "1");
+        command.env("TERM", "xterm-256color");
+        command.env_remove("HERDR_SOCKET_PATH");
+        command.env_remove("HERDR_CLIENT_SOCKET_PATH");
+        command.env_remove("HERDR_ENV");
+        command.env_remove("HERDR_SESSION");
+        let child = pair.slave.spawn_command(command).expect("spawn the client");
+        support::register_spawned_herdr_pid(child.process_id());
+        drop(pair.slave);
+
+        let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = std::sync::Arc::clone(&output);
+        let mut reader = pair.master.try_clone_reader().expect("pty reader");
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut chunk = [0_u8; 8192];
+            while let Ok(read) = reader.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                if let Ok(mut sink) = sink.lock() {
+                    sink.push_str(&String::from_utf8_lossy(&chunk[..read]));
+                }
+            }
+        });
+        let writer = pair.master.take_writer().expect("pty writer");
+        Self {
+            _master: pair.master,
+            writer,
+            child,
+            output,
+        }
+    }
+
+    fn send(&mut self, bytes: &str) {
+        use std::io::Write as _;
+        self.writer
+            .write_all(bytes.as_bytes())
+            .expect("write to the client");
+        self.writer.flush().expect("flush the client");
+    }
+
+    fn screen(&self) -> String {
+        self.output
+            .lock()
+            .map(|output| output.clone())
+            .unwrap_or_default()
+    }
+
+    /// Wait until the client has written `needle`, and say what it wrote if it
+    /// never does.
+    fn wait_for(&self, needle: &str) {
+        for _ in 0..150 {
+            if self.screen().contains(needle) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!(
+            "the client never wrote {needle:?}; it wrote:\n{}",
+            self.screen()
+        );
+    }
+
+    fn contains(&self, needle: &str) -> bool {
+        self.screen().contains(needle)
+    }
+}
+
+impl Drop for Tui {
+    fn drop(&mut self) {
+        let pid = self.child.process_id();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        support::unregister_spawned_herdr_pid(pid);
+    }
+}
+
+/// An SGR right-click, press and release, at 1-based `(column, row)`.
+fn right_click(tui: &mut Tui, column: u16, row: u16) {
+    tui.send(&format!("\x1b[<2;{column};{row}M"));
+    tui.send(&format!("\x1b[<2;{column};{row}m"));
+}
+
+/// Right-click the pane and open the account picker on it.
+///
+/// The pane menu's items are fixed for a focused, unlabelled pane with no
+/// agent: `Rename pane` then the account item, so one `Down` highlights it.
+fn open_account_picker(tui: &mut Tui) {
+    tui.wait_for("accounts-lab");
+    right_click(tui, 80, 10);
+    tui.wait_for("Start Claude as account...");
+    tui.send("\x1b[B");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    tui.send("\r");
+    tui.wait_for("start claude as account");
+}
+
+#[test]
+fn the_tui_picker_starts_claude_under_the_account_it_was_given() {
+    let mut lab = Lab::new("tui-pick");
+    assert!(lab.up().status.success());
+    let pane = lab.pane_id();
+
+    let mut tui = Tui::attach(&lab);
+    open_account_picker(&mut tui);
+    assert!(
+        tui.contains(&format!("pane {pane}")),
+        "the modal names the pane it was opened on: {}",
+        tui.screen()
+    );
+    assert!(tui.contains(&lab.profile_dir(SECOND_PROFILE).display().to_string()));
+
+    // `perso` is the default and starts selected, so one `Down` picks `work`.
+    tui.send("\x1b[B");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    tui.send("\r");
+
+    // The agent the picker started, seen through the API rather than the screen.
+    let mut agent = serde_json::Value::Null;
+    for _ in 0..200 {
+        let listed = json_of(&lab.herdr(&["agent", "list"]));
+        if let Some(found) = listed["result"]["agents"]
+            .as_array()
+            .and_then(|agents| agents.first())
+        {
+            if found["tokens"]["account"].as_str().is_some() {
+                agent = found.clone();
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        !agent.is_null(),
+        "the picker never started an agent; the client wrote:\n{}",
+        tui.screen()
+    );
+    assert_eq!(agent["name"], "claude", "{agent:#?}");
+    assert_eq!(agent["pane_id"].as_str(), Some(pane.as_str()));
+    assert_eq!(agent["tokens"]["account"], SECOND_PROFILE, "{agent:#?}");
+    assert_eq!(agent["tokens"]["account_state"], "ok", "{agent:#?}");
+
+    // And the launched process itself agrees.
+    let launch = last_launch(&lab, SECOND_PROFILE);
+    assert_eq!(
+        launch["config_dir"].as_str(),
+        lab.profile_dir(SECOND_PROFILE).to_str()
+    );
+    assert!(
+        !lab.profile_dir(DEFAULT_PROFILE)
+            .join("last-launch.json")
+            .exists(),
+        "the default profile must not have been launched"
+    );
+}
+
+#[test]
+fn the_pane_menu_hides_the_account_item_without_a_configured_profile() {
+    let mut lab = Lab::new("tui-none");
+    assert!(lab.up().status.success());
+
+    // Take the profiles out of the lab's config before the client starts, so
+    // the menu is built from a config with no `[[accounts]]` at all. The lab
+    // writes one config per app directory (`herdr` and `herdr-dev`, because a
+    // debug build reads the second); strip every one of them, or the answer
+    // depends on which channel the test binary was built for.
+    let mut stripped = 0;
+    for app in ["herdr", "herdr-dev"] {
+        let config = lab.root.join("xdg").join(app).join("config.toml");
+        let Ok(text) = std::fs::read_to_string(&config) else {
+            continue;
+        };
+        let trimmed = text
+            .split("[[accounts]]")
+            .next()
+            .expect("config before the accounts section")
+            .to_owned();
+        assert_ne!(
+            trimmed, text,
+            "{app}/config.toml must have declared profiles"
+        );
+        std::fs::write(&config, &trimmed).expect("rewrite the lab config");
+        stripped += 1;
+    }
+    assert!(stripped > 0, "the lab wrote no config to strip");
+
+    let mut tui = Tui::attach(&lab);
+    tui.wait_for("accounts-lab");
+    right_click(&mut tui, 80, 10);
+    tui.wait_for("Rename pane");
+    // The rest of the pane menu is on screen, so the account item's absence is
+    // a fact about this menu rather than about the menu not being drawn yet.
+    tui.wait_for("Close pane");
+    assert!(
+        !tui.contains("Start Claude as account"),
+        "with no profiles the item must be absent: {}",
+        tui.screen()
+    );
+}
+
+/// The failure path through the same pty: a pane with something in the
+/// foreground is refused before a byte is typed, the modal says so and stays
+/// open, nothing is started, and Esc dismisses it.
+#[test]
+fn the_tui_picker_refuses_a_busy_pane_and_stays_open_to_say_so() {
+    let mut lab = Lab::new("tui-busy");
+    assert!(lab.up().status.success());
+    let pane = lab.pane_id();
+
+    let mut tui = Tui::attach(&lab);
+    open_account_picker(&mut tui);
+
+    // Occupy the pane under the modal, through the API: the picker must
+    // re-check the pane when Enter lands, not when the menu opened.
+    let busy = lab.herdr(&["pane", "send-text", &pane, "sleep 30\r"]);
+    assert!(busy.status.success(), "{}", stderr_of(&busy));
+    let mut taken = false;
+    for _ in 0..40 {
+        let info = json_of(&lab.herdr(&["pane", "process-info", "--pane", &pane]));
+        let group = info["result"]["process_info"]["foreground_process_group_id"].as_u64();
+        let shell = info["result"]["process_info"]["shell_pid"].as_u64();
+        if group.is_some() && group != shell {
+            taken = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(taken, "the pane never became busy");
+
+    tui.send("\x1b[B");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    tui.send("\r");
+    tui.wait_for("is not at its shell prompt");
+    tui.wait_for("close");
+
+    let listed = json_of(&lab.herdr(&["agent", "list"]));
+    assert_eq!(
+        listed["result"]["agents"]
+            .as_array()
+            .map(|agents| agents.len())
+            .unwrap_or(0),
+        0,
+        "nothing may have been started: {listed:#?}"
+    );
+    assert!(
+        !screen(&lab, &pane).contains("CLAUDE_CONFIG_DIR="),
+        "nothing may have been typed into the pane"
+    );
+
+    // Esc dismisses the settled modal; the pane menu is reachable again.
+    let menus_before = tui.screen().matches("Rename pane").count();
+    tui.send("\x1b");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    right_click(&mut tui, 80, 10);
+    for _ in 0..50 {
+        if tui.screen().matches("Rename pane").count() > menus_before {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!(
+        "the pane menu never came back after Esc; the client wrote:\n{}",
+        tui.screen()
+    );
+}

@@ -158,6 +158,8 @@ fn run_client_with_mode(
         };
     let shell_config = client_rendered_shell.then(|| {
         shell::ClientShellConfig::from_config(&loaded_config.config)
+            // Fork (E9): the account profiles the pane menu can offer.
+            .with_accounts(&loaded_config.config)
             .with_startup_config_diagnostic(startup_config_diagnostic)
             .with_startup_onboarding(loaded_config.config.should_show_onboarding())
             .with_keybinding_source(keybinding_source)
@@ -2027,6 +2029,9 @@ async fn run_client_loop(
                         }
                         let (effects, notification_repaint) = shell.tick_notifications(now);
                         outcome.repaint |= notification_repaint | shell.tick_copy_feedback(now);
+                        // Fork (E9): fold the account launch worker's progress
+                        // into the picker overlay.
+                        outcome.repaint |= shell.tick_account_picker();
                         let frame = outcome
                             .repaint
                             .then(|| shell.compose(state.reported_size.0, state.reported_size.1))

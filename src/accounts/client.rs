@@ -242,6 +242,16 @@ impl AppliedLine {
         self.graded = true;
     }
 
+    /// The note [`Drop`] would print, handed to a caller that has somewhere
+    /// better to put it than stderr — a TUI modal, say, where an `eprintln!`
+    /// would land on top of the rendered screen and be lost. Taking it
+    /// disarms the print, so the warning is delivered exactly once, and the
+    /// caller must show it: the pane is still holding the exported line.
+    pub fn take_note(mut self) -> String {
+        self.graded = true;
+        stranded_line_note(&self.plan)
+    }
+
     /// Grade the launch and record it. Called once `agent.start` has reported
     /// the agent ready; taking `self` is what disarms the notice above.
     pub fn finish(mut self) -> LaunchOutcome {
@@ -267,20 +277,29 @@ impl AppliedLine {
     }
 }
 
+/// What a pane is left holding when a launch fails after the line landed.
+///
+/// One wording, whether it is printed to a CLI's stderr or folded into a TUI
+/// modal: the shell keeps the variable until it exits, so the next `claude`
+/// started there — by hand, or by a `--account none` start — uses it.
+fn stranded_line_note(plan: &LaunchPlan) -> String {
+    format!(
+        "{} was already exported in pane {} when the start failed; that shell still points at \
+         {:?} (account {:?}) until it exits, so anything started there — including a later \
+         `--account none` start — will use it.",
+        plan.profile.agent.config_dir_env_var(),
+        plan.pane_id,
+        plan.expected_config_dir,
+        plan.profile.name,
+    )
+}
+
 impl Drop for AppliedLine {
     fn drop(&mut self) {
         if self.graded {
             return;
         }
-        eprintln!(
-            "note: {} was already exported in pane {} when the start failed; that shell still \
-             points at {:?} (account {:?}) until it exits, so anything started there — including \
-             a later `--account none` start — will use it.",
-            self.plan.profile.agent.config_dir_env_var(),
-            self.plan.pane_id,
-            self.plan.expected_config_dir,
-            self.plan.profile.name,
-        );
+        eprintln!("note: {}", stranded_line_note(&self.plan));
     }
 }
 

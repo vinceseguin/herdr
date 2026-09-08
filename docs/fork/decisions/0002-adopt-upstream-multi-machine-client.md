@@ -81,6 +81,37 @@ Option 3.
     `src/update.rs` and `src/app/mod.rs` (the fork-channel guard), and in
     `tests/api_ping.rs` / `tests/cli/**` (channel-aware version assertions via
     `support::build_version()`).
+  - **Amendment, 2026-09-07 (E9 PR 7).** `src/client/**` still takes
+    upstream's side, with **one carve-out**: the fork's Claude-account picker
+    keeps all of its logic in two **fork-owned** files that upstream will never
+    have — `src/client/shell/account_overlay.rs` (state, filtering, key and
+    mouse routing, the launch worker) and
+    `src/client/shell/account_overlay_render.rs` (drawing; a child module of
+    `overlays` so it can use the private modal chrome `panel`/`popup`/`row`/
+    `button`/`contrast`). Keep the fork's side for both. Every other client
+    file carries a single adjacent delegating line that a sync agent
+    **re-applies onto upstream's version** from this list alone. In merge
+    order:
+
+    | File | Re-apply |
+    | --- | --- |
+    | `src/client/shell.rs` | `mod account_overlay;` in the module list |
+    | `src/client/shell/state.rs` | `ClientShellOverlayKind::AccountPicker`; `ClientContextMenuAction::StartClaudeAs`; `ClientContextMenuTarget::Pane` fields `agent_kind: Option<String>` and `accounts_available: usize`; `ClientShellOverlay::AccountPicker(account_overlay::ClientAccountPickerOverlay)` and its `kind()` arm; `ClientShellConfig.accounts: crate::accounts::profile::Profiles` |
+    | `src/client/shell/config.rs` | `accounts: Profiles::default()` in `from_config`; the `with_accounts(&Config)` builder; the `if !invalid_section("accounts")` refresh in `apply_live_config` |
+    | `src/client/shell/context_menu.rs` | the two extra bindings + `items.extend(super::account_overlay::start_claude_context_item(…))` in the `Pane` arm of `items()`; in `open_pane_context_menu` the two lines `let agent_kind = super::account_overlay::pane_agent_kind(snapshot, &pane_id);` and `let accounts_available = self.accounts_available_for(&self.active_endpoint_id);` plus the two fields in the `Pane` target; the `StartClaudeAs => self.open_account_picker(pane_id, outcome)` arm |
+    | `src/client/shell/overlays.rs` | `mod account_overlay_render;`; the `ClientShellOverlay::AccountPicker(v)` render arm |
+    | `src/client/shell/overlay_input.rs` | `if self.route_account_picker_key(key, outcome) { return; }` after the worktree router |
+    | `src/client/shell/mouse.rs` | `if self.route_account_picker_mouse(mouse.kind, point, outcome) { return; }` before the worktree overlay arm |
+    | `src/client/mod.rs` | `outcome.repaint \|= shell.tick_account_picker();` next to `tick_copy_feedback` in the `Timer` arm |
+
+    The picker's row and search hit rectangles ride on `OverlayRender`'s
+    existing `worktree_rows` / `worktree_search` fields rather than new ones,
+    because `composition.rs` copies those into the hit map for every overlay
+    and only the matching overlay's router ever reads them — that is what keeps
+    `composition.rs` and `ShellHitMap` out of this list. `src/cli.rs` is
+    already "take both"; its E9 line is `pub(crate) mod agent;`, so the picker's
+    worker can call the one `start_managed_agent` the CLI uses instead of a
+    second copy of the `agent.start` retry. E9 PR 8 extends this table.
   - E1's three hooks in `src/remote/attach.rs` (`pub(crate)` visibility on the
     ssh stdio bridge and discovery, `SshStdioBridge::start_with(…,
     BridgeErrorSink)`, `local_forward_socket_path_scoped`,
