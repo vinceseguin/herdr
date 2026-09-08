@@ -997,7 +997,8 @@ mod tests {
 
     #[test]
     fn inspecting_a_missing_directory_reports_everything_absent() {
-        let dir = temp_dir("missing").join("gone");
+        let root = temp_dir("missing");
+        let dir = root.join("gone");
         let inspection = inspect_dir(&dir, InspectOptions::health());
         assert!(!inspection.dir_exists);
         assert!(!inspection.logged_in);
@@ -1005,6 +1006,7 @@ mod tests {
         assert_eq!(inspection.credentials_mode_ok, None);
         assert!(inspection.broken_links.is_empty());
         assert_eq!(inspection.identity, None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
