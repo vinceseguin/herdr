@@ -481,8 +481,13 @@ Because it is an ordinary token it travels everywhere for free:
 
 ```toml
 [ui.sidebar.agents.rows_by_agent]
-claude = [["state_icon", "workspace", "tab"], ["agent", "$account", "$account_state"]]
+claude = [["state_icon", "state_text", "workspace", "tab"], ["agent", "$account", "$account_state"]]
 ```
+
+`state_text` is in there for [usage limits](#usage-limits): it is the token
+`herdr account watch`'s label replaces. Drop it if you do not want a status
+word, and the account tokens still render — you just lose the `usage limit`
+badge.
 
 **`herdr fleet status`** grows an `ACCOUNT` column when any agent reports one:
 
@@ -733,8 +738,12 @@ While it runs, a limited agent carries:
 }
 ```
 
-`state_labels.blocked` replaces the status word in the sidebar row, so with the
-`rows_by_agent` snippet above the row reads `usage limit` instead of `blocked`.
+`state_labels.blocked` replaces the **`state_text`** token in the sidebar row,
+so with the `rows_by_agent` snippet above the row reads `usage lim… ·
+accounts-lab` where it used to read `blocked · accounts-lab`. A row that does
+not include `state_text` shows no status word and therefore no label — the
+`$account_state` token still flips to `limited`, which is the fact the badge is
+made of.
 
 **It polls `agent.list`; it does not subscribe to status events.** That
 subscription is per pane on a stock server, so covering every Claude agent

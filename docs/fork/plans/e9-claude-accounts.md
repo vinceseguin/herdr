@@ -2238,6 +2238,14 @@ below are the deviations from the prose above.
   logged_out` is vocabulary nothing currently writes; and `HOOK_FILE` is
   `herdr-agent-state.ps1` under `#[cfg(windows)]`, which the guide now names so
   the doc-contract test passes on Windows too.
+- **Correction from the end-to-end run (follow-up commit).** The guide's
+  `[ui.sidebar.agents.rows_by_agent]` snippet omitted `state_text`, and the
+  page then claimed the row would read `usage limit`. It cannot:
+  `agent_sidebar.rs` folds `state_labels[<status>]` into the **`state_text`**
+  token, so a row without it shows no status word and no label. Driven live in
+  the lab: with the original snippet the sidebar read `a1 · perso · limited`
+  and nothing else; with `state_text` added it read `usage lim… · accounts…`.
+  The snippet now carries `state_text` and the claim names the token.
 - **Evidence captured for the guide** (accounts lab, isolated
   `XDG_CONFIG_HOME`, fake `claude`): `account list|status|add --dry-run|add
   --json|remove|default|login`, `agent start --account work` and the
