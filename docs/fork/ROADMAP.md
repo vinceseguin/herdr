@@ -633,55 +633,94 @@ just a Claude config directory with its own `.credentials.json` and
   config_dir = "~/.claude-work"
   ```
 
-  `herdr account list|add <name> [--config-dir <path>]|login <name>|status
-  [<name>]|default <name>` — `add` creates the profile directory and seeds it
-  from the default profile (shared `projects/` transcripts so `--resume` works
-  from any account, shared hooks/skills/plugins/settings; **private**
-  `.credentials.json`, `.claude.json` and caches — the exact share list is a
-  plan decision verified against the installed Claude Code); `login` runs
-  `claude auth login` in that directory in a pane; `status` reads each
-  profile's `oauthAccount` (email, plan) without printing tokens. Profiles
-  are per host: credentials never leave the machine the agent runs on.
-- **Choose at start.** `herdr agent start --account <name>` and the TUI agent
-  launcher (a picker or a `[keys]` binding, following the existing dialog
-  language) launch Claude Code with that profile's `CLAUDE_CONFIG_DIR`. The
-  launch stays client-side and stock-server compatible: the pane shell
-  command is prefixed with the environment assignment (per-shell syntax via
-  `crate::platform::interactive_shell_command`), or `agent.start` gains an
-  **optional** `env`/`account` field that older servers ignore — the plan
-  proves which. Defaults resolve `agent` → workspace → host → the profile
-  marked `default`.
-- **See it.** Every Claude agent shows its account (name, and a warning
-  badge when the profile is logged out or rate-limited) in the sidebar,
-  `herdr agent list`, `herdr fleet status --json` and, through E3/E4, the
-  phone. The account is a runtime fact recorded when the agent is launched
-  (client-local metadata keyed by the agent's resume session) and confirmed
-  by reading the process environment in `src/platform/` where the OS allows.
+  **As built:** `herdr account list|add|remove|default|status|login|watch`,
+  and profiles come from two merged sources — `[[accounts]]` in `config.toml`
+  (herdr never rewrites it) plus a CLI-managed `<config>/accounts/profiles.toml`
+  that `add`, `remove` and `default` write. `add` creates the profile directory
+  (`0700`) and seeds it from an existing profile: `projects todos skills
+  plugins commands agents CLAUDE.md history.jsonl` are **shared by symlink**
+  (so `--resume` works from any account); `settings.json` and `.claude.json`
+  are **copied** — not shared, because Claude Code rewrites them atomically and
+  would replace a symlink — with `.claude.json`'s `oauthAccount` and any
+  `*apikey*`/`*token*`/`*credential*`/`*secret*` key removed; and
+  `.credentials.json`, `statsig/`, `shell-snapshots/`, `debug/`, `cache/`,
+  `ide/` are **never touched**, so a new profile is logged out until
+  `herdr account login`. `login` types the profile's `CLAUDE_CONFIG_DIR` export
+  and `claude auth login` into a pane at its prompt; `status` reads each
+  profile's `oauthAccount` (email, organization, plan) without ever reading a
+  credentials file. Profiles are per host: credentials never leave the machine
+  the agent runs on.
+- **Choose at start.** `herdr agent start --account <name>` and a TUI picker
+  (`Start Claude as account...` on the pane context menu, following the
+  existing modal language) launch Claude Code with that profile's
+  `CLAUDE_CONFIG_DIR`. **As built:** the launch is client-side and stock-server
+  compatible as a **two-step** sequence — the profile's assignment is typed
+  into the pane's shell with `pane.send_text` in that shell's own syntax
+  (eight families; an unrecognised shell or a directory the shell cannot quote
+  is a hard error, never a silent launch), then the ordinary `agent.start`
+  types `claude` and inherits it. The optional `agent.start` field the roadmap
+  allowed was **rejected**: an older server would ignore it and report success,
+  which the stable endpoint contract forbids. Defaults resolve `--account` →
+  the profile marked `default` → a single configured profile → none;
+  `--account none` opts out. Workspace- and host-level defaults are a
+  follow-up (`[accounts.defaults]` is reserved and rejected with a diagnostic).
+- **See it.** Every Claude agent shows its account in the sidebar,
+  `herdr agent list`, `herdr fleet status` (an `ACCOUNT` column) and
+  `--json`, and through E3/E4 the phone. **As built:** the account is a
+  runtime fact recorded on the **server** as `pane.report_metadata` tokens —
+  `account` and `account_state ∈ {ok, unverified, mismatch, limited,
+  logged_out}`, `source = "fork:accounts"`,
+  `applies_to_source = "herdr:claude"` — not client-local metadata; a client
+  ledger was rejected because a server-restart resume relaunches under the
+  default profile and the ledger would then show the wrong account. The
+  sidebar renders them through the existing `$account` / `$account_state`
+  token path. `ok` requires reading the launched process's own environment
+  (`/proc/<pid>/environ`, Linux only); elsewhere the honest answer is
+  `unverified`, and an environment naming another directory is `mismatch`.
+  Tokens are in-memory on the server, so a restart forgets the account rather
+  than showing a wrong one.
 - **Switch mid-session.** `herdr agent switch-account <pane> <name>` and a
   TUI action: capture the agent's Claude session id (already tracked for
   resume), ask Claude Code to exit cleanly, relaunch `claude --resume <id>`
   under the new profile in the same pane, and verify the transcript resumed.
   Read is safe / control is explicit: the switch is a confirmed action and
-  never runs automatically.
-- **Limit awareness.** A `src/detect/manifests/claude.toml` rule (evidence
-  captured with `herdr agent read --source detection`) recognises Claude
-  Code's usage-limit screen as a distinct blocked reason (`usage_limit`) so
-  the agent sorts blocked-first with a "switch account" hint; the reset time,
-  when shown, is surfaced. No auto-switch in v1.
+  never runs automatically. **As built:** the agent is never killed; exit
+  codes are `0` switched, `2` refused before a byte reached the pane, `1` the
+  protocol had started and the message says what the pane holds.
+- **Limit awareness.** A `src/detect/manifests/claude.toml` rule recognises
+  Claude Code's usage-limit screen as a distinct blocked reason
+  (`usage_limit`, region `after_last_horizontal_rule`) so the agent sorts
+  blocked-first; `herdr account status` prints a "switch account" hint naming
+  the command, and the reset time, when shown, is surfaced. The opt-in
+  `herdr account watch` labels limited agents in the sidebar
+  (`state_labels.blocked = "usage limit"`, `account_state = limited`) with
+  **leased** tokens, so a watcher that stops cannot strand a badge. No
+  auto-switch in v1. **Caveat as built:** the rule ships from a
+  *reconstructed* fixture — a real usage-limit screen needs a rate-limited
+  account, which no local lab can produce — so it is proven not to fire on
+  healthy screens and is **not** proven to fire on the real one. The live
+  checklist is in `tests/fixtures/fork/README.md` and
+  `docs/fork/accounts.md`.
 - Docs in `docs/fork/accounts.md`; tests: pure config/profile-resolution
   units, launch-command construction per shell, the switch state machine on
   `AppState::test_new()`, and a real-server validation that starts two fake
   `claude` stubs under two throwaway profile directories and switches one.
 
 **Depends on:** E0 (phone-side display and switch action: E7).
-**Open decisions (default in bold):** (a) profile layout — **separate
-`CLAUDE_CONFIG_DIR` per account sharing transcripts via symlinks** vs one
-directory with credentials swapped (would switch every running agent at
-once); (b) how the env reaches the agent — **client-side shell prefix, stock
-servers unchanged** vs an optional `agent.start` field; (c) scope of
-accounts — **Claude only in v1**, other agents' config-dir variables listed in
-`src/integration/env.rs` later; (d) limit handling — **detect and suggest**
-vs auto-switch on limit.
+**Decisions (resolved):** (a) profile layout — separate `CLAUDE_CONFIG_DIR`
+per account sharing transcripts via symlinks; (b) how the env reaches the
+agent — client-side, two-step, stock servers unchanged (the optional
+`agent.start` field was rejected on the endpoint contract); (c) scope —
+Claude only in v1, `AccountAgent` append-only; (d) limit handling — detect and
+suggest, never auto-switch. Recorded with their alternatives and consequences
+in [ADR 0003](./decisions/0003-claude-accounts-as-profile-dirs.md); the user
+guide is [`accounts.md`](./accounts.md).
+**Downstream constraints:** E4 reads `agents[].tokens.account` and
+`agents[].tokens.account_state` from the fleet report and must treat an
+unknown `account_state` value and an unknown `FleetChange` kind
+(`agent_metadata`) as things to show verbatim or skip, never to guess; E7's
+phone switch action must call the same stock methods the CLI does, routed per
+host, and must keep the confirmation.
 
 ---
 

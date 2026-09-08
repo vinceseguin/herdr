@@ -19,6 +19,7 @@ architecture decisions in [`decisions/`](./decisions/).
 | Console | upstream's multi-machine client (`herdr machine add`, `list`, …; machine sidebar, background connects, reconnects — upstream #3670) | **the same** — the fork's own console (E2) was retired in favour of it, see [ADR 0002](./decisions/0002-adopt-upstream-multi-machine-client.md) |
 | Phone | — (third-party bridges) | `herdr gateway` + installable web app: agents grouped blocked-first, live terminals, answer prompts |
 | Away from home | SSH | same thing over Tailscale; gateway gets HTTPS from `tailscale serve` |
+| Claude accounts | one `~/.claude` per machine; log out to change licence | `[[accounts]]` profiles per agent: pick one at start, see it everywhere, move a running agent to another account keeping its conversation |
 | Servers | stock | **stock** — LAN hosts run upstream or the fork interchangeably |
 
 Design in one line: servers are untouched, the console is upstream's, SSH is
@@ -429,6 +430,48 @@ The whole module is behind the `gateway` cargo feature, on by default in fork
 builds; `cargo build --no-default-features` yields an upstream-shaped binary
 with no `gateway` command, which is what fork CI's
 `check-no-default-features` job protects.
+
+## Claude accounts
+
+Usage limits are per Claude account. `[[accounts]]` profiles let each Claude
+Code agent run under its own `CLAUDE_CONFIG_DIR`, so a second licence is a flag
+instead of a logout.
+
+```toml
+[[accounts]]
+name = "perso"
+config_dir = "~/.claude"
+default = true
+
+[[accounts]]
+name = "work"
+config_dir = "~/.claude-work"
+```
+
+```bash
+herdr account add work --config-dir ~/.claude-work   # seeds the directory, shares transcripts
+herdr account login work                             # types `claude auth login` into a pane
+herdr account status                                 # health + oauthAccount identity, never secrets
+herdr agent start a1 --kind claude --pane w1:p1 --account work
+herdr agent switch-account a1 perso                  # same conversation, other account
+herdr account watch                                  # opt-in: label agents that hit their limit
+```
+
+In the TUI, right-clicking a pane offers `Start Claude as account...` or
+`Switch Claude account...` (local endpoint only). The account is an ordinary
+server metadata token (`account`, `account_state`, source `fork:accounts`), so
+it shows up in `herdr agent get`, in the sidebar as `$account`, as an `ACCOUNT`
+column in `herdr fleet status`, and through the gateway on the phone with no
+extra work.
+
+Servers stay stock: the launch types the profile's `CLAUDE_CONFIG_DIR` export
+into the pane's shell and then calls the ordinary `agent.start`. Full reference
+— every command with its exit codes and JSON, the seed layout, the switch
+protocol and its guarantees, usage-limit detection and the `account watch`
+label leases, the limitations, and the checklist of what still has to be
+verified against a real Claude Code installation — is in
+[`accounts.md`](./accounts.md). The design decisions are
+[ADR 0003](./decisions/0003-claude-accounts-as-profile-dirs.md).
 
 ## Continuous integration
 
