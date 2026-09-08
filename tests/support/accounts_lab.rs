@@ -129,6 +129,37 @@ impl Lab {
             .expect("run herdr against the accounts lab")
     }
 
+    /// Start a herdr command against the lab in the background.
+    ///
+    /// Same environment as [`Lab::herdr`], but the caller keeps the child: the
+    /// account watcher is a long-running process, and the only honest way to
+    /// test what it does while it runs — and what it leaves behind when it is
+    /// interrupted — is to run one.
+    pub fn herdr_spawn(&self, args: &[&str]) -> std::process::Child {
+        let path = format!(
+            "{}:{}",
+            self.root.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        Command::new(env!("CARGO_BIN_EXE_herdr"))
+            .arg("--session")
+            .arg(SESSION)
+            .args(args)
+            .env("XDG_CONFIG_HOME", self.root.join("xdg"))
+            .env("XDG_RUNTIME_DIR", self.runtime_dir())
+            .env("PATH", path)
+            .env("CLAUDE_CONFIG_DIR", self.ambient_dir())
+            .env("HERDR_BIN", env!("CARGO_BIN_EXE_herdr"))
+            .env_remove("HERDR_SOCKET_PATH")
+            .env_remove("HERDR_CLIENT_SOCKET_PATH")
+            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_SESSION")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn herdr against the accounts lab")
+    }
+
     /// The pane the lab left at a shell prompt.
     pub fn pane_id(&self) -> String {
         let output = self.run(&["status", "--json"]);

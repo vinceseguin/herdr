@@ -300,6 +300,38 @@ fn account_command() -> Command {
                         .help("Pane to type into (default: the current pane)"),
                 ),
         )
+        .subcommand(
+            Command::new("watch")
+                .about(
+                    "Keep a usage limit visible: poll the running agents, ask herdr's \
+                     detector why a Claude agent whose account herdr knows is blocked, and \
+                     label the ones that are out of usage so the sidebar, `herdr agent get`, \
+                     `herdr account status` and `herdr fleet status --json` all say so. It \
+                     never types into a pane and never switches an account; it only writes \
+                     metadata, and only on agents that carry an account token. Every label \
+                     is leased, so a watcher that stops cannot leave one behind. Runs until \
+                     interrupted.\n\nnext: herdr agent switch-account <PANE> <ACCOUNT>",
+                )
+                .arg(
+                    option("interval", "MS")
+                        .help("Read the agent list every MS (default 5000, 500-300000)"),
+                )
+                .arg(
+                    Arg::new("once")
+                        .long("once")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Do one pass and exit, leaving what it labelled to its lease",
+                        ),
+                )
+                .arg(json_flag().help("Print one JSON object per line instead of a sentence"))
+                .arg(
+                    Arg::new("keep-labels")
+                        .long("keep-labels")
+                        .action(ArgAction::SetTrue)
+                        .help("Leave labels in place on exit and let their leases expire"),
+                ),
+        )
 }
 
 fn config_command() -> Command {

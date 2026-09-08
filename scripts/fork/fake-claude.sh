@@ -30,6 +30,10 @@
 #     $FAKE_CLAUDE_LIMIT_FILE when set) instead of going idle, and prints the
 #     same screen on the input `/limit`, which is how a limit that arrives
 #     mid-session is driven;
+#   * on the input `/redraw` reprints the prompt box, which is how a limit
+#     notice becomes history: the `usage_limit` rule reads the region after the
+#     last horizontal rule, so a fresh box below the notice is what a lifted
+#     limit looks like on screen;
 #   * with FAKE_CLAUDE_BUSY=1 ignores `/exit` and never returns the pane to its
 #     shell, which is how `herdr agent switch-account` is proved to time out
 #     without killing anything;
@@ -297,6 +301,15 @@ while :; do
             # detection reads it; nothing here reports a state, because
             # `herdr:claude` is a reserved state source.
             print_limit_screen
+            ;;
+        /redraw)
+            # How a limit notice stops being state and becomes history: Claude
+            # redraws its prompt box, and herdr's live regions — which are
+            # defined relative to that box's horizontal rules — no longer
+            # contain the old footer. This is the only way back out of
+            # `usage_limit` on a screen, since the notice itself never scrolls
+            # itself away and Escape cannot clear a limit.
+            print_prompt_box
             ;;
         /work)
             # The 2.1.228 busy spinner, as an OSC title: `osc_title_working` in
