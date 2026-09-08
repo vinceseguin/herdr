@@ -561,6 +561,7 @@ pub fn switch_account(
             },
             Action::SendKeys(keys) => send_agent_keys(machine.pane_id(), keys),
             Action::Prompt(text) => submit_agent_prompt(machine.pane_id(), &text),
+            Action::SubmitText(text) => submit_pane_text(machine.pane_id(), &text),
             Action::PollAgent => match read_agent(machine.agent_target()) {
                 Ok(snapshot) => Observation::agent(snapshot),
                 // A read that failed outright (not "no such agent", which is
@@ -757,6 +758,25 @@ fn submit_agent_prompt(pane_id: &str, text: &str) -> Observation {
         }),
     });
     observation_of_send(response, "agent.prompt")
+}
+
+/// `/exit` typed straight into the pane's pty.
+///
+/// The escape hatch for an agent the server will not accept a prompt for. It
+/// carries none of `agent.prompt`'s guards, which is exactly why the machine
+/// reaches it only for a usage-limited agent it has already pinned by pane and
+/// terminal id, and why the text it submits is a constant rather than anything
+/// a caller supplied. The trailing carriage return is what submits it:
+/// `pane.send_text` sends raw bytes with no bracketed paste.
+fn submit_pane_text(pane_id: &str, text: &str) -> Observation {
+    let response = crate::cli::send_request(&Request {
+        id: "cli:accounts:switch:send_text".into(),
+        method: Method::PaneSendText(PaneSendTextParams {
+            pane_id: pane_id.to_owned(),
+            text: format!("{text}\r"),
+        }),
+    });
+    observation_of_send(response, "pane.send_text")
 }
 
 fn observation_of_send(response: std::io::Result<serde_json::Value>, method: &str) -> Observation {

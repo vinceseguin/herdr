@@ -1,7 +1,7 @@
 id = "claude"
-version = "2026.09.04.1"
+version = "2026.09.07.1"
 min_engine_version = 2
-updated_at = "2026-09-04T00:00:00Z"
+updated_at = "2026-09-07T00:00:00Z"
 aliases = ["claude-code"]
 
 [[rules]]
@@ -119,6 +119,96 @@ all = [
     { line_regex = ['^\s*\x{276F}?\s*Accept\b'] },
     { line_regex = ['^\s*\x{276F}?\s*Decline\b'] },
   ] },
+]
+
+[[rules]]
+id = "usage_limit"
+state = "blocked"
+priority = 985
+region = "after_last_horizontal_rule"
+visible_blocker = true
+# Claude Code's account usage limit. Blocked, not idle: the prompt still
+# accepts typing, but nothing an agent is asked to do can run until the limit
+# lifts, and herdr's account tooling offers switching to another profile.
+#
+# Priority 985 sits above live_blocked_form (980) so the limit wins while both
+# are visible, and below transcript_viewer (1000) and osc_title_working (1100)
+# so a scrolled-back transcript or a genuinely working turn still wins.
+#
+# The region is the status area below the current prompt box — the same one
+# live_blocked_form reads — and not the bottom N lines, for two reasons that
+# both matter here. A notice that has scrolled above the live box is history,
+# not state: reading it as state would leave a *relaunched* agent looking
+# limited because the previous session's screen is still on the pane. And a
+# transcript can never reach this region, so an assistant turn discussing usage
+# limits is structurally incapable of matching, not merely unlikely to.
+#
+# EVIDENCE, AND ITS LIMIT. Per AGENTS.md a rule of this kind comes from a live
+# capture of the real screen. The usage-limit screen needs a rate-limited real
+# account, which no local lab can produce, so the fixture behind this rule
+# (tests/fixtures/fork/claude-usage-limit.txt) is *reconstructed* from Claude
+# Code's known limit wording laid out in the live-captured prompt-box/footer
+# shape. tests/fixtures/fork/README.md records that and the exact checks a
+# human must run against a really limited account. The rule is therefore
+# written to fail closed: two independent controls must both be present.
+#
+# 1. the notice itself, anchored either to the start of its own line or to a
+#    "·"/"∙"/"|" separator inside the footer status line — so a wrapped
+#    sentence in the middle of an assistant turn cannot impersonate it;
+# 2. the control that always travels with it: when the limit lifts, or the
+#    "/upgrade" that lifts it now.
+#
+# Residual risk, stated plainly: a Claude session that renders a real
+# usage-limit notice *inside its own transcript* is indistinguishable from a
+# limited one by screen scraping. tests/fixtures/fork/
+# claude-usage-limit-negative.txt pins the ordinary prose case — "Claude usage
+# limit reached" quoted mid-line, "resets at 14:00" as prose — as a non-match.
+#
+# REMOTE SHADOWING. A cached remote manifest whose version is greater than or
+# equal to this one replaces the bundled file wholesale (src/detect/manifest.rs
+# read_remote_manifest), so an upstream catalog published after this date would
+# take this rule away without any error. The bundled version above is ahead of
+# the published catalog today; a herdr that must not lose the rule sets
+# `[update] manifest_check = false`, and `herdr agent explain <pane> --json`
+# reports `manifest_source` so a caller can tell which file answered.
+all = [
+  { any = [
+    { line_regex = ['(?i)(?:^|[\x{00B7}\x{2219}|]\s*)\s*\d+-hour limit reached\b'] },
+    { line_regex = ['(?i)(?:^|[\x{00B7}\x{2219}|]\s*)\s*weekly limit reached\b'] },
+    { line_regex = ['(?i)(?:^|[\x{00B7}\x{2219}|]\s*)\s*(?:claude )?usage limit reached\b'] },
+  ] },
+  { any = [
+    { line_regex = ['(?i)\bresets?(?:\s+at)?\s+\d{1,2}(?::\d{2})?\s*[ap]\.?m\.?\b'] },
+    { line_regex = ['(?i)\bresets?(?:\s+at)?\s+\d{1,2}:\d{2}\b'] },
+    { line_regex = ['(?i)\blimit will reset at\b'] },
+    { line_regex = ['(?i)^\s*/upgrade\b'] },
+  ] },
+]
+# A dialog on top of the limit screen is the actionable thing, and a scrolled
+# transcript is not the live state at all: defer to the rules that own them.
+# The dialog controls listed here are the ones every Claude blocker draws
+# inside this same region, so a permission prompt, an MCP dialog or a
+# connection approval keeps its own rule (and its own advice) even while the
+# account really is limited.
+#
+# The last entry closes the degenerate region. `after_last_horizontal_rule`
+# falls back to the whole screen when the screen holds no rule at all — a
+# Claude that is not drawing its prompt box — and a transcript paragraph can
+# wrap "Claude usage limit reached. Your limit will reset at 3pm." onto an
+# indented line of its own, which the headline anchor above would accept. A
+# transcript turn bullet (U+23FA) or tool-result gutter (U+23BF) inside the
+# region means the region is transcript rather than the live status area, so
+# the rule declines it. The live footer never carries either marker.
+not = [
+  { contains = ["showing detailed transcript"] },
+  { contains = ["do you want to proceed?"] },
+  { contains = ["esc to cancel"] },
+  { contains = ["esc to interrupt"] },
+  { contains = ["tab to amend"] },
+  { contains = ["ctrl+e to explain"] },
+  { contains = ["waiting for permission"] },
+  { contains = ["do you want to allow this connection?"] },
+  { line_regex = ['^\s*[\x{23FA}\x{23BF}]'] },
 ]
 
 [[rules]]

@@ -24,6 +24,7 @@
 //! never heard of.
 
 use crate::accounts::layout::{AccountIdentity, ProfileInspection};
+use crate::accounts::limit::UsageLimit;
 use crate::accounts::profile::{AccountProfile, Profiles};
 use crate::accounts::tokens::{AccountState, ACCOUNT_STATE_TOKEN, ACCOUNT_TOKEN};
 use crate::api::schema::{AgentInfo, AgentStatus};
@@ -42,6 +43,10 @@ pub struct AgentFact {
     /// `tokens.account_state`, verbatim — including a value this build does
     /// not know.
     pub account_state: Option<String>,
+    /// Set only when herdr's own detector said so, which costs an
+    /// `agent.explain` and is therefore the caller's decision rather than a
+    /// field [`AgentFact::from_agent_info`] can fill in.
+    pub limit: Option<UsageLimit>,
 }
 
 impl AgentFact {
@@ -52,7 +57,14 @@ impl AgentFact {
             agent_status: agent.agent_status,
             account: agent.tokens.get(ACCOUNT_TOKEN).cloned(),
             account_state: agent.tokens.get(ACCOUNT_STATE_TOKEN).cloned(),
+            limit: None,
         }
+    }
+
+    /// Record what the detector said about this agent's account usage.
+    pub fn with_limit(mut self, limit: Option<UsageLimit>) -> Self {
+        self.limit = limit;
+        self
     }
 }
 
@@ -70,6 +82,12 @@ pub struct AgentOnAccount {
     /// Reported rather than dropped: an older herdr reading a newer one's
     /// token must show what it saw, not pretend the agent has no state.
     pub account_state_known: bool,
+    /// Present only when herdr's detector matched the usage-limit rule on this
+    /// agent's screen. Absent means "not seen", never "not limited": a status
+    /// run without a server, or against an agent that was not blocked when it
+    /// looked, never asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<UsageLimit>,
 }
 
 impl AgentOnAccount {
@@ -84,6 +102,7 @@ impl AgentOnAccount {
             agent_status: fact.agent_status,
             account_state,
             account_state_known,
+            limit: fact.limit.clone(),
         }
     }
 }
@@ -288,8 +307,17 @@ fn render_agents(status: &AccountStatus) -> String {
                 (Some(state), false) => format!(" {state} (unknown to this herdr)"),
                 (None, _) => String::new(),
             };
+            // The one blocked reason this report can act on, so it is spelled
+            // out next to the agent rather than left to `agent explain`.
+            let limit = match agent.limit.as_ref() {
+                Some(limit) => match limit.reset_text.as_deref() {
+                    Some(reset) => format!(" — usage limit, resets {reset}"),
+                    None => " — usage limit".to_string(),
+                },
+                None => String::new(),
+            };
             format!(
-                "{name} on {} {}{state}",
+                "{name} on {} {}{state}{limit}",
                 agent.pane_id,
                 agent_status_str(agent.agent_status)
             )
@@ -358,6 +386,7 @@ mod tests {
             agent_status: AgentStatus::Working,
             account: account.map(str::to_string),
             account_state: state.map(str::to_string),
+            limit: None,
         }
     }
 
@@ -606,5 +635,49 @@ work (store)
         let fact = AgentFact::from_agent_info(&agent);
         assert_eq!(fact.account, None);
         assert_eq!(fact.account_state, None);
+    }
+
+    /// A limit herdr saw is a limit the report says out loud, in both shapes.
+    #[test]
+    fn a_usage_limit_reaches_the_row_and_the_text_report() {
+        let profiles = Profiles::test_new(vec![profile("perso", true, ProfileOrigin::Config)]);
+        let limited = fact("%1.1", "a1", Some("perso"), Some("ok")).with_limit(Some(
+            crate::accounts::limit::UsageLimit {
+                reset_text: Some("3pm".to_string()),
+            },
+        ));
+        let statuses = assemble(&profiles, None, |_| healthy(), Some(&[limited]));
+
+        let agents = statuses[0].agents.as_ref().expect("agents");
+        assert_eq!(
+            agents[0]
+                .limit
+                .as_ref()
+                .and_then(|limit| limit.reset_text.as_deref()),
+            Some("3pm")
+        );
+        let encoded = serde_json::to_string(&statuses).expect("encode");
+        assert!(
+            encoded.contains(r#""limit":{"reset_text":"3pm"}"#),
+            "{encoded}"
+        );
+        let text = render_text(&statuses);
+        assert!(text.contains("usage limit, resets 3pm"), "{text}");
+    }
+
+    /// Not asking is not an answer: an agent nobody explained carries no
+    /// `limit` key at all, rather than one that reads as "healthy".
+    #[test]
+    fn an_agent_that_was_never_explained_carries_no_limit_key() {
+        let profiles = Profiles::test_new(vec![profile("perso", true, ProfileOrigin::Config)]);
+        let statuses = assemble(
+            &profiles,
+            None,
+            |_| healthy(),
+            Some(&[fact("%1.1", "a1", Some("perso"), Some("ok"))]),
+        );
+        let encoded = serde_json::to_string(&statuses).expect("encode");
+        assert!(!encoded.contains("limit"), "{encoded}");
+        assert!(!render_text(&statuses).contains("usage limit"));
     }
 }

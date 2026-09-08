@@ -2339,3 +2339,187 @@ fn the_tui_picker_refuses_a_busy_pane_and_stays_open_to_say_so() {
         tui.screen()
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR 9 — the usage-limit rule and the account limit hints
+// ---------------------------------------------------------------------------
+
+/// The reconstructed limit screen the manifest rule is written against.
+///
+/// The stub prints this file, so the rule is exercised through herdr's real
+/// screen detection rather than through a reported state: `herdr:claude` is a
+/// reserved state source and cannot report `blocked` (see PR 5's *As built*).
+fn usage_limit_fixture() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/fork/claude-usage-limit.txt")
+}
+
+/// Poll `agent get` until the server reports `status`, or give up.
+fn wait_for_agent_status(lab: &Lab, target: &str, status: &str) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..100 {
+        last = agent_of(lab, target);
+        if last["agent_status"].as_str() == Some(status) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("agent {target} never reached status {status}; last: {last:#?}");
+}
+
+/// Poll `agent explain` until the detector settles on `rule`, or give up.
+fn wait_for_matched_rule(lab: &Lab, target: &str, rule: &str) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..80 {
+        last = json_of(&lab.herdr(&["agent", "explain", target, "--json"]));
+        if last["matched_rule"]["id"].as_str() == Some(rule) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("agent {target} never matched rule {rule}; last explain: {last:#?}");
+}
+
+/// The whole of PR 9 end to end: a limit screen is `blocked` by the
+/// `usage_limit` rule, `account status` carries it, and the switch preflight
+/// says why it is being asked.
+#[test]
+fn a_usage_limit_screen_is_detected_and_reported() {
+    let mut lab = Lab::new("limit");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    let fixture = format!(
+        "FAKE_CLAUDE_LIMIT_FILE='{}'",
+        usage_limit_fixture().display()
+    );
+    start_agent_in(
+        &lab,
+        "a1",
+        &pane,
+        &[&fixture],
+        &["--account", DEFAULT_PROFILE],
+    );
+
+    // The negative first, on the very same agent: a healthy Claude at its
+    // prompt is not limited, and nothing claims it is.
+    let healthy = json_of(&lab.herdr(&["agent", "explain", "a1", "--json"]));
+    assert_ne!(
+        healthy["matched_rule"]["id"].as_str(),
+        Some("usage_limit"),
+        "an agent that has not hit a limit must not match it: {healthy:#?}"
+    );
+    let before = json_of(&lab.herdr(&["account", "status", "--json"]));
+    assert!(
+        !stdout_of(&lab.herdr(&["account", "status", "--json"])).contains("\"limit\""),
+        "no limit key before the limit: {before:#?}"
+    );
+
+    // Now the limit arrives, the way a real one does: mid-session.
+    let prompted = lab.herdr(&["agent", "prompt", "a1", "/limit"]);
+    assert!(prompted.status.success(), "{}", stderr_of(&prompted));
+
+    let explain = wait_for_matched_rule(&lab, "a1", "usage_limit");
+    assert_eq!(explain["state"], "blocked", "{explain:#?}");
+    assert_eq!(explain["visible_blocker"], true, "{explain:#?}");
+    assert_eq!(
+        explain["manifest_source"].as_str(),
+        Some("bundled"),
+        "the fork's own manifest must be the one that matched: {explain:#?}"
+    );
+
+    // The server's own view of the agent, which follows pane output rather
+    // than the on-demand `explain` above.
+    let agent = wait_for_agent_status(&lab, "a1", "blocked");
+    assert_eq!(agent["agent_status"], "blocked", "{agent:#?}");
+
+    // The report a human reads.
+    let status = lab.herdr(&["account", "status", "--json"]);
+    assert!(status.status.success(), "{}", stderr_of(&status));
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&stdout_of(&status)).expect("json");
+    let limited = rows
+        .iter()
+        .find(|row| row["name"] == DEFAULT_PROFILE)
+        .expect("the default profile is reported");
+    let on_account = limited["agents"]
+        .as_array()
+        .expect("agents were listed")
+        .iter()
+        .find(|agent| agent["name"] == "a1")
+        .expect("a1 is on the default profile");
+    assert_eq!(
+        on_account["limit"]["reset_text"], "3pm",
+        "the reset time comes off the detection screen: {on_account:#?}"
+    );
+    assert!(
+        stderr_of(&status).contains(&format!("switch-account {pane} {SECOND_PROFILE}")),
+        "the hint must name a way out: {}",
+        stderr_of(&status)
+    );
+
+    // And the switch says why it is being asked.
+    let switched = lab.herdr(&[
+        "agent",
+        "switch-account",
+        "a1",
+        SECOND_PROFILE,
+        "--yes",
+        "--json",
+    ]);
+    assert!(
+        switched.status.success(),
+        "switch-account failed: {}{}",
+        stdout_of(&switched),
+        stderr_of(&switched)
+    );
+    let result = json_of(&switched);
+    assert_eq!(
+        result["limit"]["reset_text"], "3pm",
+        "the preflight records the limit it switched away from: {result:#?}"
+    );
+    assert_eq!(result["to"], SECOND_PROFILE);
+}
+
+/// The other half of the contract, and the failure path that matters most:
+/// an agent that is genuinely `blocked` — so `account status` really does run
+/// `agent.explain` and the detection read on it — but blocked by a dialog
+/// drawn on top of a limited account. herdr must report the dialog the human
+/// can act on, and must not answer "switch accounts" to someone who has to
+/// answer a question.
+#[test]
+fn an_agent_blocked_for_another_reason_carries_no_limit() {
+    let mut lab = Lab::new("limit-neg");
+    assert!(lab.up().status.success());
+
+    let pane = lab.pane_id();
+    let negative = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/fork/claude-usage-limit-with-dialog.txt");
+    start_agent_in(
+        &lab,
+        "a1",
+        &pane,
+        &[&format!("FAKE_CLAUDE_LIMIT_FILE='{}'", negative.display())],
+        &["--account", DEFAULT_PROFILE],
+    );
+
+    // A blocking dialog over a limit footer, printed onto the screen.
+    let prompted = lab.herdr(&["agent", "prompt", "a1", "/limit"]);
+    assert!(prompted.status.success(), "{}", stderr_of(&prompted));
+
+    let explain = wait_for_matched_rule(&lab, "a1", "live_blocked_form");
+    assert_eq!(explain["state"], "blocked", "{explain:#?}");
+    let agent = wait_for_agent_status(&lab, "a1", "blocked");
+    assert_eq!(agent["agent_status"], "blocked", "{agent:#?}");
+
+    let status = lab.herdr(&["account", "status", "--json"]);
+    assert!(
+        !stdout_of(&status).contains("\"limit\""),
+        "no limit key: {}",
+        stdout_of(&status)
+    );
+    assert!(
+        !stderr_of(&status).contains("switch-account"),
+        "no switch was suggested: {}",
+        stderr_of(&status)
+    );
+}

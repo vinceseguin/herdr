@@ -1,0 +1,9 @@
+do you want to proceed?
+bash command: rm -rf /tmp/test
+
+❯ 1. Yes
+  2. Yes, and don't ask again for: rm *
+  3. No
+
+Esc to cancel · Tab to amend · ctrl+e to explain
+  ⏵⏵ auto mode on · 1 shell · ← for agents

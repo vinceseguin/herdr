@@ -27,10 +27,15 @@
 #   * `auth login` writes a 0600 `.credentials.json` and an `oauthAccount` into
 #     `.claude.json`, so `herdr account status` has an identity to show;
 #   * with FAKE_CLAUDE_LIMIT=1 prints a usage-limit screen (from
-#     $FAKE_CLAUDE_LIMIT_FILE when set) instead of going idle;
+#     $FAKE_CLAUDE_LIMIT_FILE when set) instead of going idle, and prints the
+#     same screen on the input `/limit`, which is how a limit that arrives
+#     mid-session is driven;
 #   * with FAKE_CLAUDE_BUSY=1 ignores `/exit` and never returns the pane to its
 #     shell, which is how `herdr agent switch-account` is proved to time out
 #     without killing anything;
+#   * draws Claude's prompt box once at startup, so herdr's live-UI detection
+#     regions (which are defined relative to that box's horizontal rules) see
+#     this session's screen rather than the previous one's;
 #   * shows a `❯ ` prompt and exits on `/exit`;
 #   * on the input `/work` sets the same braille-spinner OSC title a busy Claude
 #     sets, so herdr's own screen detection reports the agent as working — the
@@ -49,7 +54,8 @@
 #                          (falls back to HERDR_BIN_PATH, which herdr itself
 #                          puts in every pane's environment, then to PATH)
 #   HERDR_PANE_ID          set by herdr in the pane; no report without it
-#   FAKE_CLAUDE_LIMIT      1 to print the usage-limit screen
+#   FAKE_CLAUDE_LIMIT      1 to print the usage-limit screen at startup
+#                          (the `/limit` input prints it at any time)
 #   FAKE_CLAUDE_LIMIT_FILE file to print instead of the built-in limit text
 #   FAKE_CLAUDE_BUSY       1 to refuse /exit and keep running
 #   FAKE_CLAUDE_NO_SESSION 1 to report no session id, like a profile whose
@@ -224,7 +230,11 @@ if [ -n "${HERDR_PANE_ID:-}" ] && [ "${FAKE_CLAUDE_NO_SESSION:-0}" != "1" ]; the
         --session-start-source "$start_source" >/dev/null 2>&1 || true
 fi
 
-if [ "${FAKE_CLAUDE_LIMIT:-0}" = "1" ]; then
+# The usage-limit screen, printed at startup with FAKE_CLAUDE_LIMIT=1 or on
+# demand with the `/limit` input. On demand is the shape that matters: a real
+# limit arrives mid-session, and driving it that way lets one test assert the
+# idle screen *and* the limit screen on the same agent.
+print_limit_screen() {
     if [ -n "${FAKE_CLAUDE_LIMIT_FILE:-}" ] && [ -r "${FAKE_CLAUDE_LIMIT_FILE}" ]; then
         cat "${FAKE_CLAUDE_LIMIT_FILE}"
     else
@@ -232,6 +242,27 @@ if [ "${FAKE_CLAUDE_LIMIT:-0}" = "1" ]; then
         printf '5-hour limit reached ∙ resets 3pm\n'
         printf '/upgrade to increase your usage limit.\n'
     fi
+}
+
+# The prompt box Claude Code draws, once per session.
+#
+# It is not decoration: herdr's detection regions that mean "the live UI" —
+# `prompt_box_body`, `after_last_horizontal_rule` — are defined relative to the
+# horizontal rules of this box, and the `usage_limit` rule reads the footer
+# below it. Without a box a line-printing stub would leave the *previous*
+# session's last screen inside the new session's live region, and a relaunch
+# after a usage limit would be read as still limited.
+print_prompt_box() {
+    printf '\n'
+    printf '%s\n' '────────────────────────────────────────────────────────────────'
+    printf '%s\n' '❯'
+    printf '%s\n' '────────────────────────────────────────────────────────────────'
+    printf '%s\n' '  ⏵⏵ fake-claude · ? for shortcuts'
+}
+print_prompt_box
+
+if [ "${FAKE_CLAUDE_LIMIT:-0}" = "1" ]; then
+    print_limit_screen
 fi
 
 esc="$(printf '\033')"
@@ -260,6 +291,12 @@ while :; do
             fi
             printf 'fake-claude: exiting\n'
             exit 0
+            ;;
+        /limit)
+            # What a rate-limited Claude leaves on screen. herdr's own
+            # detection reads it; nothing here reports a state, because
+            # `herdr:claude` is a reserved state source.
+            print_limit_screen
             ;;
         /work)
             # The 2.1.228 busy spinner, as an OSC title: `osc_title_working` in

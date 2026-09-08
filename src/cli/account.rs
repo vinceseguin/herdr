@@ -28,8 +28,8 @@ use crate::accounts::profile::{
 };
 use crate::accounts::store;
 use crate::api::schema::{
-    AgentInfo, EmptyParams, Method, PaneCurrentParams, PaneProcessInfo, PaneProcessInfoParams,
-    PaneSendTextParams, Request,
+    AgentInfo, AgentReadParams, AgentStatus, AgentTarget, EmptyParams, Method, PaneCurrentParams,
+    PaneProcessInfo, PaneProcessInfoParams, PaneSendTextParams, ReadFormat, ReadSource, Request,
 };
 
 pub(super) const ACCOUNT_USAGE: &str = "Usage:
@@ -903,6 +903,30 @@ fn status(args: &[String]) -> std::io::Result<i32> {
     if let Some(note) = agents_note {
         eprintln!("note: {note}");
     }
+    // The one blocked reason this command can offer a way out of. On stderr,
+    // beside the warnings, so `--json` stays a clean document on stdout.
+    let names = profiles.names();
+    for status in &statuses {
+        for agent in status.agents.iter().flatten() {
+            let Some(limit) = agent.limit.as_ref() else {
+                continue;
+            };
+            let others = crate::accounts::limit::alternatives(
+                &names.iter().map(String::as_str).collect::<Vec<_>>(),
+                Some(status.name.as_str()),
+            );
+            eprintln!(
+                "{}: {}",
+                agent.name.as_deref().unwrap_or("an agent"),
+                crate::accounts::limit::hint(
+                    limit,
+                    Some(status.name.as_str()),
+                    &agent.pane_id,
+                    &others,
+                )
+            );
+        }
+    }
     // Reported against the full merged view, not the selected profile: an
     // agent stranded on a profile that no longer exists is exactly what a
     // single-profile `status` would otherwise hide.
@@ -968,7 +992,10 @@ fn agent_facts() -> (
             Some(
                 agents
                     .iter()
-                    .map(crate::accounts::status::AgentFact::from_agent_info)
+                    .map(|agent| {
+                        crate::accounts::status::AgentFact::from_agent_info(agent)
+                            .with_limit(usage_limit_of(agent))
+                    })
                     .collect(),
             ),
             None,
@@ -980,6 +1007,72 @@ fn agent_facts() -> (
             )),
         ),
     }
+}
+
+/// What herdr's detector says about a blocked Claude agent's account usage.
+///
+/// Asked **only** for a Claude agent that is already blocked. `agent.explain`
+/// is a per-agent round trip, and a status run on a busy machine must not turn
+/// into one explain per pane: an idle or working agent is not waiting on a
+/// usage limit, and an agent that is not Claude has no account to be limited.
+///
+/// Every failure answers `None` — "herdr did not see a limit", never "there is
+/// no limit". `status` is a read that already degrades gracefully when no
+/// server answers, and a limit hint is the least of what it owes the caller.
+fn usage_limit_of(agent: &AgentInfo) -> Option<crate::accounts::limit::UsageLimit> {
+    if agent.agent_status != AgentStatus::Blocked {
+        return None;
+    }
+    if agent.agent.as_deref() != Some(crate::accounts::tokens::AGENT_LABEL) {
+        return None;
+    }
+    let explain = agent_explain(&agent.pane_id)?;
+    // Check the verdict before paying for the screen: the reset time is the
+    // only thing the read contributes, and most blocked agents are blocked for
+    // some other reason.
+    if !crate::accounts::limit::matched_usage_limit(&explain) {
+        return None;
+    }
+    let screen = detection_screen(&agent.pane_id).unwrap_or_default();
+    crate::accounts::limit::classify(&explain, &screen)
+}
+
+/// One `agent.explain`, or `None` if anything at all went wrong.
+pub(super) fn agent_explain(target: &str) -> Option<serde_json::Value> {
+    let response = crate::cli::send_request(&Request {
+        id: "cli:accounts:explain".into(),
+        method: Method::AgentExplain(AgentTarget {
+            target: target.to_string(),
+        }),
+    })
+    .ok()?;
+    if response.get("error").is_some() {
+        return None;
+    }
+    Some(response["result"]["explain"].clone())
+}
+
+/// The same bottom-buffer text the detector matched against, so the reset time
+/// is read from the screen that produced the verdict rather than from the
+/// user-visible viewport (which the user can scroll).
+pub(super) fn detection_screen(target: &str) -> Option<String> {
+    let response = crate::cli::send_request(&Request {
+        id: "cli:accounts:read".into(),
+        method: Method::AgentRead(AgentReadParams {
+            target: target.to_string(),
+            source: ReadSource::Detection,
+            lines: None,
+            format: ReadFormat::Text,
+            strip_ansi: true,
+        }),
+    })
+    .ok()?;
+    if response.get("error").is_some() {
+        return None;
+    }
+    response["result"]["read"]["text"]
+        .as_str()
+        .map(str::to_owned)
 }
 
 // ---------------------------------------------------------------------------

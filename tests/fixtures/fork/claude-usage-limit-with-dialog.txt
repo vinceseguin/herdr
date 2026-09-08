@@ -1,0 +1,11 @@
+⏺ Edit(src/main.rs)
+  ⎿  Updated src/main.rs with 1 addition
+
+────────────────────────────────────────────────────────────────
+ Edit file?
+
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Enter to confirm
+  ⏵⏵ auto mode on · 5-hour limit reached ∙ resets 3pm · /upgrade

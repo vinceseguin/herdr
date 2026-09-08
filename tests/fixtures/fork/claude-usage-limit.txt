@@ -1,0 +1,9 @@
+⏺ Update(src/detect/manifests/claude.toml)
+  ⎿  Updated src/detect/manifests/claude.toml with 24 additions
+
+⏺ Claude usage limit reached. Your limit will reset at 3pm (America/Toronto).
+
+────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 5-hour limit reached ∙ resets 3pm · /upgrade
