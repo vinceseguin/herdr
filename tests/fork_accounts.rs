@@ -2273,3 +2273,69 @@ fn the_pane_menu_hides_the_account_item_without_a_configured_profile() {
         tui.screen()
     );
 }
+
+/// The failure path through the same pty: a pane with something in the
+/// foreground is refused before a byte is typed, the modal says so and stays
+/// open, nothing is started, and Esc dismisses it.
+#[test]
+fn the_tui_picker_refuses_a_busy_pane_and_stays_open_to_say_so() {
+    let mut lab = Lab::new("tui-busy");
+    assert!(lab.up().status.success());
+    let pane = lab.pane_id();
+
+    let mut tui = Tui::attach(&lab);
+    open_account_picker(&mut tui);
+
+    // Occupy the pane under the modal, through the API: the picker must
+    // re-check the pane when Enter lands, not when the menu opened.
+    let busy = lab.herdr(&["pane", "send-text", &pane, "sleep 30\r"]);
+    assert!(busy.status.success(), "{}", stderr_of(&busy));
+    let mut taken = false;
+    for _ in 0..40 {
+        let info = json_of(&lab.herdr(&["pane", "process-info", "--pane", &pane]));
+        let group = info["result"]["process_info"]["foreground_process_group_id"].as_u64();
+        let shell = info["result"]["process_info"]["shell_pid"].as_u64();
+        if group.is_some() && group != shell {
+            taken = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(taken, "the pane never became busy");
+
+    tui.send("\x1b[B");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    tui.send("\r");
+    tui.wait_for("is not at its shell prompt");
+    tui.wait_for("close");
+
+    let listed = json_of(&lab.herdr(&["agent", "list"]));
+    assert_eq!(
+        listed["result"]["agents"]
+            .as_array()
+            .map(|agents| agents.len())
+            .unwrap_or(0),
+        0,
+        "nothing may have been started: {listed:#?}"
+    );
+    assert!(
+        !screen(&lab, &pane).contains("CLAUDE_CONFIG_DIR="),
+        "nothing may have been typed into the pane"
+    );
+
+    // Esc dismisses the settled modal; the pane menu is reachable again.
+    let menus_before = tui.screen().matches("Rename pane").count();
+    tui.send("\x1b");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    right_click(&mut tui, 80, 10);
+    for _ in 0..50 {
+        if tui.screen().matches("Rename pane").count() > menus_before {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!(
+        "the pane menu never came back after Esc; the client wrote:\n{}",
+        tui.screen()
+    );
+}

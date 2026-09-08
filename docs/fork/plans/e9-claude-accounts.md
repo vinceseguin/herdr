@@ -350,7 +350,7 @@ implementation starts only after E3 is ✅.
 | 4 | feat(accounts): launch claude under a profile with herdr agent start --account | B · CLI | 1 | ✅ |
 | 5 | feat(accounts): switch a running claude agent to another profile keeping its session | B · CLI | 4 | ✅ |
 | 6 | feat(fleet): fleet report and change stream carry agent metadata tokens | C · Fleet | 1 | ✅ |
-| 7 | feat(accounts): tui account picker to start claude in a pane | D · TUI | 4 | ⬜ |
+| 7 | feat(accounts): tui account picker to start claude in a pane | D · TUI | 4 | ✅ |
 | 8 | feat(accounts): tui switch-account action with confirmation | D · TUI | 5, 7 | ⬜ |
 | 9 | feat(detect): claude usage-limit rule and account limit hints | E · Limits | 3, 5 | ⬜ |
 | 10 | feat(accounts): herdr account watch labels usage-limited agents | E · Limits | 9 | ⬜ |
@@ -1507,6 +1507,111 @@ evidence. Repeat with an empty `[[accounts]]` config: the item is absent.
 **Downstream.** PR 8 reuses `ClientAccountPickerOverlay` with `PickerMode::
 Switch { agent_name, current }` and `AccountJob`.
 
+**As built (PR 7, merged).** The plan's *Real current state* for the client
+shell predates the upstream v0.9.0 sync and its line numbers are stale; the
+corrections below are the shapes PR 8 must code against, and they win over the
+prose above.
+
+- **Two fork files, not one.** `src/client/shell/account_overlay.rs` holds
+  every piece of logic — the overlay state, `PickerMode`, `AccountEntry`,
+  `AccountJob`, filtering, agent-name generation, key routing, mouse routing,
+  the worker and the event fold. The **rendering** had to become a second
+  fork file, `src/client/shell/account_overlay_render.rs`, declared inside
+  `overlays.rs` next to `mod worktree_overlays;`: the shared modal chrome
+  (`panel`, `popup`, `row`, `button`, `contrast`) is private to the `overlays`
+  module, and widening it would have been a restructuring of an upstream file.
+  Upstream splits its own overlays exactly this way (`worktree_overlays.rs`
+  draws, `worktrees.rs` routes, `state.rs` holds the struct).
+- **`ClientShellConfig` lives in `state.rs`, not `config.rs`.** The plan named
+  the wrong file. The field is `accounts: crate::accounts::profile::Profiles`
+  — the *merged* view, not `Vec<AccountProfileConfig>`, because `herdr account
+  add` writes to `profiles.toml` and a picker built from `config.toml` alone
+  would not see those profiles. `config.rs` gained a `with_accounts(&Config)`
+  builder called from the one production site that loads a config from disk
+  (`src/client/mod.rs`), plus an `apply_live_config` refresh; `from_config`
+  deliberately leaves it empty so the many unit tests that build a config from
+  `Config::default()` never read the developer's own profile store.
+- **The context-menu target carries `agent_kind: Option<String>` and
+  `accounts_available: usize`.** `ClientContextMenuOverlay::items()` sees only
+  its target, not the shell, so both gates are baked in at
+  `open_pane_context_menu` time. `accounts_available` is already zero on a
+  remote endpoint (`ClientShellState::accounts_available_for` returns 0 unless
+  `ClientEndpointId::is_local()`), so the same field serves PR 8's "≥ 2
+  profiles" rule without another one.
+- **The overlay contract PR 8 reuses.** `PickerMode` is an enum with one
+  variant today, `Start { agent_name: String }`; PR 8 adds
+  `Switch { agent_name, current }` and a confirm step, and reuses
+  `ClientAccountPickerOverlay`, `AccountJob`, `AccountJobEvent::{Progress,
+  Finished}` and `AccountJobResult` unchanged. `ClientAccountPickerOverlay::
+  fold(event) -> bool` returns "close the modal now"; a `Mismatch`, an
+  `Unverified` or any warning keeps it open on purpose.
+- **The job is a `std::thread` + `std::sync::mpsc`, polled from the client's
+  existing timer**, through one added line in `src/client/mod.rs`
+  (`outcome.repaint |= shell.tick_account_picker();`). `tick_popup_pending`
+  looked like the natural hook but returns no repaint signal, so a progress
+  line folded there would not have been drawn until the next unrelated event.
+  `tick_account_picker` costs one `try_recv` when a job runs and one enum
+  match when none does; nothing runs per pane or per render.
+- **`AppliedLine::take_note()` was added to `src/accounts/client.rs`.** The
+  guard's `Drop` prints the "the pane still exports this directory" note with
+  `eprintln!`, which inside the TUI would be painted over by the next frame
+  and lost. `take_note` returns that text and disarms the print, and the
+  worker puts it in the modal; `Drop` and the CLI are unchanged, both now
+  rendering the same `stranded_line_note(&plan)`.
+- **`src/cli.rs`'s `mod agent;` became `pub(crate) mod agent;`** so the worker
+  can call `crate::cli::agent::start_managed_agent` — the one copy of the
+  `agent.start` busy-retry PR 5 factored out — instead of a second copy. That
+  file is already "take both" under ADR 0002.
+- **Hit rectangles ride on `OverlayRender.worktree_rows` /
+  `worktree_search`.** `composition.rs` copies those into `ShellHitMap` for
+  whatever overlay is open and only the matching router reads them, so reusing
+  them kept `composition.rs` and `ShellHitMap` out of the upstream-edit list.
+- **The picker shows health, not identity.** The plan's `AccountEntry.plan`
+  came from `oauthAccount`, which means parsing `.claude.json` — megabytes on
+  a real installation — while the user holds a mouse button down. The entries
+  carry `dir_exists`, `logged_in`, `hook_installed` and `is_default` from
+  `InspectOptions::health()` (stat calls only) and render as
+  `default · no hook`. `herdr account status` remains where identity is shown.
+- **Refusals happen twice.** The item is hidden unless the pane has no agent,
+  a profile exists and the endpoint is local; and `submit_account_picker`
+  re-checks everything against the live client state before a thread is
+  spawned, because a modal can be up for minutes. In order
+  (`account_launch_preflight`): the active endpoint is still local (a pending
+  activation can complete under the modal, after which `self.snapshot` is
+  another server's and its pane ids collide with local ones while the worker
+  would still type into the *local* pane of that id); the pinned pane is
+  still in the snapshot; nothing occupies it; the profile is still in the
+  client's live-reloaded config *and* still names the directory the row
+  showed; its directory exists. "Occupied" is `account_overlay::
+  pane_agent_kind`: **any** `snapshot.agents` entry for the pane, managed or
+  not — a `claude` typed by hand has no name but does hold the pane, and a
+  managed launch with no detected kind yet is still a launch. The same
+  predicate gates the menu item (one delegating line in
+  `open_pane_context_menu`). Everything after that is `accounts::client`'s
+  own refusal chain, which never types into a pane that is not a shell at its
+  prompt.
+- **A refusal is not an outcome.** `ClientAccountPickerOverlay.settled` is
+  set only by a `Finished` event — the launch ran, something may have been
+  typed — and only then do Enter and the primary button *close* the modal
+  and row clicks stop launching. A preflight refusal (nothing typed) shows in
+  `error` but leaves the picker usable: moving the selection clears it and
+  Enter tries the new row. PR 8 should keep that split.
+- **The worker gets the `AccountProfile`, not a name.** It is the profile the
+  picker showed, checked against the row at preflight, so what launches is
+  exactly what was on screen and the thread does no config I/O; the sequence
+  is then `prepare → apply_env → start_managed_agent → finish` (or
+  `take_note` on a refused start), exactly the CLI's. The tick also enforces
+  `ACCOUNT_JOB_STALL_LIMIT` (90 s since the worker's last event): the socket
+  calls carry no timeout, and Esc is refused mid-launch, so a server that
+  stops answering would otherwise leave a modal that could never be closed.
+  On a stall the thread is *detached* (never joined — it may be stuck in a
+  read), the modal settles with a message that says the launch may still
+  finish on its own, and the worker keeps going: it still grades and records
+  the agent if it ever gets that far.
+- **Every upstream client edit is listed in ADR 0002's sync policy** (amended
+  in this PR) so a sync agent can re-apply the wiring on top of upstream's
+  version from that table alone.
+
 ### PR 8 — feat(accounts): tui switch-account action with confirmation · deps: 5, 7
 
 **Goal.** `Switch account…` on a Claude agent's pane: picker → explicit
@@ -1519,10 +1624,19 @@ sidebar reflects the new account.
   `ClientAccountSwitchConfirm { pane_id, name, from, to, session_id,
   interrupt: bool }` step rendered like `ClientConfirmCloseOverlay` (`y`/
   Enter confirms, `n`/Esc cancels, `i` toggles interrupt when the agent is
-  working), then the job phase showing the machine's phase names.
+  working), then the job phase showing the machine's phase names. *(PR 7
+  shipped the overlay: add the `Switch` variant to `PickerMode`, a second
+  `AccountJobResult` shape if the switch needs one, and the confirm step; the
+  drawing goes in `src/client/shell/account_overlay_render.rs`, the
+  fork-owned child of `overlays` — see PR 7's* As built *.)*
 - `src/client/shell/state.rs`, `context_menu.rs` *(upstream files — minimal
   wiring)*: `ClientContextMenuAction::SwitchAccount`; item visible when the
   pane's agent is `claude`, ≥ 2 profiles exist, and the endpoint is local.
+  PR 7 already put `agent_kind: Option<String>` and `accounts_available:
+  usize` on `ClientContextMenuTarget::Pane` (the second is zero on a remote
+  endpoint), so this is one predicate beside
+  `account_overlay::start_claude_context_item` and one activation arm — no new
+  target field. **Add both to ADR 0002's E9 sync-policy table.**
 - `src/accounts/client.rs`: `switch_account_with_progress(…, on_event:
   impl FnMut(SwitchEvent))` (shared by CLI `--verbose` and the TUI).
 

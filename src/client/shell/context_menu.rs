@@ -161,11 +161,7 @@ impl ClientShellState {
             .filter(|focused| focused != &pane_id);
         // Fork (E9): the account item needs the pane's agent and how many
         // profiles this client can offer for the endpoint it is attached to.
-        let agent_kind = snapshot
-            .agents
-            .iter()
-            .find(|agent| agent.pane_id == pane_id && agent.name.is_some())
-            .and_then(|agent| agent.agent.clone());
+        let agent_kind = super::account_overlay::pane_agent_kind(snapshot, &pane_id);
         let accounts_available = self.accounts_available_for(&self.active_endpoint_id);
         let workspace_id = pane.workspace_id.clone();
         let has_manual_label = pane.label.is_some();

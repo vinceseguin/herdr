@@ -27,6 +27,7 @@
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use super::*;
 
@@ -37,6 +38,19 @@ use crate::accounts::tokens::{AccountState, AGENT_LABEL};
 /// The agent name a first Claude launch gets, and the stem the next ones are
 /// numbered from.
 const DEFAULT_AGENT_NAME: &str = AGENT_LABEL;
+
+/// How long the worker may go without reporting anything before the modal
+/// stops waiting for it.
+///
+/// The worker's socket calls carry no timeout, so a server that stops
+/// answering would otherwise leave a modal that cannot be dismissed — Esc is
+/// refused while a launch runs. Every phase is bounded well inside this when
+/// the server answers at all: the shell settle wait is 2 s, `agent.start`'s
+/// busy retry 2 s, and its readiness wait 30 s. When the budget runs out the
+/// worker is detached, not killed: it still grades and records the agent if
+/// it ever gets that far, so nothing about the account claim changes — only
+/// where the outcome is shown.
+const ACCOUNT_JOB_STALL_LIMIT: Duration = Duration::from_secs(90);
 
 /// One profile, as the picker shows it.
 ///
@@ -155,6 +169,8 @@ pub(super) enum AccountJobResult {
 pub(super) struct AccountJob {
     handle: Option<JoinHandle<()>>,
     events: Receiver<AccountJobEvent>,
+    /// When the worker last said anything, for the stall limit.
+    last_event: Instant,
 }
 
 impl AccountJob {
@@ -162,11 +178,12 @@ impl AccountJob {
     ///
     /// A disconnected channel with no terminal event means the worker panicked
     /// or was dropped; report that rather than showing a spinner for ever.
-    fn drain(&mut self) -> (Vec<AccountJobEvent>, bool) {
+    fn drain(&mut self, now: Instant) -> (Vec<AccountJobEvent>, bool) {
         let mut events = Vec::new();
         let finished = loop {
             match self.events.try_recv() {
                 Ok(event) => {
+                    self.last_event = now;
                     let terminal = matches!(event, AccountJobEvent::Finished(_));
                     events.push(event);
                     if terminal {
@@ -191,10 +208,24 @@ impl AccountJob {
         (events, finished)
     }
 
+    /// True when the worker has been silent for longer than the stall limit.
+    fn stalled(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_event) > ACCOUNT_JOB_STALL_LIMIT
+    }
+
+    /// Wait for the thread. Only called once its terminal event has been
+    /// drained, so this never blocks the event loop for longer than the
+    /// worker's own return.
     fn join(&mut self) {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+
+    /// Let the thread go without waiting for it. The worker keeps its own
+    /// sender and finishes the launch on its own; only its report is lost.
+    fn detach(&mut self) {
+        drop(self.handle.take());
     }
 }
 
@@ -215,6 +246,12 @@ pub(super) struct ClientAccountPickerOverlay {
     pub(super) progress: Option<&'static str>,
     pub(super) error: Option<String>,
     pub(super) warnings: Vec<String>,
+    /// A launch has ended and its outcome is what the modal shows. From here
+    /// Enter and the primary button close the modal; nothing launches again
+    /// from a picker that has already launched once. A refusal that happened
+    /// *before* any byte reached the pane does not set this — it is shown in
+    /// `error`, and the user can pick another profile and try again.
+    pub(super) settled: bool,
     job: Option<AccountJob>,
 }
 
@@ -225,6 +262,28 @@ impl ClientAccountPickerOverlay {
 
     pub(super) fn running(&self) -> bool {
         self.job.is_some()
+    }
+
+    /// Fresh, before any job: nothing running, nothing settled.
+    pub(super) fn idle(
+        pane_id: String,
+        mode: PickerMode,
+        entries: Vec<AccountEntry>,
+        selected: usize,
+    ) -> Self {
+        Self {
+            pane_id,
+            mode,
+            entries,
+            selected,
+            query: String::new(),
+            search_focused: false,
+            progress: None,
+            error: None,
+            warnings: Vec::new(),
+            settled: false,
+            job: None,
+        }
     }
 
     pub(super) fn filtered_indices(&self) -> Vec<usize> {
@@ -266,6 +325,7 @@ impl ClientAccountPickerOverlay {
                 warnings,
             }) => {
                 self.progress = None;
+                self.settled = true;
                 self.warnings = warnings;
                 self.error = match state {
                     AccountState::Ok => None,
@@ -283,11 +343,48 @@ impl ClientAccountPickerOverlay {
             }
             AccountJobEvent::Finished(AccountJobResult::Failed { message, note }) => {
                 self.progress = None;
+                self.settled = true;
                 self.error = Some(message);
                 self.warnings = note.into_iter().collect();
                 false
             }
         }
+    }
+}
+
+/// The kind of agent occupying `pane_id`, if any, as the pane menu needs it.
+///
+/// Any entry in `snapshot.agents` means the pane's terminal is an agent
+/// terminal — a managed launch (named, possibly still pending detection) or a
+/// `claude` someone started by hand. Either way `agent.start` has nothing to
+/// do there, so the item is withheld and the picker refuses. A managed entry
+/// with no detected kind yet still counts; the placeholder keeps the answer
+/// `Some`.
+pub(super) fn pane_agent_kind(snapshot: &ClientShellSnapshot, pane_id: &str) -> Option<String> {
+    snapshot
+        .agents
+        .iter()
+        .find(|agent| agent.pane_id == pane_id)
+        .map(|agent| agent.agent.clone().unwrap_or_else(|| "agent".to_owned()))
+}
+
+#[cfg(test)]
+impl ClientAccountPickerOverlay {
+    /// The picker with a launch in flight whose worker never speaks, for
+    /// tests of the running state. The returned sender keeps the channel
+    /// open; drop it to simulate a worker that died.
+    pub(super) fn test_running(
+        mut self,
+        since: Instant,
+    ) -> (Self, std::sync::mpsc::Sender<AccountJobEvent>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.progress = Some("starting claude...");
+        self.job = Some(AccountJob {
+            handle: None,
+            events: rx,
+            last_event: since,
+        });
+        (self, tx)
     }
 }
 
@@ -353,18 +450,22 @@ fn unique_agent_name(taken: &[&str]) -> String {
 /// Run the launch, reporting each phase, and never panic on a closed channel.
 ///
 /// This is the worker body. It is a free function so the thread owns no shell
-/// state: the pane id and the profile name are the whole input, and the
-/// events are the whole output.
+/// state: the pane id, the agent name and the profile are the whole input,
+/// and the events are the whole output. The profile is the one the picker
+/// showed — resolved by the client from the same config the CLI reads, and
+/// checked against the row the user chose before the thread starts — so what
+/// launches is exactly what was on screen, and this thread does no config
+/// I/O of its own.
 fn run_start_job(
     pane_id: String,
     agent_name: String,
-    account: String,
+    profile: AccountProfile,
     events: &std::sync::mpsc::Sender<AccountJobEvent>,
 ) {
     let send = |event: AccountJobEvent| {
-        // A closed receiver means the client is shutting down. Keep going —
-        // stopping between `apply_env` and `finish` would leave an agent
-        // running with no account recorded.
+        // A closed receiver means the modal is gone or the client is shutting
+        // down. Keep going — stopping between `apply_env` and `finish` would
+        // leave an agent running with no account recorded.
         let _ = events.send(event);
     };
     let failed = |message: String| {
@@ -373,21 +474,6 @@ fn run_start_job(
             note: None,
         })
     };
-
-    send(AccountJobEvent::Progress("resolving profile..."));
-    let config = crate::config::Config::load().config;
-    let (profiles, diagnostics) = crate::accounts::profile::load_profiles(&config);
-    let Some(profile) = profiles.get(&account) else {
-        let detail = diagnostics
-            .first()
-            .map(|diagnostic| format!(" ({diagnostic})"))
-            .unwrap_or_default();
-        send(failed(format!(
-            "account {account:?} is no longer configured{detail}"
-        )));
-        return;
-    };
-    let profile: AccountProfile = profile.clone();
 
     send(AccountJobEvent::Progress("exporting profile..."));
     let plan = match crate::accounts::client::prepare(&profile, &pane_id, &agent_name, &[]) {
@@ -481,11 +567,7 @@ impl ClientShellState {
         if !snapshot.panes.iter().any(|pane| pane.pane_id == pane_id) {
             return;
         }
-        if snapshot
-            .agents
-            .iter()
-            .any(|agent| agent.pane_id == pane_id && agent.name.is_some())
-        {
+        if pane_agent_kind(snapshot, &pane_id).is_some() {
             return;
         }
         let taken = snapshot
@@ -499,18 +581,12 @@ impl ClientShellState {
             .position(|entry| entry.is_default)
             .unwrap_or(0);
         self.overlay = Some(ClientShellOverlay::AccountPicker(
-            ClientAccountPickerOverlay {
+            ClientAccountPickerOverlay::idle(
                 pane_id,
-                mode: PickerMode::Start { agent_name },
+                PickerMode::Start { agent_name },
                 entries,
                 selected,
-                query: String::new(),
-                search_focused: false,
-                progress: None,
-                error: None,
-                warnings: Vec::new(),
-                job: None,
-            },
+            ),
         ));
         outcome.repaint = true;
     }
@@ -529,62 +605,98 @@ impl ClientShellState {
             .unwrap_or(0) as isize;
         let next = (current + delta).clamp(0, filtered.len().saturating_sub(1) as isize) as usize;
         picker.selected = filtered[next];
+        // A refusal was about the row that was highlighted; moving off it is
+        // the user's answer to it.
+        if !picker.settled {
+            picker.error = None;
+        }
+    }
+
+    /// Why the highlighted row cannot be launched right now, or the profile
+    /// to launch it under.
+    ///
+    /// Every check here happens before a byte reaches any pane. The pinned
+    /// pane is re-checked against the live snapshot because a modal can be up
+    /// for minutes and the pane may have closed or grown an agent; the
+    /// endpoint is re-checked because a pending activation can complete under
+    /// the modal, after which `self.snapshot` describes *another server's*
+    /// panes — whose ids collide with local ones — while the worker would
+    /// still type into the local pane of that id. The profile is re-read from
+    /// the client's config, which reloads live, and must still describe the
+    /// row the user chose: a name that now points somewhere else is not the
+    /// account they picked.
+    fn account_launch_preflight(
+        &self,
+        picker: &ClientAccountPickerOverlay,
+        entry: &AccountEntry,
+    ) -> Result<AccountProfile, String> {
+        let pane_id = &picker.pane_id;
+        let account = &entry.name;
+        if !self.active_endpoint_id.is_local() {
+            return Err("herdr is no longer attached to the local server".to_owned());
+        }
+        let Some(snapshot) = self.snapshot.as_deref() else {
+            return Err("herdr has no snapshot of this server yet".to_owned());
+        };
+        if !snapshot.panes.iter().any(|pane| &pane.pane_id == pane_id) {
+            return Err(format!("pane {pane_id} is gone"));
+        }
+        if pane_agent_kind(snapshot, pane_id).is_some() {
+            return Err(format!("pane {pane_id} already runs an agent"));
+        }
+        let Some(profile) = self.config.accounts.get(account) else {
+            return Err(format!(
+                "account {account:?} is no longer configured; close this and reopen the menu"
+            ));
+        };
+        if profile.config_dir.display().to_string() != entry.config_dir {
+            return Err(format!(
+                "account {account:?} changed since this opened; close this and reopen the menu"
+            ));
+        }
+        if !entry.dir_exists {
+            return Err(format!(
+                "account {account:?} has no config directory; run `herdr account add {account}`"
+            ));
+        }
+        Ok(profile.clone())
     }
 
     /// Start the launch for the highlighted profile.
     ///
-    /// Re-checks the pinned pane against the live snapshot first: a modal can
-    /// be up for minutes, and the pane may have closed or grown an agent since
-    /// the menu opened. Both refusals happen before a byte reaches any pane.
+    /// Nothing happens unless [`Self::account_launch_preflight`] agrees; a
+    /// refusal is shown in the modal and leaves it usable, since nothing was
+    /// typed anywhere.
     fn submit_account_picker(&mut self, outcome: &mut ClientShellInput) {
         let Some(ClientShellOverlay::AccountPicker(picker)) = self.overlay.as_ref() else {
             return;
         };
-        if picker.running() {
+        if picker.running() || picker.settled {
             return;
         }
-        let pane_id = picker.pane_id.clone();
         let Some(entry) = picker.selected_entry() else {
             return;
         };
-        let account = entry.name.clone();
-        let dir_exists = entry.dir_exists;
+        let pane_id = picker.pane_id.clone();
         let PickerMode::Start { agent_name } = &picker.mode;
         let agent_name = agent_name.clone();
 
-        let refusal = match self.snapshot.as_deref() {
-            None => Some("herdr has no snapshot of this server yet".to_owned()),
-            Some(snapshot) if !snapshot.panes.iter().any(|pane| pane.pane_id == pane_id) => {
-                Some(format!("pane {pane_id} is gone"))
+        let profile = match self.account_launch_preflight(picker, entry) {
+            Ok(profile) => profile,
+            Err(message) => {
+                if let Some(ClientShellOverlay::AccountPicker(picker)) = self.overlay.as_mut() {
+                    picker.error = Some(message);
+                    picker.warnings.clear();
+                }
+                outcome.repaint = true;
+                return;
             }
-            Some(snapshot)
-                if snapshot
-                    .agents
-                    .iter()
-                    .any(|agent| agent.pane_id == pane_id && agent.name.is_some()) =>
-            {
-                Some(format!("pane {pane_id} already runs an agent"))
-            }
-            Some(_) if !dir_exists => Some(format!(
-                "account {account:?} has no config directory; run `herdr account add {account}`"
-            )),
-            Some(_) => None,
         };
-        if let Some(message) = refusal {
-            if let Some(ClientShellOverlay::AccountPicker(picker)) = self.overlay.as_mut() {
-                picker.error = Some(message);
-                picker.warnings.clear();
-            }
-            outcome.repaint = true;
-            return;
-        }
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let worker_pane_id = pane_id.clone();
-        let worker_account = account.clone();
         let handle = std::thread::Builder::new()
             .name("herdr-account-launch".to_owned())
-            .spawn(move || run_start_job(worker_pane_id, agent_name, worker_account, &tx));
+            .spawn(move || run_start_job(pane_id, agent_name, profile, &tx));
         let Some(ClientShellOverlay::AccountPicker(picker)) = self.overlay.as_mut() else {
             return;
         };
@@ -592,10 +704,11 @@ impl ClientShellState {
             Ok(handle) => {
                 picker.error = None;
                 picker.warnings.clear();
-                picker.progress = Some("resolving profile...");
+                picker.progress = Some("exporting profile...");
                 picker.job = Some(AccountJob {
                     handle: Some(handle),
                     events: rx,
+                    last_event: Instant::now(),
                 });
             }
             Err(err) => picker.error = Some(format!("could not start the account launch: {err}")),
@@ -608,13 +721,33 @@ impl ClientShellState {
     /// Called once per client timer tick (≤ 100 ms). Costs one `try_recv` when
     /// no picker is open, and nothing at all per pane or per render.
     pub(crate) fn tick_account_picker(&mut self) -> bool {
+        self.tick_account_picker_at(Instant::now())
+    }
+
+    /// [`Self::tick_account_picker`] at a given instant, so the stall limit is
+    /// testable without waiting it out.
+    fn tick_account_picker_at(&mut self, now: Instant) -> bool {
         let Some(ClientShellOverlay::AccountPicker(picker)) = self.overlay.as_mut() else {
             return false;
         };
         let Some(job) = picker.job.as_mut() else {
             return false;
         };
-        let (events, finished) = job.drain();
+        let (mut events, mut finished) = job.drain(now);
+        if !finished && events.is_empty() && job.stalled(now) {
+            // Detach rather than join: a thread that is stuck in a socket
+            // read would take the event loop down with it.
+            job.detach();
+            events.push(AccountJobEvent::Finished(AccountJobResult::Failed {
+                message: format!(
+                    "no answer from the server for {}s; the launch may still finish on its \
+                     own — check `herdr agent list` before starting another",
+                    ACCOUNT_JOB_STALL_LIMIT.as_secs()
+                ),
+                note: None,
+            }));
+            finished = true;
+        }
         if events.is_empty() && !finished {
             return false;
         }
@@ -647,14 +780,14 @@ impl ClientShellState {
         // the only place its outcome is reported.
         let running = picker.running();
         let search_focused = picker.search_focused;
-        let settled = picker.error.is_some() || !picker.warnings.is_empty();
+        let settled = picker.settled;
         match code {
             KeyCode::Esc if !running => {
                 self.overlay = None;
                 outcome.repaint = true;
             }
-            // Once a result is on screen, Enter acknowledges it rather than
-            // launching a second agent into the same pane.
+            // Once a launch has ended, Enter acknowledges its outcome rather
+            // than launching a second agent into the same pane.
             KeyCode::Enter if !running && settled => {
                 self.overlay = None;
                 outcome.repaint = true;
@@ -723,7 +856,7 @@ impl ClientShellState {
             return false;
         };
         let running = picker.running();
-        let settled = picker.error.is_some() || !picker.warnings.is_empty();
+        let settled = picker.settled;
         match kind {
             MouseEventKind::ScrollUp if !running => {
                 self.move_account_picker_selection(-1);
@@ -790,19 +923,36 @@ mod tests {
     }
 
     fn picker(entries: Vec<AccountEntry>) -> ClientAccountPickerOverlay {
-        ClientAccountPickerOverlay {
-            pane_id: "p1".to_owned(),
-            mode: PickerMode::Start {
+        ClientAccountPickerOverlay::idle(
+            "p1".to_owned(),
+            PickerMode::Start {
                 agent_name: "claude".to_owned(),
             },
             entries,
-            selected: 0,
-            query: String::new(),
-            search_focused: false,
-            progress: None,
-            error: None,
-            warnings: Vec::new(),
-            job: None,
+            0,
+        )
+    }
+
+    fn agent_on(
+        pane_id: &str,
+        name: Option<&str>,
+        kind: Option<&str>,
+    ) -> crate::protocol::ClientShellAgent {
+        crate::protocol::ClientShellAgent {
+            pane_id: pane_id.into(),
+            workspace_id: "ws_1".into(),
+            tab_id: "tab_1".into(),
+            name: name.map(Into::into),
+            display_agent: kind.map(Into::into),
+            agent: kind.map(Into::into),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_status: crate::api::schema::AgentStatus::Idle,
+            state_change_seq: 1,
+            state_labels: Vec::new(),
+            tokens: Vec::new(),
+            focused: false,
         }
     }
 
@@ -979,8 +1129,9 @@ mod tests {
         let mut job = AccountJob {
             handle: None,
             events: rx,
+            last_event: Instant::now(),
         };
-        let (events, finished) = job.drain();
+        let (events, finished) = job.drain(Instant::now());
         assert!(finished);
         assert_eq!(events.len(), 2);
         assert!(matches!(
@@ -1002,10 +1153,33 @@ mod tests {
         let mut job = AccountJob {
             handle: None,
             events: rx,
+            last_event: Instant::now(),
         };
-        let (events, finished) = job.drain();
+        let (events, finished) = job.drain(Instant::now());
         assert!(finished);
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn a_launch_outcome_settles_the_picker_but_a_refusal_does_not() {
+        let mut overlay = picker(vec![entry("work", false)]);
+        assert!(!overlay.settled);
+        overlay.fold(AccountJobEvent::Progress("starting claude..."));
+        assert!(!overlay.settled, "progress is not an outcome");
+        overlay.fold(AccountJobEvent::Finished(AccountJobResult::Failed {
+            message: "no".to_owned(),
+            note: None,
+        }));
+        assert!(overlay.settled);
+
+        let mut overlay = picker(vec![entry("work", false)]);
+        overlay.fold(AccountJobEvent::Finished(AccountJobResult::Launched {
+            account: "work".to_owned(),
+            state: AccountState::Ok,
+            detail: None,
+            warnings: Vec::new(),
+        }));
+        assert!(overlay.settled, "a clean launch is an outcome too");
     }
 
     // ---- the shell wiring: the item, and the pane the action reaches ----
@@ -1285,5 +1459,276 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- the refusals that keep a launch off the wrong pane or server ----
+
+    /// A profile directory that exists, so the preflight gets past the
+    /// `dir_exists` gate and the test reaches the check it is about.
+    fn present_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-account-overlay-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(root.join("work")).expect("profile dir");
+        root
+    }
+
+    fn picker_error(state: &ClientShellState) -> Option<String> {
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => {
+                assert!(!picker.running(), "nothing may have been launched");
+                picker.error.clone()
+            }
+            other => panic!("expected the picker to stay open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pane_occupied_by_an_unmanaged_agent_gets_no_item_and_is_refused() {
+        let root = present_root("unmanaged");
+        let mut snapshot = two_pane_snapshot();
+        // A `claude` someone typed by hand: detected, never named.
+        snapshot
+            .agents
+            .push(agent_on("pane_2", None, Some("claude")));
+        assert_eq!(
+            pane_agent_kind(&snapshot, "pane_2").as_deref(),
+            Some("claude")
+        );
+        assert_eq!(pane_agent_kind(&snapshot, "pane_1"), None);
+
+        let mut state = shell_with(profiles(&[("work", true)], &root), snapshot.clone());
+        state.open_pane_context_menu("pane_2".to_owned(), 0, 0);
+        assert!(!menu_has_account_item(&state));
+
+        // Opened on a free pane, then the agent appears under the modal.
+        state.overlay = None;
+        state.set_snapshot(Box::new(two_pane_snapshot()));
+        state.open_account_picker("pane_2".to_owned(), &mut ClientShellInput::default());
+        state.set_snapshot(Box::new(snapshot));
+        state.submit_account_picker(&mut ClientShellInput::default());
+        assert_eq!(
+            picker_error(&state).as_deref(),
+            Some("pane pane_2 already runs an agent")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_managed_agent_without_a_detected_kind_still_occupies_its_pane() {
+        let mut snapshot = two_pane_snapshot();
+        // Named by `agent.start`, not yet recognised on screen.
+        snapshot
+            .agents
+            .push(agent_on("pane_2", Some("claude"), None));
+        assert_eq!(
+            pane_agent_kind(&snapshot, "pane_2").as_deref(),
+            Some("agent"),
+            "the item must not be offered on a pane a launch is pending in"
+        );
+        assert!(
+            start_claude_context_item(pane_agent_kind(&snapshot, "pane_2").as_deref(), 1).is_none()
+        );
+    }
+
+    #[test]
+    fn the_picker_refuses_once_the_client_is_attached_elsewhere() {
+        let root = present_root("endpoint");
+        let mut state = shell_with(profiles(&[("work", true)], &root), two_pane_snapshot());
+        state.open_account_picker("pane_2".to_owned(), &mut ClientShellInput::default());
+        // A pending activation completes under the modal: the snapshot is now
+        // another server's, whose `pane_2` is not the pane the menu was
+        // opened on even though the id matches.
+        state.active_endpoint_id =
+            ClientEndpointId::Ssh(crate::client::endpoint::ProfileId::generate());
+        state.submit_account_picker(&mut ClientShellInput::default());
+        assert_eq!(
+            picker_error(&state).as_deref(),
+            Some("herdr is no longer attached to the local server")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_picker_refuses_a_profile_the_config_no_longer_holds() {
+        let root = present_root("vanished");
+        let mut state = shell_with(profiles(&[("work", true)], &root), two_pane_snapshot());
+        state.open_account_picker("pane_2".to_owned(), &mut ClientShellInput::default());
+        // A live config reload dropped the section.
+        state.config.accounts = Profiles::default();
+        state.submit_account_picker(&mut ClientShellInput::default());
+        let error = picker_error(&state).expect("a refusal");
+        assert!(error.contains("no longer configured"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_picker_refuses_a_profile_that_now_points_elsewhere() {
+        let root = present_root("moved");
+        let mut state = shell_with(profiles(&[("work", true)], &root), two_pane_snapshot());
+        state.open_account_picker("pane_2".to_owned(), &mut ClientShellInput::default());
+        // Same name, different directory: not the row the user chose.
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("work")).expect("moved profile dir");
+        state.config.accounts = profiles(&[("work", true)], &elsewhere);
+        state.submit_account_picker(&mut ClientShellInput::default());
+        let error = picker_error(&state).expect("a refusal");
+        assert!(error.contains("changed since this opened"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_refusal_leaves_the_picker_usable_and_moving_off_the_row_clears_it() {
+        let root = std::env::temp_dir().join("herdr-account-overlay-refusal-usable");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut state = shell_with(
+            profiles(&[("perso", false), ("work", true)], &root),
+            two_pane_snapshot(),
+        );
+        state.open_account_picker("pane_2".to_owned(), &mut ClientShellInput::default());
+        state.submit_account_picker(&mut ClientShellInput::default());
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => {
+                assert!(picker.error.is_some());
+                assert!(
+                    !picker.settled,
+                    "nothing was typed, so the picker is not spent"
+                );
+            }
+            other => panic!("expected the picker, got {other:?}"),
+        }
+        state.move_account_picker_selection(-1);
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => {
+                assert_eq!(picker.error, None);
+                assert_eq!(
+                    picker.selected_entry().map(|entry| entry.name.as_str()),
+                    Some("perso")
+                );
+            }
+            other => panic!("expected the picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_settled_picker_never_submits_again() {
+        let root = present_root("settled");
+        let mut state = shell_with(profiles(&[("work", true)], &root), two_pane_snapshot());
+        state.open_account_picker("pane_2".to_owned(), &mut ClientShellInput::default());
+        if let Some(ClientShellOverlay::AccountPicker(picker)) = state.overlay.as_mut() {
+            picker.fold(AccountJobEvent::Finished(AccountJobResult::Failed {
+                message: "claude did not start: agent_pane_busy".to_owned(),
+                note: Some("the line is still in the pane".to_owned()),
+            }));
+        }
+        state.submit_account_picker(&mut ClientShellInput::default());
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => {
+                assert!(!picker.running(), "a second launch must not start");
+                assert_eq!(
+                    picker.error.as_deref(),
+                    Some("claude did not start: agent_pane_busy"),
+                    "the outcome stays on screen"
+                );
+            }
+            other => panic!("expected the picker, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- the worker's lifetime as the tick sees it ----
+
+    #[test]
+    fn a_silent_worker_is_reported_and_detached_after_the_stall_limit() {
+        let mut state = shell_with(Profiles::default(), two_pane_snapshot());
+        let started = Instant::now();
+        let (overlay, keep_alive) = picker(vec![entry("work", false)]).test_running(started);
+        state.overlay = Some(ClientShellOverlay::AccountPicker(overlay));
+
+        // Inside the budget: still waiting, nothing to repaint.
+        let within = started + ACCOUNT_JOB_STALL_LIMIT - Duration::from_secs(1);
+        assert!(!state.tick_account_picker_at(within));
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => assert!(picker.running()),
+            other => panic!("expected the picker, got {other:?}"),
+        }
+
+        // Past it, with the channel still open: give up on the report, not
+        // on the launch.
+        let beyond = started + ACCOUNT_JOB_STALL_LIMIT + Duration::from_secs(1);
+        assert!(state.tick_account_picker_at(beyond));
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => {
+                assert!(!picker.running(), "the modal must be dismissable again");
+                assert!(picker.settled);
+                let error = picker.error.as_deref().expect("the stall is reported");
+                assert!(error.contains("no answer from the server"), "{error}");
+                assert!(error.contains("herdr agent list"), "{error}");
+            }
+            other => panic!("expected the picker to stay open, got {other:?}"),
+        }
+        drop(keep_alive);
+    }
+
+    #[test]
+    fn a_worker_that_speaks_resets_the_stall_clock() {
+        let mut state = shell_with(Profiles::default(), two_pane_snapshot());
+        let started = Instant::now();
+        let (overlay, tx) = picker(vec![entry("work", false)]).test_running(started);
+        state.overlay = Some(ClientShellOverlay::AccountPicker(overlay));
+
+        let later = started + ACCOUNT_JOB_STALL_LIMIT - Duration::from_secs(1);
+        tx.send(AccountJobEvent::Progress("verifying account..."))
+            .expect("send");
+        assert!(state.tick_account_picker_at(later));
+        // The limit is measured from the last word, not from the start.
+        let beyond_start = started + ACCOUNT_JOB_STALL_LIMIT + Duration::from_secs(1);
+        assert!(!state.tick_account_picker_at(beyond_start));
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => {
+                assert!(picker.running());
+                assert_eq!(picker.progress, Some("verifying account..."));
+            }
+            other => panic!("expected the picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_clean_launch_closes_the_modal_from_the_tick() {
+        let mut state = shell_with(Profiles::default(), two_pane_snapshot());
+        let (overlay, tx) = picker(vec![entry("work", false)]).test_running(Instant::now());
+        state.overlay = Some(ClientShellOverlay::AccountPicker(overlay));
+        tx.send(AccountJobEvent::Finished(AccountJobResult::Launched {
+            account: "work".to_owned(),
+            state: AccountState::Ok,
+            detail: None,
+            warnings: Vec::new(),
+        }))
+        .expect("send");
+        assert!(state.tick_account_picker_at(Instant::now()));
+        assert!(state.overlay.is_none(), "a clean launch needs no reading");
+    }
+
+    #[test]
+    fn a_worker_that_died_is_reported_by_the_tick_and_the_modal_stays() {
+        let mut state = shell_with(Profiles::default(), two_pane_snapshot());
+        let (overlay, tx) = picker(vec![entry("work", false)]).test_running(Instant::now());
+        state.overlay = Some(ClientShellOverlay::AccountPicker(overlay));
+        drop(tx);
+        assert!(state.tick_account_picker_at(Instant::now()));
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => {
+                assert!(!picker.running());
+                assert!(picker.settled);
+                let error = picker.error.as_deref().expect("reported");
+                assert!(error.contains("without a result"), "{error}");
+            }
+            other => panic!("expected the picker to stay open, got {other:?}"),
+        }
     }
 }

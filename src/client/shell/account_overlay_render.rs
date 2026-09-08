@@ -80,22 +80,29 @@ pub(super) fn render_account_picker(
         &count,
         Style::default().fg(p.overlay0).bg(p.panel_bg),
     );
-    put_text(
-        b,
-        inner.x,
-        inner.y + 2,
-        inner.width,
-        &"─".repeat(inner.width as usize),
-        Style::default().fg(p.surface1).bg(p.panel_bg),
-    );
+    // Everything below the filter line is laid out from the panel's bottom
+    // up — the button row, then the status line — and the list takes what is
+    // left. On a terminal too small for that, each part is skipped rather
+    // than drawn over the part below it or outside the panel: `popup` only
+    // guarantees an inner height of two.
+    if inner.height >= 3 {
+        put_text(
+            b,
+            inner.x,
+            inner.y + 2,
+            inner.width,
+            &"─".repeat(inner.width as usize),
+            Style::default().fg(p.surface1).bg(p.panel_bg),
+        );
+    }
 
     let body = Rect::new(
         inner.x,
-        inner.y + 3,
+        inner.y.saturating_add(3),
         inner.width,
         inner.height.saturating_sub(7),
     );
-    let visible_count = (body.height / 2).max(1) as usize;
+    let visible_count = (body.height / 2) as usize;
     let selected_index = picker.selected_entry_index();
     let selected_position = selected_index
         .and_then(|selected| filtered.iter().position(|index| *index == selected))
@@ -160,7 +167,7 @@ pub(super) fn render_account_picker(
             },
         );
     }
-    if filtered.is_empty() {
+    if filtered.is_empty() && visible_count > 0 {
         put_text(
             b,
             body.x,
@@ -174,7 +181,9 @@ pub(super) fn render_account_picker(
     // One status line: the phase while a launch runs, then whatever the user
     // has to read afterwards. A failure wins over a warning.
     let status_y = inner.bottom().saturating_sub(3);
-    if let Some(progress) = picker.progress {
+    if inner.height < 6 {
+        // No room between the filter line and the buttons.
+    } else if let Some(progress) = picker.progress {
         put_text(
             b,
             inner.x,
@@ -203,7 +212,7 @@ pub(super) fn render_account_picker(
         );
     }
 
-    let settled = picker.error.is_some() || !picker.warnings.is_empty();
+    let settled = picker.settled;
     let buttons = row(inner, &[16, 12], 2, inner.height.saturating_sub(1));
     let [primary, cancel] = buttons.as_slice() else {
         return None;
@@ -241,11 +250,144 @@ pub(super) fn render_account_picker(
         worktree_search: if running { Rect::default() } else { search },
         worktree_rows: if running { Vec::new() } else { row_hits },
         cursor: (picker.search_focused && !running).then(|| crate::protocol::CursorState {
-            x: (search.x + 3 + display_width(&picker.query)).min(search.right().saturating_sub(1)),
+            x: search
+                .x
+                .saturating_add(3)
+                .saturating_add(display_width(&picker.query))
+                .min(search.right().saturating_sub(1)),
             y: search.y,
             visible: true,
             shape: 0,
         }),
         ..OverlayRender::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use account_overlay::{AccountEntry, PickerMode};
+
+    fn palette() -> Palette {
+        crate::app::client_palette_from_config(&crate::config::Config::default())
+    }
+
+    fn entry(name: &str) -> AccountEntry {
+        AccountEntry {
+            name: name.to_owned(),
+            config_dir: format!("/tmp/profiles/{name}"),
+            dir_exists: true,
+            logged_in: true,
+            hook_installed: true,
+            is_default: name == "work",
+        }
+    }
+
+    fn picker(count: usize) -> ClientAccountPickerOverlay {
+        ClientAccountPickerOverlay::idle(
+            "pane_2".to_owned(),
+            PickerMode::Start {
+                agent_name: "claude".to_owned(),
+            },
+            (0..count)
+                .map(|index| entry(&format!("acct-{index}")))
+                .collect(),
+            0,
+        )
+    }
+
+    #[test]
+    fn every_terminal_size_renders_without_panicking() {
+        let palette = palette();
+        for cols in 1..=40_u16 {
+            for rows in 1..=14_u16 {
+                let mut buffer = Buffer::empty(Rect::new(0, 0, cols, rows));
+                let idle = picker(3);
+                let _ = render_account_picker(&mut buffer, &idle, &palette);
+
+                let mut settled = picker(3);
+                settled.settled = true;
+                settled.error = Some("claude did not start: agent_pane_busy".to_owned());
+                settled.warnings = vec!["CLAUDE_CONFIG_DIR is still exported".to_owned()];
+                settled.search_focused = true;
+                settled.query = "a".repeat(200);
+                let _ = render_account_picker(&mut buffer, &settled, &palette);
+
+                let (running, _tx) = picker(3).test_running(std::time::Instant::now());
+                let _ = render_account_picker(&mut buffer, &running, &palette);
+            }
+        }
+    }
+
+    #[test]
+    fn a_full_size_render_reports_one_hit_per_visible_row_and_nothing_while_running() {
+        let palette = palette();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 40));
+        let idle = picker(3);
+        let rendered = render_account_picker(&mut buffer, &idle, &palette).expect("rendered");
+        assert_eq!(rendered.worktree_rows.len(), 3);
+        let indices = rendered
+            .worktree_rows
+            .iter()
+            .map(|(_, index)| *index)
+            .collect::<Vec<_>>();
+        assert_eq!(indices, vec![0, 1, 2]);
+        assert!(!rendered.worktree_search.is_empty());
+        assert!(!rendered.primary.is_empty());
+        assert!(!rendered.cancel.is_empty());
+        assert!(
+            rendered.cursor.is_none(),
+            "no cursor until the filter is focused"
+        );
+
+        let (running, _tx) = picker(3).test_running(std::time::Instant::now());
+        let rendered = render_account_picker(&mut buffer, &running, &palette).expect("rendered");
+        assert!(
+            rendered.worktree_rows.is_empty(),
+            "no row may be clicked mid-launch"
+        );
+        assert!(rendered.worktree_search.is_empty());
+        assert!(rendered.cancel.is_empty(), "no cancel mid-launch");
+        assert!(rendered.cursor.is_none());
+    }
+
+    #[test]
+    fn the_filter_narrows_the_hits_to_the_matching_rows() {
+        let palette = palette();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 40));
+        let mut filtered = picker(3);
+        filtered.query = "acct-2".to_owned();
+        filtered.search_focused = true;
+        let rendered = render_account_picker(&mut buffer, &filtered, &palette).expect("rendered");
+        assert_eq!(
+            rendered
+                .worktree_rows
+                .iter()
+                .map(|(_, index)| *index)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        let cursor = rendered.cursor.expect("the filter has the cursor");
+        assert_eq!(cursor.y, rendered.worktree_search.y);
+        assert!(cursor.x < rendered.worktree_search.right());
+    }
+
+    #[test]
+    fn a_long_list_scrolls_to_keep_the_selection_visible() {
+        let palette = palette();
+        // 20 entries at two rows each will not fit a 26-row popup.
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 30));
+        let mut long = picker(20);
+        long.selected = 19;
+        let rendered = render_account_picker(&mut buffer, &long, &palette).expect("rendered");
+        assert!(
+            rendered.worktree_rows.iter().any(|(_, index)| *index == 19),
+            "the selected row must be among the drawn ones: {:?}",
+            rendered.worktree_rows
+        );
+        assert!(rendered.worktree_rows.len() < 20);
+        for (rect, _) in &rendered.worktree_rows {
+            assert!(rect.bottom() <= buffer.area.bottom());
+        }
+    }
 }
