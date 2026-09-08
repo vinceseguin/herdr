@@ -354,7 +354,7 @@ implementation starts only after E3 is ✅.
 | 8 | feat(accounts): tui switch-account action with confirmation | D · TUI | 5, 7 | ✅ |
 | 9 | feat(detect): claude usage-limit rule and account limit hints | E · Limits | 3, 5 | ✅ |
 | 10 | feat(accounts): herdr account watch labels usage-limited agents | E · Limits | 9 | ✅ |
-| 11 | docs(accounts): accounts guide, adr, readme and roadmap drift | F · Docs | 2, 6, 8, 10 | ⬜ |
+| 11 | docs(accounts): accounts guide, adr, readme and roadmap drift | F · Docs | 2, 6, 8, 10 | ✅ |
 
 **Wave preview:** W1 `[1]` → W2 `[2, 4, 6]` → W3 `[3, 5, 7]` → W4 `[8, 9]`
 → W5 `[10]` → W6 `[11]`. Critical path 1 → 2 → 3 → 9 → 10 → 11 (and 1 → 4 →
@@ -2185,6 +2185,68 @@ the documented shape (paste the transcript into the PR).
 
 **Downstream.** E7 links here for the phone-side switch; E4 reads the
 token names.
+
+**As built (PR 11, merged).** The command output, JSON shapes and console
+transcripts in `docs/fork/accounts.md` were taken from the accounts lab on this
+branch, and a hardening pass then re-checked every remaining factual claim —
+flag by flag, exit code by exit code — against the merged code. The corrections
+below are the deviations from the prose above.
+
+- **The doc-contract test lives in `src/accounts/layout.rs`, not
+  `tests/fork_accounts.rs`.** The crate has no `[lib]` target, so an
+  integration test cannot import `SHARED_ENTRIES` / `COPIED_ENTRIES` /
+  `PRIVATE_ENTRIES` / `SCRUBBED_IDENTITY_KEYS` / `SCRUBBED_KEY_SUBSTRINGS` and
+  would have had to re-parse the module's source text. The unit test
+  `the_accounts_guide_lists_the_seed_layout` reads `docs/fork/accounts.md` from
+  `CARGO_MANIFEST_DIR` and requires every one of those constants — plus
+  `HOOK_DIR` and `HOOK_FILE` — to appear in the guide as an inline code span.
+  A new entry in any list therefore fails the gate until the guide names it.
+  (The check is a substring search, not a table parse: it catches an entry the
+  guide never mentions, not one filed under the wrong heading.)
+- **The guide covers more than the plan listed**, because PRs 3, 5, 9 and 10
+  shipped behaviour with no other user-facing home: the `agents: null` vs `[]`
+  distinction and `account_state_known` on `account status --json`; the switch
+  protocol's `Recheck` phase, pane pinning, two-fact `AwaitShell`,
+  `SessionMismatch` and the exit-code table; the typed-`/exit` fallback for a
+  blocked-by-limit agent; and `account watch`'s full lease lifecycle,
+  interval bounds, explain budget and reconnect rules.
+- **`docs/fork/ROADMAP.md` keeps its E9 scope**; only drift was corrected —
+  the command list (`remove`, `watch`), the real share/copy/private lists, the
+  two-step launch and the rejection of the optional `agent.start` field,
+  server metadata tokens instead of a client-local ledger, the default-
+  resolution chain, the limit-rule caveat, the switch exit codes, and the four
+  open decisions marked resolved with a pointer to ADR 0003. The epic's row in
+  the status table was left for the orchestrator.
+- **ADR 0002's E9 sync-policy table needed no change.** PRs 7 and 8 already
+  recorded every `src/client/**` line, including
+  `ClientContextMenuAction::SwitchClaudeAccount` and the two
+  `pub(crate) mod` widenings in `src/cli.rs`. It was re-read against the merged
+  code rather than re-derived.
+- **The hardening pass corrected what the first draft over-claimed**, and the
+  list is worth keeping because each item is a place the code and an obvious
+  reading of it disagree: `herdr agent list` has no `--json` flag (it always
+  prints JSON, and the flag exits 2); `account status --json` is an *array*;
+  `--print-config` is not a dry run and prints nothing under `--json`; the
+  merge's duplicate-`config_dir` check is lexical, and only `account add` and
+  the seed guards resolve symlinks; `--timeout` reaches the relaunch's
+  readiness wait only inside the server's own 3 s..300 s window; a
+  `PaneReplaced` after a successful relaunch is *abandoned*, not graded; the
+  TUI modal has one status line and a failure wins it, so the recovery hint it
+  collected is only in the CLI's report; the picker's filter needs `/` before
+  it takes typing; `herdr --remote` refuses to carry a subcommand, so it is not
+  the way to run account commands on another host; `account_state =
+  logged_out` is vocabulary nothing currently writes; and `HOOK_FILE` is
+  `herdr-agent-state.ps1` under `#[cfg(windows)]`, which the guide now names so
+  the doc-contract test passes on Windows too.
+- **Evidence captured for the guide** (accounts lab, isolated
+  `XDG_CONFIG_HOME`, fake `claude`): `account list|status|add --dry-run|add
+  --json|remove|default|login`, `agent start --account work` and the
+  account-less `--account none` path, an unknown
+  profile refused with exit 2, `agent switch-account` both directions with the
+  pane transcript, `agent explain` on the limit screen, `account status --json`
+  with `limit`, `account watch --once` in both output shapes, the lease
+  expiring `account_state` at ~20 s, and `fleet status` with its `ACCOUNT`
+  column.
 
 ## Critical files referenced (reuse, don't reinvent)
 

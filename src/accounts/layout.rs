@@ -830,6 +830,39 @@ pub fn scrub_claude_json(text: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// The guide documents the seed layout, and this is what keeps it true.
+    ///
+    /// `docs/fork/accounts.md` prints the share/copy/private lists as a table
+    /// a human reads before trusting a new profile with an account. Adding an
+    /// entry here and forgetting the guide would leave that table quietly
+    /// wrong, so every constant this module exports must appear in the guide
+    /// as an inline code span.
+    #[test]
+    fn the_accounts_guide_lists_the_seed_layout() {
+        let guide_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/fork/accounts.md");
+        let guide = std::fs::read_to_string(&guide_path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", guide_path.display()));
+
+        let mut missing = Vec::new();
+        for entry in SHARED_ENTRIES
+            .iter()
+            .chain(COPIED_ENTRIES)
+            .chain(PRIVATE_ENTRIES)
+            .chain(SCRUBBED_IDENTITY_KEYS)
+            .chain(SCRUBBED_KEY_SUBSTRINGS)
+            .chain([&HOOK_DIR, &HOOK_FILE])
+        {
+            if !guide.contains(&format!("`{entry}`")) {
+                missing.push(*entry);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "docs/fork/accounts.md does not document {missing:?}; every \
+             src/accounts/layout.rs entry must appear there as `like this`"
+        );
+    }
+
     fn temp_dir(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
