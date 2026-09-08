@@ -31,9 +31,11 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
+use crate::accounts::client::Confirmation;
 use crate::accounts::layout::{inspect, InspectOptions};
 use crate::accounts::profile::{AccountProfile, Profiles};
-use crate::accounts::tokens::{AccountState, AGENT_LABEL};
+use crate::accounts::switch::{LaunchRequest, SwitchError, SwitchInput, SwitchOptions};
+use crate::accounts::tokens::{AccountState, ACCOUNT_TOKEN, AGENT_LABEL};
 
 /// The agent name a first Claude launch gets, and the stem the next ones are
 /// numbered from.
@@ -66,6 +68,10 @@ pub(super) struct AccountEntry {
     pub(super) logged_in: bool,
     pub(super) hook_installed: bool,
     pub(super) is_default: bool,
+    /// The account this pane's agent already claims. Only ever true in
+    /// [`PickerMode::Switch`]; a switch to it is refused by the machine, and
+    /// the row says so before the user tries.
+    pub(super) is_current: bool,
 }
 
 impl AccountEntry {
@@ -91,15 +97,23 @@ impl AccountEntry {
         !self.dir_exists || !self.logged_in
     }
 
-    /// What the row shows on the right: which profile is the default, and
-    /// what is wrong with it. Both, because they are independent facts and a
-    /// default profile with no hook is exactly the case worth seeing.
+    /// What the row shows on the right: where the agent is now, which profile
+    /// is the default, and what is wrong with it. All three, because they are
+    /// independent facts and a default profile with no hook is exactly the
+    /// case worth seeing.
     pub(super) fn status_text(&self) -> String {
-        match (self.is_default, self.health_label()) {
-            (true, "") => "default".to_owned(),
-            (true, health) => format!("default · {health}"),
-            (false, health) => health.to_owned(),
+        let mut parts: Vec<&str> = Vec::new();
+        if self.is_current {
+            parts.push("current");
         }
+        if self.is_default {
+            parts.push("default");
+        }
+        let health = self.health_label();
+        if !health.is_empty() {
+            parts.push(health);
+        }
+        parts.join(" · ")
     }
 
     pub(super) fn matches_query(&self, query: &str) -> bool {
@@ -113,33 +127,58 @@ impl AccountEntry {
 
 /// What the picker is for.
 ///
-/// PR 8 adds `Switch { agent_name, current }`; the overlay, its key routing
-/// and [`AccountJob`] are shared, and only the submitted job differs.
+/// The overlay, its key routing and [`AccountJob`] are shared between the two;
+/// only the submitted job, the confirmation step and the wording differ.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PickerMode {
     /// Start a new Claude agent in a pane that has none, under the picked
     /// profile, with this name.
     Start { agent_name: String },
+    /// Move the Claude agent already running in this pane to another profile,
+    /// keeping its conversation.
+    Switch {
+        /// The managed name the agent had when the menu was opened. The
+        /// submit-time preflight refuses if the pane no longer holds an agent
+        /// by that name, so the action can only ever reach the agent the user
+        /// right-clicked.
+        agent_name: String,
+        /// What that agent claims today, when it claims anything.
+        current: Option<String>,
+        /// Send `Escape` before `/exit` when the agent turns out to be
+        /// working. Off by default: interrupting a tool call is a decision,
+        /// not a default.
+        interrupt: bool,
+    },
 }
 
 impl PickerMode {
     fn title(&self) -> &'static str {
         match self {
             Self::Start { .. } => "start claude as account",
+            Self::Switch { .. } => "switch claude account",
         }
+    }
+
+    fn is_switch(&self) -> bool {
+        matches!(self, Self::Switch { .. })
     }
 }
 
-/// A step of the launch, as the worker thread reports it.
+/// A step of the launch or switch, as the worker thread reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum AccountJobEvent {
     /// A phase name for the modal; the worker sends one before each blocking
     /// call so a slow launch never looks hung.
     Progress(&'static str),
+    /// The switch protocol is asking the question it always asks. The worker
+    /// is blocked on the answer and nothing has been sent to the pane;
+    /// [`ClientShellState::answer_account_confirm`] is the only thing that
+    /// unblocks it.
+    Confirm(String),
     Finished(AccountJobResult),
 }
 
-/// How a launch ended.
+/// How a launch or a switch ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum AccountJobResult {
     /// The agent is running. `state` is the *graded* account state, so a
@@ -151,12 +190,29 @@ pub(super) enum AccountJobResult {
         detail: Option<String>,
         warnings: Vec<String>,
     },
-    /// Nothing is running under the picked account. `note` is present when the
-    /// environment line had already reached the pane's shell, which outlives
-    /// the failure and has to be said out loud.
+    /// The agent was moved to another profile and kept its conversation.
+    /// Graded exactly like a launch, and a `Mismatch` lands here too.
+    Switched {
+        account: String,
+        state: AccountState,
+        detail: Option<String>,
+        /// The conversation the agent came back with — the same one it had.
+        session_id: String,
+        warnings: Vec<String>,
+    },
+    /// Nothing is running under the picked account. `notes` carries everything
+    /// the user still has to read: the environment line the pane's shell is
+    /// left holding, the switch's own warnings (a relaunched agent *was*
+    /// recorded under the new account even though the protocol did not
+    /// finish), and the `claude --resume <id>` recovery hint.
     Failed {
         message: String,
-        note: Option<String>,
+        notes: Vec<String>,
+        /// True when the worker proved nothing reached the pane, so the agent
+        /// is exactly as it was and the picker stays usable. Only the switch
+        /// protocol can prove this (`SwitchFailure::touched_pane`); a start
+        /// that failed after `prepare` cannot, so it settles the modal.
+        refused: bool,
     },
 }
 
@@ -171,6 +227,16 @@ pub(super) struct AccountJob {
     events: Receiver<AccountJobEvent>,
     /// When the worker last said anything, for the stall limit.
     last_event: Instant,
+    /// The other half of the switch's confirmation. Taken when the user
+    /// answers, and dropped with the job otherwise — a worker whose answer
+    /// channel closes reads that as "there is nobody to ask" and refuses
+    /// without sending anything.
+    answers: Option<std::sync::mpsc::Sender<Confirmation>>,
+    /// True between the worker's question and the user's answer. The stall
+    /// limit is suspended then: the worker is waiting on a person, not on a
+    /// server, and a modal that closed itself under a question would answer
+    /// it by accident.
+    awaiting_confirm: bool,
 }
 
 impl AccountJob {
@@ -197,8 +263,9 @@ impl AccountJob {
                         .any(|event| matches!(event, AccountJobEvent::Finished(_)))
                     {
                         events.push(AccountJobEvent::Finished(AccountJobResult::Failed {
-                            message: "the account launch stopped without a result".to_owned(),
-                            note: None,
+                            message: "the account job stopped without a result".to_owned(),
+                            notes: Vec::new(),
+                            refused: false,
                         }));
                     }
                     break true;
@@ -209,8 +276,24 @@ impl AccountJob {
     }
 
     /// True when the worker has been silent for longer than the stall limit.
+    ///
+    /// A worker blocked on the confirmation is not silent in the sense that
+    /// matters: it is waiting for the person in front of the modal, has sent
+    /// nothing to the pane, and will keep waiting for as long as they need.
     fn stalled(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.last_event) > ACCOUNT_JOB_STALL_LIMIT
+        !self.awaiting_confirm
+            && now.saturating_duration_since(self.last_event) > ACCOUNT_JOB_STALL_LIMIT
+    }
+
+    /// Answer the question the worker is blocked on, exactly once.
+    ///
+    /// `false` means the worker is already gone; the drain reports that on the
+    /// next tick rather than this call inventing an outcome.
+    fn answer(&mut self, answer: Confirmation) -> bool {
+        self.awaiting_confirm = false;
+        self.answers
+            .take()
+            .is_some_and(|answers| answers.send(answer).is_ok())
     }
 
     /// Wait for the thread. Only called once its terminal event has been
@@ -224,8 +307,14 @@ impl AccountJob {
 
     /// Let the thread go without waiting for it. The worker keeps its own
     /// sender and finishes the launch on its own; only its report is lost.
+    ///
+    /// The answer channel goes with it: a detached switch worker that later
+    /// reaches its confirmation finds nobody to ask and refuses, rather than
+    /// blocking for ever on a modal that is no longer listening.
     fn detach(&mut self) {
         drop(self.handle.take());
+        drop(self.answers.take());
+        self.awaiting_confirm = false;
     }
 }
 
@@ -244,6 +333,11 @@ pub(super) struct ClientAccountPickerOverlay {
     /// The phase the worker last reported. `Some` means a job is running and
     /// the modal cannot be dismissed.
     pub(super) progress: Option<&'static str>,
+    /// The switch protocol's own question, while it is on screen. The text is
+    /// the machine's, verbatim: it names the pane, the agent, both accounts
+    /// and the conversation that will be resumed, and it is the only thing
+    /// standing between a right-click and Claude being asked to exit.
+    pub(super) confirm: Option<String>,
     pub(super) error: Option<String>,
     pub(super) warnings: Vec<String>,
     /// A launch has ended and its outcome is what the modal shows. From here
@@ -264,6 +358,21 @@ impl ClientAccountPickerOverlay {
         self.job.is_some()
     }
 
+    /// True while the switch's question is on screen and nothing has been sent
+    /// to the pane. The list is not navigable then — the only two answers are
+    /// yes and no.
+    pub(super) fn awaiting_confirm(&self) -> bool {
+        self.confirm.is_some()
+    }
+
+    /// Whether this picker offers the interrupt toggle, and its state.
+    pub(super) fn interrupt(&self) -> Option<bool> {
+        match &self.mode {
+            PickerMode::Start { .. } => None,
+            PickerMode::Switch { interrupt, .. } => Some(*interrupt),
+        }
+    }
+
     /// Fresh, before any job: nothing running, nothing settled.
     pub(super) fn idle(
         pane_id: String,
@@ -279,6 +388,7 @@ impl ClientAccountPickerOverlay {
             query: String::new(),
             search_focused: false,
             progress: None,
+            confirm: None,
             error: None,
             warnings: Vec::new(),
             settled: false,
@@ -318,37 +428,88 @@ impl ClientAccountPickerOverlay {
                 self.progress = Some(phase);
                 false
             }
+            AccountJobEvent::Confirm(question) => {
+                self.progress = None;
+                self.confirm = Some(question);
+                if let Some(job) = self.job.as_mut() {
+                    job.awaiting_confirm = true;
+                }
+                false
+            }
             AccountJobEvent::Finished(AccountJobResult::Launched {
                 account,
                 state,
                 detail,
                 warnings,
             }) => {
-                self.progress = None;
-                self.settled = true;
-                self.warnings = warnings;
-                self.error = match state {
-                    AccountState::Ok => None,
-                    AccountState::Mismatch => Some(format!(
-                        "claude is running, but not under account {account:?}: {}",
-                        detail.unwrap_or_else(|| "its environment disagrees".to_owned())
-                    )),
-                    other => Some(format!(
-                        "claude is running under account {account:?}, but herdr could not \
-                         confirm it ({})",
-                        other.as_str()
-                    )),
-                };
+                self.settle(warnings);
+                self.error = grade_message("claude is running", &account, state, detail);
                 self.error.is_none() && self.warnings.is_empty()
             }
-            AccountJobEvent::Finished(AccountJobResult::Failed { message, note }) => {
-                self.progress = None;
-                self.settled = true;
+            AccountJobEvent::Finished(AccountJobResult::Switched {
+                account,
+                state,
+                detail,
+                session_id,
+                warnings,
+            }) => {
+                self.settle(warnings);
+                self.error = grade_message(
+                    &format!("claude resumed conversation {session_id}"),
+                    &account,
+                    state,
+                    detail,
+                );
+                self.error.is_none() && self.warnings.is_empty()
+            }
+            AccountJobEvent::Finished(AccountJobResult::Failed {
+                message,
+                notes,
+                refused,
+            }) => {
+                self.settle(notes);
+                // A refusal the worker proved reached nothing is not an
+                // outcome: the agent is exactly as it was, so the picker stays
+                // usable and the user can change their mind about which
+                // profile — or about interrupting — and try again.
+                self.settled = !refused;
                 self.error = Some(message);
-                self.warnings = note.into_iter().collect();
                 false
             }
         }
+    }
+
+    /// Common tail of every terminal event: the job is over, the question is
+    /// gone, and whatever it left to read is on screen.
+    fn settle(&mut self, notes: Vec<String>) {
+        self.progress = None;
+        self.confirm = None;
+        self.settled = true;
+        self.warnings = notes;
+    }
+}
+
+/// How a graded account state reads in the modal.
+///
+/// `Ok` is the only state with nothing to say. A `Mismatch` is a running agent
+/// on the wrong account and must be read; anything else means herdr could not
+/// check, which is never shown as success.
+fn grade_message(
+    lead: &str,
+    account: &str,
+    state: AccountState,
+    detail: Option<String>,
+) -> Option<String> {
+    match state {
+        AccountState::Ok => None,
+        AccountState::Mismatch => Some(format!(
+            "{lead}, but not under account {account:?}: {}",
+            detail.unwrap_or_else(|| "its environment disagrees".to_owned())
+        )),
+        other => Some(format!(
+            "{lead} under account {account:?}, but herdr could not confirm it ({})",
+            other.as_str()
+        )),
     }
 }
 
@@ -361,11 +522,44 @@ impl ClientAccountPickerOverlay {
 /// with no detected kind yet still counts; the placeholder keeps the answer
 /// `Some`.
 pub(super) fn pane_agent_kind(snapshot: &ClientShellSnapshot, pane_id: &str) -> Option<String> {
+    pane_agent(snapshot, pane_id)
+        .map(|agent| agent.agent.clone().unwrap_or_else(|| "agent".to_owned()))
+}
+
+/// The `snapshot.agents` entry for `pane_id`, if any.
+fn pane_agent<'a>(
+    snapshot: &'a ClientShellSnapshot,
+    pane_id: &str,
+) -> Option<&'a crate::protocol::ClientShellAgent> {
     snapshot
         .agents
         .iter()
         .find(|agent| agent.pane_id == pane_id)
-        .map(|agent| agent.agent.clone().unwrap_or_else(|| "agent".to_owned()))
+}
+
+/// The managed Claude agent on `pane_id`, as the switch needs it: its name and
+/// the account it currently claims.
+///
+/// `None` for a pane running something else, or a `claude` nobody named —
+/// `agent.start` needs a name to register the relaunch under, and inventing
+/// one could collide with an agent elsewhere in the session. The switch
+/// protocol refuses both cases too; withholding the menu item is only the
+/// first of the two answers.
+fn pane_claude_agent(
+    snapshot: &ClientShellSnapshot,
+    pane_id: &str,
+) -> Option<(String, Option<String>)> {
+    let agent = pane_agent(snapshot, pane_id)?;
+    if agent.agent.as_deref() != Some(AGENT_LABEL) {
+        return None;
+    }
+    let name = agent.name.clone()?;
+    let account = agent
+        .tokens
+        .iter()
+        .find(|(key, _)| key == ACCOUNT_TOKEN)
+        .map(|(_, value)| value.clone());
+    Some((name, account))
 }
 
 #[cfg(test)]
@@ -383,6 +577,8 @@ impl ClientAccountPickerOverlay {
             handle: None,
             events: rx,
             last_event: since,
+            answers: None,
+            awaiting_confirm: false,
         });
         (self, tx)
     }
@@ -405,11 +601,38 @@ pub(super) fn start_claude_context_item(
     })
 }
 
+/// The switch item, when this pane can have one.
+///
+/// Offered on a pane whose agent herdr recognises as Claude, when the client
+/// has at least two profiles to move between — one to leave, one to arrive at.
+/// `accounts_available` is already zero on a remote endpoint, so the same
+/// field carries the local-only rule the launch has.
+///
+/// Two facts the switch also needs cannot be read from the shell snapshot,
+/// because `ClientShellAgent` carries neither: whether the agent has a managed
+/// name, and whether it has reported a Claude session id. The name is checked
+/// at activation, and the session id is the switch protocol's own first
+/// refusal — which happens before a byte reaches the pane and is shown in the
+/// modal. Widening the wire to gate the menu on them would be a protocol
+/// change for a menu item, which the fork's endpoint rules forbid.
+pub(super) fn switch_account_context_item(
+    agent_kind: Option<&str>,
+    accounts_available: usize,
+) -> Option<ClientContextMenuItem> {
+    (agent_kind == Some(AGENT_LABEL) && accounts_available >= 2).then_some(ClientContextMenuItem {
+        label: "Switch Claude account...",
+        action: ClientContextMenuAction::SwitchClaudeAccount,
+    })
+}
+
 /// The rows for a set of resolved profiles, worst-to-best order preserved.
 ///
 /// Split from [`ClientShellState::open_account_picker`] so the mapping is
 /// testable without a shell; the `inspect` calls are the only I/O.
-fn entries_from_profiles(profiles: &Profiles) -> Vec<AccountEntry> {
+///
+/// `current` is the account the pane's agent already claims, so the switch
+/// picker can say where the agent is now.
+fn entries_from_profiles(profiles: &Profiles, current: Option<&str>) -> Vec<AccountEntry> {
     profiles
         .iter()
         .map(|profile| {
@@ -423,6 +646,7 @@ fn entries_from_profiles(profiles: &Profiles) -> Vec<AccountEntry> {
                 is_default: profiles
                     .default_profile()
                     .is_some_and(|default| default.name == profile.name),
+                is_current: current == Some(profile.name.as_str()),
             }
         })
         .collect()
@@ -445,6 +669,169 @@ fn unique_agent_name(taken: &[&str]) -> String {
     }
     // Unreachable: the loop tries more names than there are taken ones.
     format!("{DEFAULT_AGENT_NAME}-{}", taken.len().saturating_add(2))
+}
+
+/// What a submitted pick asks the worker thread to do.
+///
+/// Built on the shell's thread while every fact is still checked against the
+/// live client state, then moved into the worker whole: the thread reads no
+/// shell state and does no config I/O, so what runs is exactly what was on
+/// screen when Enter was pressed.
+enum AccountJobSpawn {
+    Start {
+        pane_id: String,
+        agent_name: String,
+        profile: AccountProfile,
+    },
+    Switch {
+        pane_id: String,
+        profile: AccountProfile,
+        interrupt: bool,
+    },
+}
+
+/// Move the Claude agent in `pane_id` to `profile`, keeping its conversation.
+///
+/// The whole protocol is `crate::accounts::switch`'s, driven by
+/// `crate::accounts::client`, which is what `herdr agent switch-account`
+/// runs — the same refusals, the same `/exit`, the same `--resume`, the same
+/// grading. This function contributes exactly two things the CLI does
+/// differently: the confirmation is a modal rather than a TTY prompt, and the
+/// note a stranded environment line leaves behind goes into the modal instead
+/// of stderr, where a TUI would paint over it.
+///
+/// The pane is addressed by id from the first read onwards, so the switch can
+/// only ever reach the pane the user right-clicked.
+fn run_switch_job(
+    pane_id: String,
+    profile: AccountProfile,
+    interrupt: bool,
+    events: &std::sync::mpsc::Sender<AccountJobEvent>,
+    answers: &Receiver<Confirmation>,
+) {
+    let input = SwitchInput {
+        target: pane_id,
+        to: profile.clone(),
+        to_inspection: inspect(&profile, InspectOptions::health()),
+        options: SwitchOptions {
+            interrupt,
+            // The TUI offers no force: overriding a logged-out target or a
+            // no-op switch is a deliberate command-line act.
+            force: false,
+            timeout_ms: crate::accounts::switch::DEFAULT_TIMEOUT_MS,
+        },
+    };
+
+    let mut confirm = |question: &str| {
+        if events
+            .send(AccountJobEvent::Confirm(question.to_owned()))
+            .is_err()
+        {
+            // Nobody is listening, so nobody can answer. The machine turns
+            // this into `ConfirmationRequired` and sends nothing.
+            return Confirmation::Unavailable;
+        }
+        // Blocks until the modal answers or is dropped. Nothing has been sent
+        // to the pane at this point, so waiting here is free.
+        answers.recv().unwrap_or(Confirmation::Unavailable)
+    };
+    // Notes the relaunch could not print: the shell that now exports the new
+    // profile's directory outlives a failed `agent.start`.
+    let mut notes: Vec<String> = Vec::new();
+    let mut launch = |request: &LaunchRequest| switch_relaunch(&profile, request, &mut notes);
+    let mut on_phase = |phase: crate::accounts::client::SwitchPhase| {
+        let _ = events.send(AccountJobEvent::Progress(phase.label()));
+    };
+
+    let outcome = crate::accounts::client::switch_account_with_progress(
+        input,
+        &mut confirm,
+        &mut launch,
+        &mut on_phase,
+    );
+
+    let finished = match outcome {
+        Ok(outcome) => {
+            let result = outcome.result;
+            let mut warnings = outcome.warnings;
+            warnings.dedup();
+            AccountJobResult::Switched {
+                account: result.to,
+                state: result.account_state,
+                detail: result.mismatch_detail,
+                session_id: result.session_id,
+                warnings,
+            }
+        }
+        Err(failure) => {
+            let mut notes = notes;
+            notes.extend(failure.warnings.iter().cloned());
+            if let Some(hint) = failure.recovery_hint() {
+                notes.push(hint);
+            }
+            // The one refusal with a TUI answer the CLI's message cannot
+            // name: `--interrupt` is a flag here, not a switch on the modal.
+            if matches!(failure.error, SwitchError::AgentWorking { .. }) {
+                notes.push(
+                    "press i to allow interrupting it, then pick the account again".to_owned(),
+                );
+            }
+            notes.dedup();
+            AccountJobResult::Failed {
+                message: failure.to_string(),
+                notes,
+                // Proven by the protocol: nothing was delivered to the pane,
+                // so the agent is exactly as it was.
+                refused: !failure.touched_pane,
+            }
+        }
+    };
+    let _ = events.send(AccountJobEvent::Finished(finished));
+}
+
+/// The relaunch half of a switch, for the TUI.
+///
+/// The same three steps `herdr agent switch-account` runs — `prepare`,
+/// `apply_env`, the stock `agent.start` retry — with one difference: when the
+/// start fails, the note about the environment line the pane's shell is left
+/// holding is *taken* rather than printed, because an `eprintln!` from under
+/// a rendered screen is lost. It is carried back to the modal instead.
+fn switch_relaunch(
+    profile: &AccountProfile,
+    request: &LaunchRequest,
+    notes: &mut Vec<String>,
+) -> Result<crate::accounts::client::AppliedLine, SwitchError> {
+    let launch_error = |detail: String| SwitchError::Launch {
+        pane_id: request.pane_id.clone(),
+        session_id: request.session_id.clone(),
+        detail,
+    };
+    let plan =
+        crate::accounts::client::prepare(profile, &request.pane_id, &request.name, &request.args)
+            .map_err(|error| launch_error(error.to_string()))?;
+    let applied = crate::accounts::client::apply_env(plan)
+        .map_err(|error| launch_error(error.to_string()))?;
+
+    let started = crate::cli::agent::start_managed_agent(
+        &request.name,
+        AGENT_LABEL,
+        AGENT_LABEL,
+        &request.pane_id,
+        &request.args,
+        None,
+    );
+    let detail = match started {
+        Ok(Ok(_response)) => return Ok(applied),
+        Ok(Err(crate::cli::agent::AgentStartRefusal::Response(response))) => response["error"]
+            ["message"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| response["error"].to_string()),
+        Ok(Err(crate::cli::agent::AgentStartRefusal::Transport(err))) => err.to_string(),
+        Err(err) => err.to_string(),
+    };
+    notes.push(applied.take_note());
+    Err(launch_error(detail))
 }
 
 /// Run the launch, reporting each phase, and never panic on a closed channel.
@@ -471,7 +858,10 @@ fn run_start_job(
     let failed = |message: String| {
         AccountJobEvent::Finished(AccountJobResult::Failed {
             message,
-            note: None,
+            notes: Vec::new(),
+            // A start cannot prove the pane was untouched the way the switch
+            // protocol can, so its failures always settle the modal.
+            refused: false,
         })
     };
 
@@ -519,7 +909,8 @@ fn run_start_job(
         let note = applied.take_note();
         send(AccountJobEvent::Finished(AccountJobResult::Failed {
             message: format!("claude did not start: {message}"),
-            note: Some(note),
+            notes: vec![note],
+            refused: false,
         }));
         return;
     }
@@ -557,7 +948,7 @@ impl ClientShellState {
         if !self.active_endpoint_id.is_local() {
             return;
         }
-        let entries = entries_from_profiles(&self.config.accounts);
+        let entries = entries_from_profiles(&self.config.accounts, None);
         if entries.is_empty() {
             return;
         }
@@ -589,6 +980,75 @@ impl ClientShellState {
             ),
         ));
         outcome.repaint = true;
+    }
+
+    /// Open the picker to move the Claude agent in this pane to another
+    /// profile.
+    ///
+    /// The pane is the one the context menu was opened on, and the agent is
+    /// whichever managed Claude holds it *now* — read here rather than carried
+    /// on the menu target, so the action cannot be aimed at an agent that has
+    /// since gone. Two profiles are required: one to leave, one to arrive at.
+    pub(super) fn open_account_switch_picker(
+        &mut self,
+        pane_id: String,
+        outcome: &mut ClientShellInput,
+    ) {
+        if !self.active_endpoint_id.is_local() {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.as_deref() else {
+            return;
+        };
+        if !snapshot.panes.iter().any(|pane| pane.pane_id == pane_id) {
+            return;
+        }
+        let Some((agent_name, current)) = pane_claude_agent(snapshot, &pane_id) else {
+            return;
+        };
+        let entries = entries_from_profiles(&self.config.accounts, current.as_deref());
+        if entries.len() < 2 {
+            return;
+        }
+        // Land on somewhere worth going: not where the agent already is, and
+        // not a profile herdr already knows it cannot launch under.
+        let selected = entries
+            .iter()
+            .position(|entry| !entry.is_current && !entry.unusable())
+            .or_else(|| entries.iter().position(|entry| !entry.is_current))
+            .unwrap_or(0);
+        self.overlay = Some(ClientShellOverlay::AccountPicker(
+            ClientAccountPickerOverlay::idle(
+                pane_id,
+                PickerMode::Switch {
+                    agent_name,
+                    current,
+                    interrupt: false,
+                },
+                entries,
+                selected,
+            ),
+        ));
+        outcome.repaint = true;
+    }
+
+    /// Flip whether a switch may interrupt a working agent.
+    ///
+    /// Only meaningful in [`PickerMode::Switch`], and only before the job
+    /// starts: the machine's preflight reads it once, and an agent that is
+    /// working refuses the switch outright unless it is set.
+    fn toggle_account_interrupt(&mut self) -> bool {
+        let Some(ClientShellOverlay::AccountPicker(picker)) = self.overlay.as_mut() else {
+            return false;
+        };
+        if picker.running() || picker.settled {
+            return false;
+        }
+        let PickerMode::Switch { interrupt, .. } = &mut picker.mode else {
+            return false;
+        };
+        *interrupt = !*interrupt;
+        true
     }
 
     fn move_account_picker_selection(&mut self, delta: isize) {
@@ -631,19 +1091,78 @@ impl ClientShellState {
         entry: &AccountEntry,
     ) -> Result<AccountProfile, String> {
         let pane_id = &picker.pane_id;
-        let account = &entry.name;
+        let snapshot = self.account_pane_still_there(pane_id)?;
+        if pane_agent_kind(snapshot, pane_id).is_some() {
+            return Err(format!("pane {pane_id} already runs an agent"));
+        }
+        self.account_profile_unchanged(entry)
+    }
+
+    /// The same checks for a switch: the pane must still be the local pane the
+    /// menu was opened on, and it must still hold the very agent the picker
+    /// was opened for — same managed name, still recognised as Claude.
+    ///
+    /// An agent that exited, was renamed, or was replaced by another one is
+    /// refused here rather than switched: the whole action is "move *that*
+    /// agent", and the pane id alone stops meaning that the moment the agent
+    /// behind it changes. The protocol pins the pane again from its own first
+    /// read and re-checks it after the confirmation; this is the check that
+    /// happens before a thread is even spawned.
+    fn account_switch_preflight(
+        &self,
+        picker: &ClientAccountPickerOverlay,
+        entry: &AccountEntry,
+        agent_name: &str,
+    ) -> Result<AccountProfile, String> {
+        let pane_id = &picker.pane_id;
+        let snapshot = self.account_pane_still_there(pane_id)?;
+        match pane_claude_agent(snapshot, pane_id) {
+            Some((name, _)) if name == agent_name => {}
+            Some((name, _)) => {
+                return Err(format!(
+                    "pane {pane_id} now runs agent {name:?}, not {agent_name:?}; close this and \
+                     reopen the menu"
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "agent {agent_name:?} is no longer running in pane {pane_id}"
+                ))
+            }
+        }
+        if entry.is_current {
+            return Err(format!(
+                "agent {agent_name:?} already runs under account {:?}",
+                entry.name
+            ));
+        }
+        self.account_profile_unchanged(entry)
+    }
+
+    /// The endpoint and the pane, re-read from the live client state.
+    ///
+    /// The endpoint is re-checked because a pending activation can complete
+    /// under the modal, after which `self.snapshot` describes *another
+    /// server's* panes — whose ids collide with local ones — while the worker
+    /// would still address the local pane of that id.
+    fn account_pane_still_there(&self, pane_id: &str) -> Result<&ClientShellSnapshot, String> {
         if !self.active_endpoint_id.is_local() {
             return Err("herdr is no longer attached to the local server".to_owned());
         }
         let Some(snapshot) = self.snapshot.as_deref() else {
             return Err("herdr has no snapshot of this server yet".to_owned());
         };
-        if !snapshot.panes.iter().any(|pane| &pane.pane_id == pane_id) {
+        if !snapshot.panes.iter().any(|pane| pane.pane_id == pane_id) {
             return Err(format!("pane {pane_id} is gone"));
         }
-        if pane_agent_kind(snapshot, pane_id).is_some() {
-            return Err(format!("pane {pane_id} already runs an agent"));
-        }
+        Ok(snapshot)
+    }
+
+    /// The profile is re-read from the client's config, which reloads live,
+    /// and must still describe the row the user chose: a name that now points
+    /// somewhere else is not the account they picked.
+    fn account_profile_unchanged(&self, entry: &AccountEntry) -> Result<AccountProfile, String> {
+        let account = &entry.name;
         let Some(profile) = self.config.accounts.get(account) else {
             return Err(format!(
                 "account {account:?} is no longer configured; close this and reopen the menu"
@@ -678,25 +1197,60 @@ impl ClientShellState {
             return;
         };
         let pane_id = picker.pane_id.clone();
-        let PickerMode::Start { agent_name } = &picker.mode;
-        let agent_name = agent_name.clone();
 
-        let profile = match self.account_launch_preflight(picker, entry) {
-            Ok(profile) => profile,
-            Err(message) => {
-                if let Some(ClientShellOverlay::AccountPicker(picker)) = self.overlay.as_mut() {
-                    picker.error = Some(message);
-                    picker.warnings.clear();
-                }
-                outcome.repaint = true;
-                return;
+        // Every refusal below happens before a thread exists, so nothing can
+        // have reached any pane.
+        let (spawn, first_phase) = match picker.mode.clone() {
+            PickerMode::Start { agent_name } => {
+                let profile = match self.account_launch_preflight(picker, entry) {
+                    Ok(profile) => profile,
+                    Err(message) => return self.refuse_account_picker(message, outcome),
+                };
+                (
+                    AccountJobSpawn::Start {
+                        pane_id,
+                        agent_name,
+                        profile,
+                    },
+                    "exporting profile...",
+                )
+            }
+            PickerMode::Switch {
+                agent_name,
+                interrupt,
+                ..
+            } => {
+                let profile = match self.account_switch_preflight(picker, entry, &agent_name) {
+                    Ok(profile) => profile,
+                    Err(message) => return self.refuse_account_picker(message, outcome),
+                };
+                (
+                    AccountJobSpawn::Switch {
+                        pane_id,
+                        profile,
+                        interrupt,
+                    },
+                    crate::accounts::client::SwitchPhase::Preflight.label(),
+                )
             }
         };
 
         let (tx, rx) = std::sync::mpsc::channel();
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel();
         let handle = std::thread::Builder::new()
-            .name("herdr-account-launch".to_owned())
-            .spawn(move || run_start_job(pane_id, agent_name, profile, &tx));
+            .name("herdr-account-job".to_owned())
+            .spawn(move || match spawn {
+                AccountJobSpawn::Start {
+                    pane_id,
+                    agent_name,
+                    profile,
+                } => run_start_job(pane_id, agent_name, profile, &tx),
+                AccountJobSpawn::Switch {
+                    pane_id,
+                    profile,
+                    interrupt,
+                } => run_switch_job(pane_id, profile, interrupt, &tx, &answer_rx),
+            });
         let Some(ClientShellOverlay::AccountPicker(picker)) = self.overlay.as_mut() else {
             return;
         };
@@ -704,14 +1258,63 @@ impl ClientShellState {
             Ok(handle) => {
                 picker.error = None;
                 picker.warnings.clear();
-                picker.progress = Some("exporting profile...");
+                picker.progress = Some(first_phase);
                 picker.job = Some(AccountJob {
                     handle: Some(handle),
                     events: rx,
                     last_event: Instant::now(),
+                    answers: Some(answer_tx),
+                    awaiting_confirm: false,
                 });
             }
-            Err(err) => picker.error = Some(format!("could not start the account launch: {err}")),
+            Err(err) => picker.error = Some(format!("could not start the account job: {err}")),
+        }
+        outcome.repaint = true;
+    }
+
+    /// Show a refusal that reached nothing, and leave the picker usable.
+    fn refuse_account_picker(&mut self, message: String, outcome: &mut ClientShellInput) {
+        if let Some(ClientShellOverlay::AccountPicker(picker)) = self.overlay.as_mut() {
+            picker.error = Some(message);
+            picker.warnings.clear();
+        }
+        outcome.repaint = true;
+    }
+
+    /// Answer the switch's confirmation.
+    ///
+    /// The only place `Observation::Confirmed` can come from in the TUI. `yes`
+    /// releases the worker into the protocol; `no` makes it fail with
+    /// `Declined`, having sent nothing.
+    fn answer_account_confirm(&mut self, yes: bool, outcome: &mut ClientShellInput) {
+        let Some(ClientShellOverlay::AccountPicker(picker)) = self.overlay.as_mut() else {
+            return;
+        };
+        if picker.confirm.is_none() {
+            return;
+        }
+        let delivered = picker.job.as_mut().is_some_and(|job| {
+            job.answer(if yes {
+                Confirmation::Yes
+            } else {
+                Confirmation::No
+            })
+        });
+        picker.confirm = None;
+        // The worker's own next phase overwrites this as soon as it moves; the
+        // line is here so the modal never shows an empty body between the
+        // answer and the next event.
+        picker.progress = Some(if yes {
+            crate::accounts::client::SwitchPhase::Recheck.label()
+        } else {
+            "cancelling..."
+        });
+        if !delivered {
+            // The worker is gone. Its channel is closed too, so the next tick
+            // reports that rather than this call inventing an outcome.
+            tracing::debug!(
+                "the account switch worker was gone when the confirmation was answered"
+            );
         }
         outcome.repaint = true;
     }
@@ -740,11 +1343,12 @@ impl ClientShellState {
             job.detach();
             events.push(AccountJobEvent::Finished(AccountJobResult::Failed {
                 message: format!(
-                    "no answer from the server for {}s; the launch may still finish on its \
+                    "no answer from the server for {}s; the job may still finish on its \
                      own — check `herdr agent list` before starting another",
                     ACCOUNT_JOB_STALL_LIMIT.as_secs()
                 ),
-                note: None,
+                notes: Vec::new(),
+                refused: false,
             }));
             finished = true;
         }
@@ -781,6 +1385,24 @@ impl ClientShellState {
         let running = picker.running();
         let search_focused = picker.search_focused;
         let settled = picker.settled;
+        let switch = picker.mode.is_switch();
+
+        // The confirmation owns every key while it is up: there are exactly
+        // two answers, and a keystroke that fell through to the list under a
+        // question about stopping somebody's agent would be a surprise.
+        if picker.awaiting_confirm() {
+            match code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.answer_account_confirm(true, outcome)
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.answer_account_confirm(false, outcome)
+                }
+                _ => {}
+            }
+            return true;
+        }
+
         match code {
             KeyCode::Esc if !running => {
                 self.overlay = None;
@@ -800,6 +1422,14 @@ impl ClientShellState {
             KeyCode::Down if !running => {
                 self.move_account_picker_selection(1);
                 outcome.repaint = true;
+            }
+            // Only the switch has it, and only before the job starts.
+            KeyCode::Char('i') | KeyCode::Char('I')
+                if switch && !running && !settled && !search_focused =>
+            {
+                if self.toggle_account_interrupt() {
+                    outcome.repaint = true;
+                }
             }
             KeyCode::Char('/') if !running && !search_focused => {
                 if let Some(ClientShellOverlay::AccountPicker(picker)) = self.overlay.as_mut() {
@@ -857,6 +1487,20 @@ impl ClientShellState {
         };
         let running = picker.running();
         let settled = picker.settled;
+
+        // Same rule as the keyboard: while the question is up, the two
+        // buttons are the only things on the modal that do anything.
+        if picker.awaiting_confirm() {
+            if let MouseEventKind::Down(MouseButton::Left) = kind {
+                if super::contains(self.hits.overlay_primary, point) {
+                    self.answer_account_confirm(true, outcome);
+                } else if super::contains(self.hits.overlay_cancel, point) {
+                    self.answer_account_confirm(false, outcome);
+                }
+            }
+            return true;
+        }
+
         match kind {
             MouseEventKind::ScrollUp if !running => {
                 self.move_account_picker_selection(-1);
@@ -919,6 +1563,7 @@ mod tests {
             logged_in: true,
             hook_installed: true,
             is_default,
+            is_current: false,
         }
     }
 
@@ -1112,7 +1757,8 @@ mod tests {
         assert!(
             !overlay.fold(AccountJobEvent::Finished(AccountJobResult::Failed {
                 message: "claude did not start: agent_pane_busy".to_owned(),
-                note: Some("CLAUDE_CONFIG_DIR was already exported in pane p1".to_owned()),
+                notes: vec!["CLAUDE_CONFIG_DIR was already exported in pane p1".to_owned()],
+                refused: false,
             }))
         );
         assert!(overlay.error.is_some());
@@ -1130,6 +1776,8 @@ mod tests {
             handle: None,
             events: rx,
             last_event: Instant::now(),
+            answers: None,
+            awaiting_confirm: false,
         };
         let (events, finished) = job.drain(Instant::now());
         assert!(finished);
@@ -1146,7 +1794,8 @@ mod tests {
         tx.send(AccountJobEvent::Progress("one")).expect("send");
         tx.send(AccountJobEvent::Finished(AccountJobResult::Failed {
             message: "no".to_owned(),
-            note: None,
+            notes: Vec::new(),
+            refused: false,
         }))
         .expect("send");
         tx.send(AccountJobEvent::Progress("two")).expect("send");
@@ -1154,6 +1803,8 @@ mod tests {
             handle: None,
             events: rx,
             last_event: Instant::now(),
+            answers: None,
+            awaiting_confirm: false,
         };
         let (events, finished) = job.drain(Instant::now());
         assert!(finished);
@@ -1168,7 +1819,8 @@ mod tests {
         assert!(!overlay.settled, "progress is not an outcome");
         overlay.fold(AccountJobEvent::Finished(AccountJobResult::Failed {
             message: "no".to_owned(),
-            note: None,
+            notes: Vec::new(),
+            refused: false,
         }));
         assert!(overlay.settled);
 
@@ -1444,7 +2096,7 @@ mod tests {
             profile("perso", present.clone(), true),
             profile("work", root.join("work"), false),
         ]);
-        let entries = entries_from_profiles(&profiles);
+        let entries = entries_from_profiles(&profiles, None);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "perso");
         assert!(entries[0].is_default);
@@ -1623,7 +2275,8 @@ mod tests {
         if let Some(ClientShellOverlay::AccountPicker(picker)) = state.overlay.as_mut() {
             picker.fold(AccountJobEvent::Finished(AccountJobResult::Failed {
                 message: "claude did not start: agent_pane_busy".to_owned(),
-                note: Some("the line is still in the pane".to_owned()),
+                notes: vec!["the line is still in the pane".to_owned()],
+                refused: false,
             }));
         }
         state.submit_account_picker(&mut ClientShellInput::default());
@@ -1712,6 +2365,474 @@ mod tests {
         .expect("send");
         assert!(state.tick_account_picker_at(Instant::now()));
         assert!(state.overlay.is_none(), "a clean launch needs no reading");
+    }
+
+    // ---- the switch: the item, the pane and agent it reaches, its answer ----
+
+    /// A claude agent on `pane_2`, named, claiming `account`.
+    fn claude_agent_on(pane_id: &str, name: &str, account: Option<&str>) -> ClientShellSnapshot {
+        let mut snapshot = two_pane_snapshot();
+        let mut agent = agent_on(pane_id, Some(name), Some(AGENT_LABEL));
+        if let Some(account) = account {
+            agent.tokens = vec![(ACCOUNT_TOKEN.to_owned(), account.to_owned())];
+        }
+        snapshot.agents.push(agent);
+        snapshot
+    }
+
+    fn menu_has_switch_item(state: &ClientShellState) -> bool {
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::ContextMenu(menu)) => menu
+                .items()
+                .iter()
+                .any(|item| item.action == ClientContextMenuAction::SwitchClaudeAccount),
+            _ => panic!("expected a context menu"),
+        }
+    }
+
+    #[test]
+    fn the_switch_item_needs_a_claude_agent_and_somewhere_to_move_it() {
+        // One profile is where it already is; there has to be a second.
+        assert!(switch_account_context_item(Some("claude"), 2).is_some());
+        assert!(switch_account_context_item(Some("claude"), 5).is_some());
+        assert!(switch_account_context_item(Some("claude"), 1).is_none());
+        // Not Claude, or nothing running at all.
+        assert!(switch_account_context_item(Some("codex"), 3).is_none());
+        assert!(switch_account_context_item(Some("agent"), 3).is_none());
+        assert!(switch_account_context_item(None, 3).is_none());
+        // A remote endpoint reaches the item as zero profiles.
+        assert!(switch_account_context_item(Some("claude"), 0).is_none());
+    }
+
+    #[test]
+    fn the_two_account_items_are_never_offered_together() {
+        let root = std::env::temp_dir();
+        // A free pane offers only the start item.
+        let mut state = shell_with(
+            profiles(&[("perso", true), ("work", false)], &root),
+            two_pane_snapshot(),
+        );
+        state.open_pane_context_menu("pane_2".to_owned(), 0, 0);
+        assert!(menu_has_account_item(&state));
+        assert!(!menu_has_switch_item(&state));
+
+        // A pane running Claude offers only the switch.
+        let mut state = shell_with(
+            profiles(&[("perso", true), ("work", false)], &root),
+            claude_agent_on("pane_2", "a1", Some("perso")),
+        );
+        state.open_pane_context_menu("pane_2".to_owned(), 0, 0);
+        assert!(!menu_has_account_item(&state));
+        assert!(menu_has_switch_item(&state));
+    }
+
+    #[test]
+    fn activating_the_switch_item_opens_the_picker_on_that_pane_and_agent() {
+        let root = std::env::temp_dir();
+        let mut state = shell_with(
+            profiles(&[("perso", true), ("work", false)], &root),
+            claude_agent_on("pane_2", "a1", Some("perso")),
+        );
+        state.open_pane_context_menu("pane_2".to_owned(), 0, 0);
+        let index = match state.overlay.as_ref() {
+            Some(ClientShellOverlay::ContextMenu(menu)) => menu
+                .items()
+                .iter()
+                .position(|item| item.action == ClientContextMenuAction::SwitchClaudeAccount)
+                .expect("switch item"),
+            _ => panic!("expected a context menu"),
+        };
+        let mut outcome = ClientShellInput::default();
+        state.activate_context_menu_item(index, &mut outcome);
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => {
+                assert_eq!(picker.pane_id, "pane_2");
+                assert!(matches!(
+                    &picker.mode,
+                    PickerMode::Switch { agent_name, current, interrupt }
+                        if agent_name == "a1"
+                            && current.as_deref() == Some("perso")
+                            && !*interrupt
+                ));
+                // The account it is on is marked, and the selection is not it.
+                assert!(picker.entries[0].is_current);
+                assert!(
+                    picker.entries[0]
+                        .status_text()
+                        .starts_with("current · default"),
+                    "{}",
+                    picker.entries[0].status_text()
+                );
+                assert_eq!(
+                    picker.selected_entry().map(|entry| entry.name.as_str()),
+                    Some("work"),
+                    "the picker opens on somewhere worth going"
+                );
+            }
+            other => panic!("expected the account picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_switch_picker_never_opens_without_a_named_claude_and_two_profiles() {
+        let root = std::env::temp_dir();
+        let two = profiles(&[("perso", true), ("work", false)], &root);
+
+        // One profile: nowhere to move to.
+        let mut state = shell_with(
+            profiles(&[("perso", true)], &root),
+            claude_agent_on("pane_2", "a1", Some("perso")),
+        );
+        state.open_account_switch_picker("pane_2".to_owned(), &mut ClientShellInput::default());
+        assert!(state.overlay.is_none());
+
+        // A `claude` nobody named: `agent.start` has no name to resume under.
+        let mut snapshot = two_pane_snapshot();
+        snapshot
+            .agents
+            .push(agent_on("pane_2", None, Some(AGENT_LABEL)));
+        let mut state = shell_with(two.clone(), snapshot);
+        state.open_account_switch_picker("pane_2".to_owned(), &mut ClientShellInput::default());
+        assert!(state.overlay.is_none());
+
+        // Another agent entirely.
+        let mut snapshot = two_pane_snapshot();
+        snapshot
+            .agents
+            .push(agent_on("pane_2", Some("c1"), Some("codex")));
+        let mut state = shell_with(two.clone(), snapshot);
+        state.open_account_switch_picker("pane_2".to_owned(), &mut ClientShellInput::default());
+        assert!(state.overlay.is_none());
+
+        // A pane that is not there.
+        let mut state = shell_with(two, claude_agent_on("pane_2", "a1", None));
+        state.open_account_switch_picker("pane_9".to_owned(), &mut ClientShellInput::default());
+        assert!(state.overlay.is_none());
+    }
+
+    #[test]
+    fn the_switch_refuses_once_the_pane_holds_another_agent() {
+        let root = present_root("switch-moved");
+        let mut state = shell_with(
+            profiles(&[("perso", true), ("work", false)], &root),
+            claude_agent_on("pane_2", "a1", Some("perso")),
+        );
+        state.open_account_switch_picker("pane_2".to_owned(), &mut ClientShellInput::default());
+
+        // The agent exited and another one took the pane while the modal was up.
+        state.set_snapshot(Box::new(claude_agent_on("pane_2", "a2", Some("perso"))));
+        state.submit_account_picker(&mut ClientShellInput::default());
+        let error = picker_error(&state).expect("a refusal");
+        assert!(error.contains("now runs agent \"a2\""), "{error}");
+
+        // And when it left altogether.
+        state.set_snapshot(Box::new(two_pane_snapshot()));
+        state.submit_account_picker(&mut ClientShellInput::default());
+        let error = picker_error(&state).expect("a refusal");
+        assert!(error.contains("no longer running"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_switch_refuses_the_account_the_agent_is_already_on() {
+        let root = present_root("switch-same");
+        let mut state = shell_with(
+            profiles(&[("perso", true), ("work", false)], &root),
+            claude_agent_on("pane_2", "a1", Some("work")),
+        );
+        state.open_account_switch_picker("pane_2".to_owned(), &mut ClientShellInput::default());
+        // Aim it back at where it already is.
+        if let Some(ClientShellOverlay::AccountPicker(picker)) = state.overlay.as_mut() {
+            picker.selected = picker
+                .entries
+                .iter()
+                .position(|entry| entry.is_current)
+                .expect("the current row");
+        }
+        state.submit_account_picker(&mut ClientShellInput::default());
+        let error = picker_error(&state).expect("a refusal");
+        assert!(error.contains("already runs under account"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_interrupt_toggle_belongs_to_the_switch_only() {
+        let root = std::env::temp_dir();
+        let mut state = shell_with(
+            profiles(&[("perso", true), ("work", false)], &root),
+            claude_agent_on("pane_2", "a1", Some("perso")),
+        );
+        state.open_account_switch_picker("pane_2".to_owned(), &mut ClientShellInput::default());
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => {
+                assert_eq!(picker.interrupt(), Some(false))
+            }
+            other => panic!("expected the picker, got {other:?}"),
+        }
+        assert!(state.toggle_account_interrupt());
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => {
+                assert_eq!(picker.interrupt(), Some(true))
+            }
+            other => panic!("expected the picker, got {other:?}"),
+        }
+
+        // A start picker has no such thing to toggle.
+        let mut state = shell_with(profiles(&[("work", true)], &root), two_pane_snapshot());
+        state.open_account_picker("pane_2".to_owned(), &mut ClientShellInput::default());
+        assert!(!state.toggle_account_interrupt());
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => assert_eq!(picker.interrupt(), None),
+            other => panic!("expected the picker, got {other:?}"),
+        }
+    }
+
+    // ---- the confirmation: the only door between a right-click and /exit ----
+
+    fn key(code: KeyCode) -> crate::input::TerminalKey {
+        crate::input::TerminalKey::new(code, crossterm::event::KeyModifiers::empty())
+    }
+
+    /// A switch picker with a worker blocked on its confirmation.
+    fn confirming(state: &mut ClientShellState) -> Receiver<Confirmation> {
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel();
+        let (overlay, event_tx) = ClientAccountPickerOverlay::idle(
+            "pane_2".to_owned(),
+            PickerMode::Switch {
+                agent_name: "a1".to_owned(),
+                current: Some("perso".to_owned()),
+                interrupt: false,
+            },
+            vec![entry("perso", true), entry("work", false)],
+            1,
+        )
+        .test_running(Instant::now());
+        state.overlay = Some(ClientShellOverlay::AccountPicker(overlay));
+        if let Some(ClientShellOverlay::AccountPicker(picker)) = state.overlay.as_mut() {
+            if let Some(job) = picker.job.as_mut() {
+                job.answers = Some(answer_tx);
+            }
+        }
+        event_tx
+            .send(AccountJobEvent::Confirm("Switch agent \"a1\"?".to_owned()))
+            .expect("send");
+        assert!(state.tick_account_picker_at(Instant::now()));
+        std::mem::forget(event_tx);
+        answer_rx
+    }
+
+    #[test]
+    fn the_question_owns_the_keyboard_and_enter_is_the_only_yes() {
+        let mut state = shell_with(Profiles::default(), two_pane_snapshot());
+        let answers = confirming(&mut state);
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => {
+                assert!(picker.awaiting_confirm());
+                assert_eq!(picker.confirm.as_deref(), Some("Switch agent \"a1\"?"));
+                assert_eq!(picker.progress, None);
+            }
+            other => panic!("expected the picker, got {other:?}"),
+        }
+
+        // Everything that is not an answer is swallowed: no navigation, no
+        // filtering, no dismissal under a question about somebody's agent.
+        for code in [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Char('/'),
+            KeyCode::Char('i'),
+            KeyCode::Char('x'),
+        ] {
+            let mut outcome = ClientShellInput::default();
+            assert!(state.route_account_picker_key(&key(code), &mut outcome));
+            assert!(
+                answers.try_recv().is_err(),
+                "{code:?} must not answer the question"
+            );
+        }
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => {
+                assert!(picker.awaiting_confirm(), "still waiting");
+                assert_eq!(picker.selected, 1, "the selection never moved");
+            }
+            other => panic!("expected the picker, got {other:?}"),
+        }
+
+        let mut outcome = ClientShellInput::default();
+        assert!(state.route_account_picker_key(&key(KeyCode::Enter), &mut outcome));
+        assert_eq!(answers.try_recv(), Ok(Confirmation::Yes));
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => {
+                assert!(!picker.awaiting_confirm());
+                assert!(picker.running(), "the worker carries on");
+            }
+            other => panic!("expected the picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn esc_and_n_decline_the_question_and_nothing_else_can() {
+        for code in [KeyCode::Esc, KeyCode::Char('n')] {
+            let mut state = shell_with(Profiles::default(), two_pane_snapshot());
+            let answers = confirming(&mut state);
+            let mut outcome = ClientShellInput::default();
+            assert!(state.route_account_picker_key(&key(code), &mut outcome));
+            assert_eq!(answers.try_recv(), Ok(Confirmation::No), "{code:?}");
+            // Esc under the question answers it; it does not close the modal,
+            // which is where the worker's "nothing was sent" lands.
+            assert!(matches!(
+                state.overlay,
+                Some(ClientShellOverlay::AccountPicker(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_question_is_answered_exactly_once() {
+        let mut state = shell_with(Profiles::default(), two_pane_snapshot());
+        let answers = confirming(&mut state);
+        let mut outcome = ClientShellInput::default();
+        state.route_account_picker_key(&key(KeyCode::Enter), &mut outcome);
+        assert_eq!(answers.try_recv(), Ok(Confirmation::Yes));
+        // A second Enter is the settled-picker path, not another answer.
+        state.route_account_picker_key(&key(KeyCode::Enter), &mut outcome);
+        assert!(answers.try_recv().is_err(), "the machine asks once");
+    }
+
+    #[test]
+    fn a_worker_waiting_on_a_person_never_stalls() {
+        let mut state = shell_with(Profiles::default(), two_pane_snapshot());
+        let _answers = confirming(&mut state);
+        let much_later = Instant::now() + ACCOUNT_JOB_STALL_LIMIT * 10;
+        assert!(!state.tick_account_picker_at(much_later));
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => {
+                assert!(
+                    picker.awaiting_confirm(),
+                    "a question waits as long as it takes"
+                );
+            }
+            other => panic!("expected the picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_switch_that_reached_nothing_leaves_the_picker_usable() {
+        let mut overlay = ClientAccountPickerOverlay::idle(
+            "pane_2".to_owned(),
+            PickerMode::Switch {
+                agent_name: "a1".to_owned(),
+                current: Some("perso".to_owned()),
+                interrupt: false,
+            },
+            vec![entry("perso", true), entry("work", false)],
+            1,
+        );
+        assert!(
+            !overlay.fold(AccountJobEvent::Finished(AccountJobResult::Failed {
+                message: "agent \"a1\" is working".to_owned(),
+                notes: vec!["press i to allow interrupting it".to_owned()],
+                refused: true,
+            }))
+        );
+        assert!(
+            !overlay.settled,
+            "nothing was sent, so the user may try again"
+        );
+        assert!(overlay.error.is_some());
+        assert_eq!(overlay.warnings.len(), 1);
+        assert_eq!(overlay.confirm, None);
+
+        // One that did reach the pane settles: the pane is not as it was, and
+        // a second attempt from the same modal would be a guess.
+        let mut overlay = ClientAccountPickerOverlay::idle(
+            "pane_2".to_owned(),
+            PickerMode::Switch {
+                agent_name: "a1".to_owned(),
+                current: None,
+                interrupt: false,
+            },
+            vec![entry("work", false)],
+            0,
+        );
+        assert!(
+            !overlay.fold(AccountJobEvent::Finished(AccountJobResult::Failed {
+                message: "claude did not come back".to_owned(),
+                notes: vec!["run `claude --resume abc` in pane pane_2".to_owned()],
+                refused: false,
+            }))
+        );
+        assert!(overlay.settled);
+        assert!(overlay.warnings[0].contains("--resume"));
+    }
+
+    #[test]
+    fn a_clean_switch_reports_the_conversation_it_kept_and_closes() {
+        let mut overlay = ClientAccountPickerOverlay::idle(
+            "pane_2".to_owned(),
+            PickerMode::Switch {
+                agent_name: "a1".to_owned(),
+                current: Some("perso".to_owned()),
+                interrupt: false,
+            },
+            vec![entry("perso", true), entry("work", false)],
+            1,
+        );
+        assert!(
+            overlay.fold(AccountJobEvent::Finished(AccountJobResult::Switched {
+                account: "work".to_owned(),
+                state: AccountState::Ok,
+                detail: None,
+                session_id: "abc-123".to_owned(),
+                warnings: Vec::new(),
+            }))
+        );
+        assert_eq!(overlay.error, None);
+        assert!(overlay.settled);
+
+        // A graded mismatch is a running agent on the wrong account: it stays
+        // on screen, naming both the conversation and what the environment says.
+        let mut overlay = ClientAccountPickerOverlay::idle(
+            "pane_2".to_owned(),
+            PickerMode::Switch {
+                agent_name: "a1".to_owned(),
+                current: None,
+                interrupt: false,
+            },
+            vec![entry("work", false)],
+            0,
+        );
+        assert!(
+            !overlay.fold(AccountJobEvent::Finished(AccountJobResult::Switched {
+                account: "work".to_owned(),
+                state: AccountState::Mismatch,
+                detail: Some("it names /home/u/.claude".to_owned()),
+                session_id: "abc-123".to_owned(),
+                warnings: Vec::new(),
+            }))
+        );
+        let error = overlay.error.expect("a mismatch must be shown");
+        assert!(error.contains("abc-123"), "{error}");
+        assert!(error.contains("/home/u/.claude"), "{error}");
+    }
+
+    #[test]
+    fn a_detached_worker_stops_waiting_for_an_answer_nobody_will_give() {
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel::<Confirmation>();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut job = AccountJob {
+            handle: None,
+            events: event_rx,
+            last_event: Instant::now(),
+            answers: Some(answer_tx),
+            awaiting_confirm: true,
+        };
+        assert!(answer_rx.try_recv().is_err());
+        job.detach();
+        // The worker's `recv` returns `Err` rather than blocking for ever, and
+        // the machine reads that as "there is nobody to ask".
+        assert!(matches!(answer_rx.recv(), Err(std::sync::mpsc::RecvError)));
+        assert!(!job.awaiting_confirm);
     }
 
     #[test]

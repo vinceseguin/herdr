@@ -587,6 +587,8 @@ pub(super) enum ClientContextMenuAction {
     ClosePane,
     // Fork (E9): open the account picker for this pane.
     StartClaudeAs,
+    // Fork (E9): move this pane's Claude agent to another account profile.
+    SwitchClaudeAccount,
 }
 
 #[derive(Debug)]
