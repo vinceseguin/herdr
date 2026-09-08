@@ -2122,44 +2122,29 @@ impl Tui {
             .unwrap_or_default()
     }
 
-    /// Wait until the client has written `needle`, and say what it wrote if it
-    /// never does.
-    fn wait_for(&self, needle: &str) {
-        for _ in 0..150 {
-            if self.screen().contains(needle) {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        panic!(
-            "the client never wrote {needle:?}; it wrote:\n{}",
-            self.screen()
-        );
-    }
-
-    fn contains(&self, needle: &str) -> bool {
-        self.screen().contains(needle)
-    }
-
     /// What the client *wrote*, with the escape sequences that addressed it
     /// removed.
     ///
     /// A terminal draws a frame as runs of styled cells separated by cursor
-    /// moves, so a phrase that is one line on screen can be several runs in
-    /// the stream. Matching the raw bytes therefore misses text that is
-    /// plainly visible; stripping the sequences first matches what a person
-    /// would read.
+    /// moves, and ratatui writes only the cells that changed, so a phrase that
+    /// is one line on screen is several runs in the stream with escapes
+    /// between them. Matching the raw bytes therefore misses text that is
+    /// plainly visible, and *which* text it misses depends on what the
+    /// previous frame happened to hold — which is how a raw match turns into a
+    /// flake on a slower machine. Every assertion below matches this instead.
     fn visible_screen(&self) -> String {
         visible(&self.screen())
     }
 
-    fn contains_visible(&self, needle: &str) -> bool {
+    fn contains(&self, needle: &str) -> bool {
         self.visible_screen().contains(needle)
     }
 
-    fn wait_for_visible(&self, needle: &str) {
+    /// Wait until the client has shown `needle`, and say what it showed if it
+    /// never does.
+    fn wait_for(&self, needle: &str) {
         for _ in 0..150 {
-            if self.contains_visible(needle) {
+            if self.contains(needle) {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2260,7 +2245,7 @@ fn the_tui_picker_starts_claude_under_the_account_it_was_given() {
     assert!(
         tui.contains(&format!("pane {pane}")),
         "the modal names the pane it was opened on: {}",
-        tui.screen()
+        tui.visible_screen()
     );
     assert!(tui.contains(&lab.profile_dir(SECOND_PROFILE).display().to_string()));
 
@@ -2287,7 +2272,7 @@ fn the_tui_picker_starts_claude_under_the_account_it_was_given() {
     assert!(
         !agent.is_null(),
         "the picker never started an agent; the client wrote:\n{}",
-        tui.screen()
+        tui.visible_screen()
     );
     assert_eq!(agent["name"], "claude", "{agent:#?}");
     assert_eq!(agent["pane_id"].as_str(), Some(pane.as_str()));
@@ -2348,7 +2333,7 @@ fn the_pane_menu_hides_the_account_item_without_a_configured_profile() {
     assert!(
         !tui.contains("Start Claude as account"),
         "with no profiles the item must be absent: {}",
-        tui.screen()
+        tui.visible_screen()
     );
 }
 
@@ -2402,19 +2387,19 @@ fn the_tui_picker_refuses_a_busy_pane_and_stays_open_to_say_so() {
     );
 
     // Esc dismisses the settled modal; the pane menu is reachable again.
-    let menus_before = tui.screen().matches("Rename pane").count();
+    let menus_before = tui.visible_screen().matches("Rename pane").count();
     tui.send("\x1b");
     std::thread::sleep(std::time::Duration::from_millis(300));
     right_click(&mut tui, 80, 10);
     for _ in 0..50 {
-        if tui.screen().matches("Rename pane").count() > menus_before {
+        if tui.visible_screen().matches("Rename pane").count() > menus_before {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     panic!(
         "the pane menu never came back after Esc; the client wrote:\n{}",
-        tui.screen()
+        tui.visible_screen()
     );
 }
 
@@ -2623,9 +2608,9 @@ fn an_agent_blocked_for_another_reason_carries_no_limit() {
 fn open_switch_picker(tui: &mut Tui, column: u16) {
     tui.wait_for("accounts-lab");
     right_click(tui, column, 10);
-    tui.wait_for_visible("Switch Claude account...");
+    tui.wait_for("Switch Claude account...");
     assert!(
-        !tui.contains_visible("Start Claude as account"),
+        !tui.contains("Start Claude as account"),
         "a pane running an agent has nothing to start: {}",
         tui.visible_screen()
     );
@@ -2634,7 +2619,7 @@ fn open_switch_picker(tui: &mut Tui, column: u16) {
     // is one or two rows down. Counting what is on screen keeps the test
     // independent of which pane the click landed in.
     let mut downs = 1;
-    if tui.contains_visible("Swap with focused pane") {
+    if tui.contains("Swap with focused pane") {
         downs += 1;
     }
     for _ in 0..downs {
@@ -2643,7 +2628,7 @@ fn open_switch_picker(tui: &mut Tui, column: u16) {
     }
     tui.send("\r");
     // The lowercase title is the picker's, not the menu item's.
-    tui.wait_for_visible("switch claude account");
+    tui.wait_for("switch claude account");
 }
 
 /// Wait until `agent get <name>` reports `tokens.account == account`.
@@ -2712,15 +2697,15 @@ fn the_tui_switch_keeps_the_conversation_and_flips_the_account() {
     let other_screen_before = screen(&lab, &other_pane);
 
     assert!(
-        tui.contains_visible("current"),
+        tui.contains("current"),
         "the picker says where the agent is now: {visible}"
     );
 
     // `perso` is where it is, so the picker opens on `work`; Enter submits.
     tui.send("\r");
-    tui.wait_for_visible("↵ confirm");
+    tui.wait_for("↵ confirm");
     assert!(
-        tui.contains_visible("--resume"),
+        tui.contains("--resume"),
         "the confirmation says the conversation is resumed: {}",
         tui.visible_screen()
     );
@@ -2735,7 +2720,7 @@ fn the_tui_switch_keeps_the_conversation_and_flips_the_account() {
     tui.send("\r");
     std::thread::sleep(std::time::Duration::from_millis(250));
     assert!(
-        tui.contains_visible("↵ confirm"),
+        tui.contains("↵ confirm"),
         "a yes before the question could be read must be ignored: {}",
         tui.visible_screen()
     );
@@ -2804,9 +2789,9 @@ fn the_tui_switch_confirmation_can_be_declined_without_typing_anything() {
 
     open_switch_picker(&mut tui, 80);
     tui.send("\r");
-    tui.wait_for_visible("↵ confirm");
+    tui.wait_for("↵ confirm");
     tui.send("n");
-    tui.wait_for_visible("nothing was sent to the pane");
+    tui.wait_for("nothing was sent to the pane");
 
     // The pane is exactly as it was, and so is the agent.
     assert_eq!(
@@ -2830,7 +2815,7 @@ fn the_tui_switch_confirmation_can_be_declined_without_typing_anything() {
     // The picker is usable again: a refusal that reached nothing is not an
     // outcome, so another account can be chosen from the same modal.
     assert!(
-        tui.contains_visible("switch account"),
+        tui.contains("switch account"),
         "the picker stays on screen: {}",
         tui.visible_screen()
     );
@@ -2862,11 +2847,11 @@ fn the_tui_switch_refuses_an_agent_with_no_session_id() {
 
     open_switch_picker(&mut tui, 80);
     tui.send("\r");
-    tui.wait_for_visible("has no Claude session id");
+    tui.wait_for("has no Claude session id");
 
     // No question was ever put, and nothing reached the pane.
     assert!(
-        !tui.contains_visible("↵ confirm"),
+        !tui.contains("↵ confirm"),
         "a switch that cannot run must not ask: {}",
         tui.visible_screen()
     );
