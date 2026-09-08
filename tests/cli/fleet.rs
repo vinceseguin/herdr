@@ -421,3 +421,134 @@ session = "alpha"
     drop(alpha);
     cleanup_test_base(&base);
 }
+
+/// A metadata token reported on one host's agent reaches the merged report.
+///
+/// This is the fork's account path end to end at the fleet layer: whatever
+/// reports `tokens.account` on a server (`herdr agent start --account`, the
+/// switch driver, or the raw `pane.report-metadata` used here) must be visible
+/// through `herdr fleet status --json`, attributed to the right host.
+#[test]
+fn fleet_status_json_carries_agent_metadata_tokens() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+
+    let alpha = spawn_named_server(&config_home, &runtime_dir, "alpha");
+    let beta = spawn_named_server(&config_home, &runtime_dir, "beta");
+    for session in ["alpha", "beta"] {
+        wait_for_socket(
+            &named_client_socket(&config_home, session),
+            Duration::from_secs(15),
+        );
+    }
+    write_config(&config_home, TWO_LOCAL_HOSTS);
+
+    // A pane only appears in the merged agent list once its server considers
+    // it an agent, so claim it through the same hook-authority method a real
+    // agent integration uses before attaching metadata to it.
+    let created = run_named_cli_json(
+        &config_home,
+        &runtime_dir,
+        &[
+            "--session",
+            "alpha",
+            "workspace",
+            "create",
+            "--label",
+            "tokens",
+            "--no-focus",
+        ],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no pane was created on alpha: {created}"))
+        .to_string();
+    let reported = run_named_cli(
+        &config_home,
+        &runtime_dir,
+        &[
+            "--session",
+            "alpha",
+            "pane",
+            "report-agent",
+            &pane_id,
+            "--source",
+            "fork:test",
+            "--agent",
+            "claude",
+            "--state",
+            "idle",
+        ],
+    );
+    assert!(
+        reported.status.success(),
+        "report-agent failed: {}",
+        String::from_utf8_lossy(&reported.stderr)
+    );
+    let reported = run_named_cli(
+        &config_home,
+        &runtime_dir,
+        &[
+            "--session",
+            "alpha",
+            "pane",
+            "report-metadata",
+            &pane_id,
+            "--source",
+            "fork:accounts",
+            "--agent",
+            "claude",
+            "--applies-to-source",
+            "fork:test",
+            "--token",
+            "account=work",
+            "--token",
+            "account_state=ok",
+            "--state-label",
+            "idle=ready",
+        ],
+    );
+    assert!(
+        reported.status.success(),
+        "report-metadata failed: {}",
+        String::from_utf8_lossy(&reported.stderr)
+    );
+
+    let report = run_named_cli_json(
+        &config_home,
+        &runtime_dir,
+        &["fleet", "status", "--json", "--timeout-ms", "15000"],
+    );
+    let agents = report["agents"].as_array().expect("agents array");
+    let agent = agents
+        .iter()
+        .find(|agent| agent["ref"] == format!("alpha/{pane_id}"))
+        .unwrap_or_else(|| panic!("the reporting pane is not a merged agent: {report}"));
+    assert_eq!(agent["host"], "alpha");
+    assert_eq!(agent["tokens"]["account"], "work");
+    assert_eq!(agent["tokens"]["account_state"], "ok");
+    assert_eq!(agent["state_labels"]["idle"], "ready");
+    // The token belongs to that host's agent alone.
+    assert!(
+        agents
+            .iter()
+            .filter(|other| other["ref"] != agent["ref"])
+            .all(|other| other["tokens"].get("account").is_none()),
+        "another host's agent picked up alpha's account token: {report}"
+    );
+
+    // The text table grows an ACCOUNT column exactly when a token is there.
+    let text = run_named_cli(
+        &config_home,
+        &runtime_dir,
+        &["fleet", "status", "--timeout-ms", "15000"],
+    );
+    let text = String::from_utf8_lossy(&text.stdout).to_string();
+    assert!(text.contains("ACCOUNT"), "{text}");
+    assert!(text.contains("work"), "{text}");
+
+    drop(beta);
+    drop(alpha);
+    cleanup_test_base(&base);
+}

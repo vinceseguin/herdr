@@ -349,7 +349,7 @@ implementation starts only after E3 is ✅.
 | 3 | feat(accounts): herdr account status and login | B · CLI | 2 | ✅ |
 | 4 | feat(accounts): launch claude under a profile with herdr agent start --account | B · CLI | 1 | ✅ |
 | 5 | feat(accounts): switch a running claude agent to another profile keeping its session | B · CLI | 4 | ✅ |
-| 6 | feat(fleet): fleet report and change stream carry agent metadata tokens | C · Fleet | 1 | ⬜ |
+| 6 | feat(fleet): fleet report and change stream carry agent metadata tokens | C · Fleet | 1 | ✅ |
 | 7 | feat(accounts): tui account picker to start claude in a pane | D · TUI | 4 | ⬜ |
 | 8 | feat(accounts): tui switch-account action with confirmation | D · TUI | 5, 7 | ⬜ |
 | 9 | feat(detect): claude usage-limit rule and account limit hints | E · Limits | 3, 5 | ⬜ |
@@ -1397,6 +1397,55 @@ phone path.
 **Downstream.** E4's fleet reducer reads `agents[].tokens.account`; E7's
 phone switch action will call the same stock methods PR 5 uses, routed per
 host.
+
+**As built (PR 6, merged).** The plan's *Real current state* for the fleet
+predates E3, the fleet reconnect fix and the upstream v0.9.0 sync; the
+corrections below win over the prose above.
+
+- **`src/fleet/state.rs` line numbers moved** (`MergedAgent` is no longer at
+  `:255`, `HostState::merged_agent` no longer at `:234`, `FleetChange` no
+  longer at `:281`) because `HostState` gained `awaiting_baseline` and its
+  documentation. Nothing about the reconnect fix was touched: the invariant
+  `awaiting_baseline ⟹ connected` and its tests are unchanged, and metadata
+  deltas are computed inside the same `set_snapshot` loop that already folds
+  status changes.
+- **The comparison state lives on `SeenAgent`, not on the old snapshot.**
+  `SeenAgent` gained a `metadata: AgentMetadata { tokens, state_labels }`
+  (`BTreeMap` each) built once per agent per snapshot inside the existing
+  roll-up loop. Cardinality is *agents per snapshot*, never per frame and
+  never per render; `AgentMetadata::of` is the only allocation added, and the
+  delta itself is emitted only for an agent present in **both** snapshots
+  (`known.is_some()`), so a reconnect republishes metadata on `agent_added`
+  and never as an edit.
+- **Equality is order-independent.** The wire carries
+  `Vec<(String, String)>`; the fleet folds it into a `BTreeMap`, so a server
+  that re-ordered its pairs is not a change and the JSON a reader sees is
+  sorted.
+- **A metadata edit does not advance `fleet_change_seq`.** Recency still means
+  "the agent's state advanced"; a token reported by a launcher must not
+  re-order the merged list. The merged cache is still invalidated, so the next
+  `merged_agents()` carries the new maps.
+- **One upstream-adjacent edit the plan did not list:**
+  `src/cli/fleet.rs::render_change` matches `FleetChange` exhaustively, so the
+  new variant needs an arm there. It renders
+  `agent * <ref> <name>=<value>… <status>:<label>…`, or
+  `agent * <ref> cleared` when both maps are empty. No other exhaustive match
+  over `FleetChange` exists (`src/gateway/**` forwards the JSON verbatim and
+  only ever `matches!`-filters it), so E3's gateway carries the new kind and
+  the two new agent fields with **zero gateway changes** — verified live
+  against `/api/fleet`.
+- **`FLEET_STATUS_SCHEMA` stays `herdr.fleet.status.v1`.** Both fields are
+  `#[serde(default)]` on `AgentReport` and on `MergedAgent`, so a document
+  written before they existed still decodes; tests pin that.
+- **`report.rs` now reads `crate::accounts::tokens::ACCOUNT_TOKEN`** for its
+  optional `ACCOUNT` column rather than repeating the string. That is a
+  dependency on a pure const module only; `src/fleet/mod.rs::PURE_MODULES`
+  still passes.
+- Docs: `docs/fork/fleet-core.md` gained the two field rows, the
+  `agent_metadata` line format and the explicit "skip a `kind` you do not
+  know" rule; `docs/fork/gateway.md`'s `agents[]` enumeration, event-kind
+  table and "the remaining nine fields" note (now eleven) were updated with
+  it.
 
 ### PR 7 — feat(accounts): tui account picker to start claude in a pane · deps: 4
 

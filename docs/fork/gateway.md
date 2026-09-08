@@ -576,8 +576,15 @@ lab, two local hosts, abbreviated after the first host:
   `200` with that host marked `unavailable`.
 - Every `agents[]` entry carries `ref` (`host/w1:p1`), `host`, `pane_id`,
   `workspace_id`, `tab_id`, `workspace_label`, `name`, `title`, `agent`,
-  `display_agent`, `agent_status`, `state_change_seq`, `fleet_change_seq` and
-  `focused`. The list is merged across hosts, blocked first.
+  `display_agent`, `agent_status`, `state_change_seq`, `fleet_change_seq`,
+  `focused`, `tokens` and `state_labels`. The list is merged across hosts,
+  blocked first.
+- `tokens` and `state_labels` are the agent's metadata on its own host
+  (`pane.report_metadata` there), each a `{name: value}` object sorted by name —
+  `{}` when the host reported none. `tokens.account` and `tokens.account_state`
+  are the fork's Claude-profile vocabulary; treat any other name as opaque, and
+  treat both objects as **absent** (not an error) when reading a report written
+  by an older client.
 
 ### Errors
 
@@ -736,16 +743,18 @@ Then one message per change, each a newline-free JSON object tagged by `kind`:
 | `agent_added` | `agent` | An agent pane joined, or rejoined with fresh recency — treat it as an **upsert** keyed by `agent.pane`. |
 | `agent_removed` | `pane` | `host/w1:p1`. |
 | `agent_status` | `pane`, `from`, `to` | A status transition. |
+| `agent_metadata` | `pane`, `tokens`, `state_labels` | An agent already in the list changed its metadata. Both maps are the **whole** metadata after the change, not a patch — both empty means everything was cleared. An agent that just joined carries its metadata on `agent_added` instead. |
 | `active_host` | `host` | Not emitted by a gateway (it has no active host). |
 | `resync` | — | You fell behind; a fresh `fleet` follows immediately. |
 
 **`agent_added.agent` is not the `agents[]` shape.** The delta carries the
 merged agent as the fleet model holds it: `pane`, `workspace` and `tab` are
 single `host/id` strings where `/api/fleet`'s `agents[]` spells them out as
-`ref` + `host` + `pane_id` + `workspace_id` + `tab_id`. The remaining nine
+`ref` + `host` + `pane_id` + `workspace_id` + `tab_id`. The remaining eleven
 fields (`workspace_label`, `name`, `title`, `agent`, `display_agent`,
-`agent_status`, `state_change_seq`, `fleet_change_seq`, `focused`) are spelled
-the same. A client needs two decoders, or one that accepts both spellings.
+`agent_status`, `state_change_seq`, `fleet_change_seq`, `focused`, `tokens`,
+`state_labels`) are spelled the same. A client needs two decoders, or one that
+accepts both spellings.
 
 **A reader must skip a `kind` it does not know** — new kinds are additive and
 E6/E7 will add them.
