@@ -1762,6 +1762,13 @@ win over the prose above.
   worker declared silent on the very next tick, detached, and the switch left to
   run unobserved — losing exactly the warnings that say a resume landed on a
   different conversation.
+- **The TUI reads PR 9's usage limit too.** The switch worker makes the same
+  best-effort `agent.explain` + detection-screen read `herdr agent
+  switch-account` makes and passes `SwitchInput.limit`, so the confirmation
+  modal says *why* the switch is being asked for. That needed `src/cli.rs`'s
+  `mod account;` to become `pub(crate) mod account;` — the same one-word
+  widening PR 7 made for `mod agent;`, in a file ADR 0002 already resolves as
+  "take both".
 - **No notification path.** The plan said a job outliving its modal should land
   in `notifications.rs`; PR 7 made the modal undismissable while a job runs, so
   the only ways to lose it are an endpoint reset or client exit. The worker

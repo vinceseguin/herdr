@@ -578,7 +578,7 @@ impl SwitchPhase {
 fn phase_of(action: &Action, confirmed: bool, launched: bool) -> Option<SwitchPhase> {
     match action {
         Action::AskConfirm(_) => Some(SwitchPhase::Confirm),
-        Action::SendKeys(_) | Action::Prompt(_) => Some(SwitchPhase::Exit),
+        Action::SendKeys(_) | Action::Prompt(_) | Action::SubmitText(_) => Some(SwitchPhase::Exit),
         Action::PollPane => Some(SwitchPhase::AwaitShell),
         Action::Launch(_) => Some(SwitchPhase::Relaunch),
         Action::Grade => Some(SwitchPhase::Grade),

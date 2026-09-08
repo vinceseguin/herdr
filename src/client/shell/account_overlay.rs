@@ -752,11 +752,25 @@ fn run_switch_job(
     events: &std::sync::mpsc::Sender<AccountJobEvent>,
     answers: &Receiver<Confirmation>,
 ) {
+    // Read the agent's screen once, before anything is sent, so the
+    // confirmation can say *why* the switch is being asked for — the same
+    // best-effort read `herdr agent switch-account` makes. An unknown target,
+    // a server that will not answer, or a screen that matches nothing all mean
+    // "herdr saw no limit"; the preflight below is what actually refuses.
+    let limit = crate::cli::account::agent_explain(&pane_id).and_then(|explain| {
+        if !crate::accounts::limit::matched_usage_limit(&explain) {
+            return None;
+        }
+        let screen = crate::cli::account::detection_screen(&pane_id).unwrap_or_default();
+        crate::accounts::limit::classify(&explain, &screen)
+    });
+
     let input = SwitchInput {
         target: pane_id,
         expected_name: Some(agent_name),
         to: profile.clone(),
         to_inspection: inspect(&profile, InspectOptions::health()),
+        limit,
         options: SwitchOptions {
             interrupt,
             // The TUI offers no force: overriding a logged-out target or a

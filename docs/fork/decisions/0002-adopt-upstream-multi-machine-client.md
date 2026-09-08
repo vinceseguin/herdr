@@ -109,9 +109,11 @@ Option 3.
     because `composition.rs` copies those into the hit map for every overlay
     and only the matching overlay's router ever reads them — that is what keeps
     `composition.rs` and `ShellHitMap` out of this list. `src/cli.rs` is
-    already "take both"; its E9 line is `pub(crate) mod agent;`, so the picker's
-    worker can call the one `start_managed_agent` the CLI uses instead of a
-    second copy of the `agent.start` retry. E9 PR 8 (the switch action) added
+    already "take both"; its E9 lines are `pub(crate) mod agent;` and
+    `pub(crate) mod account;`, so the picker's worker can call the one
+    `start_managed_agent` the CLI uses instead of a second copy of the
+    `agent.start` retry, and the switch worker can read the usage limit through
+    the same `agent_explain`/`detection_screen` pair the CLI reads it with. E9 PR 8 (the switch action) added
     the `SwitchClaudeAccount` variant, item and activation arm listed above
     and nothing else outside the two fork-owned files.
   - E1's three hooks in `src/remote/attach.rs` (`pub(crate)` visibility on the

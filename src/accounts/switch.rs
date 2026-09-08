@@ -1313,6 +1313,7 @@ mod tests {
     fn a_usage_limit_is_named_in_the_confirmation() {
         let mut machine = SwitchMachine::new(SwitchInput {
             target: "a1".to_string(),
+            expected_name: None,
             to: profile("work"),
             to_inspection: healthy(),
             options: SwitchOptions::default(),
@@ -1564,6 +1565,7 @@ mod tests {
                 expected_name: Some(name.to_string()),
                 to: profile("work"),
                 to_inspection: healthy(),
+                limit: None,
                 options: SwitchOptions::default(),
             })
         };
@@ -1867,6 +1869,7 @@ mod tests {
         blocked.status = AgentStatus::Blocked;
         let mut machine = SwitchMachine::new(SwitchInput {
             target: "a1".to_string(),
+            expected_name: None,
             to: profile("work"),
             to_inspection: healthy(),
             options: SwitchOptions::default(),
@@ -1909,6 +1912,7 @@ mod tests {
         blocked.status = AgentStatus::Blocked;
         let mut machine = SwitchMachine::new(SwitchInput {
             target: "a1".to_string(),
+            expected_name: None,
             to: profile("work"),
             to_inspection: healthy(),
             options: SwitchOptions::default(),
@@ -1979,6 +1983,7 @@ mod tests {
         blocked.status = AgentStatus::Blocked;
         let mut machine = SwitchMachine::new(SwitchInput {
             target: "a1".to_string(),
+            expected_name: None,
             to: profile("work"),
             to_inspection: healthy(),
             options: SwitchOptions::default(),
