@@ -2729,6 +2729,21 @@ fn the_tui_switch_keeps_the_conversation_and_flips_the_account() {
         !screen(&lab, &target_pane).contains("/exit"),
         "the confirmation must be answered before anything is sent"
     );
+    // An Enter on the heels of the one that submitted the picker — a double
+    // tap, a key repeat — is not an answer: the question has to have been on
+    // screen long enough to be read.
+    tui.send("\r");
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    assert!(
+        tui.contains_visible("↵ confirm"),
+        "a yes before the question could be read must be ignored: {}",
+        tui.visible_screen()
+    );
+    assert!(
+        !screen(&lab, &target_pane).contains("/exit"),
+        "an ignored answer sends nothing"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(600));
     tui.send("\r");
 
     let after = wait_for_account(&lab, target_agent, SECOND_PROFILE, &tui);

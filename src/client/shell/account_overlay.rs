@@ -54,6 +54,19 @@ const DEFAULT_AGENT_NAME: &str = AGENT_LABEL;
 /// where the outcome is shown.
 const ACCOUNT_JOB_STALL_LIMIT: Duration = Duration::from_secs(90);
 
+/// How long the switch's question must have been on screen before Enter, `y`
+/// or a click on `confirm` counts as the answer.
+///
+/// The question appears in the place the picker was, moments after the Enter
+/// or the click that submitted the picker. A double-tapped Enter, a held key's
+/// first repeat, or the second half of a double-click on a row would land on
+/// it before anyone could have read it — and the `confirm` hit rectangle can
+/// still be the previous frame's until the next paint. Nobody reads three
+/// lines about stopping their agent in half a second, so an answer that
+/// early is treated as the tail of the gesture that opened the question and
+/// ignored. Declining is never delayed: a spurious "no" costs nothing.
+const CONFIRM_ARM_DELAY: Duration = Duration::from_millis(500);
+
 /// One profile, as the picker shows it.
 ///
 /// Health is the cheap half of [`crate::accounts::layout::inspect`] — stat
@@ -289,8 +302,17 @@ impl AccountJob {
     ///
     /// `false` means the worker is already gone; the drain reports that on the
     /// next tick rather than this call inventing an outcome.
-    fn answer(&mut self, answer: Confirmation) -> bool {
+    ///
+    /// The stall clock restarts here. It was suspended while the question was
+    /// up, but `last_event` still dates from when the question *arrived* — a
+    /// person may have taken minutes over it — and the worker's next word
+    /// comes only after it has been scheduled and read the agent again. Left
+    /// alone, the very next tick could declare a worker that has just been
+    /// released "silent for 90 s", detach it, and let the switch run on with
+    /// nobody watching.
+    fn answer(&mut self, answer: Confirmation, now: Instant) -> bool {
         self.awaiting_confirm = false;
+        self.last_event = now;
         self.answers
             .take()
             .is_some_and(|answers| answers.send(answer).is_ok())
@@ -338,6 +360,10 @@ pub(super) struct ClientAccountPickerOverlay {
     /// and the conversation that will be resumed, and it is the only thing
     /// standing between a right-click and Claude being asked to exit.
     pub(super) confirm: Option<String>,
+    /// When the question was put on screen, for [`CONFIRM_ARM_DELAY`]. Set by
+    /// the tick that folds the worker's `Confirm` event, since the fold itself
+    /// is pure and has no clock.
+    confirm_shown_at: Option<Instant>,
     pub(super) error: Option<String>,
     pub(super) warnings: Vec<String>,
     /// A launch has ended and its outcome is what the modal shows. From here
@@ -389,11 +415,19 @@ impl ClientAccountPickerOverlay {
             search_focused: false,
             progress: None,
             confirm: None,
+            confirm_shown_at: None,
             error: None,
             warnings: Vec::new(),
             settled: false,
             job: None,
         }
+    }
+
+    /// True once the question has been on screen long enough for an answer
+    /// to be one — see [`CONFIRM_ARM_DELAY`].
+    fn confirm_armed(&self, now: Instant) -> bool {
+        self.confirm_shown_at
+            .is_some_and(|shown| now.saturating_duration_since(shown) >= CONFIRM_ARM_DELAY)
     }
 
     pub(super) fn filtered_indices(&self) -> Vec<usize> {
@@ -484,6 +518,7 @@ impl ClientAccountPickerOverlay {
     fn settle(&mut self, notes: Vec<String>) {
         self.progress = None;
         self.confirm = None;
+        self.confirm_shown_at = None;
         self.settled = true;
         self.warnings = notes;
     }
@@ -685,6 +720,9 @@ enum AccountJobSpawn {
     },
     Switch {
         pane_id: String,
+        /// The managed name the picker was opened for. The pane is addressed
+        /// by id, and this is what the protocol's first read must find there.
+        agent_name: String,
         profile: AccountProfile,
         interrupt: bool,
     },
@@ -701,9 +739,14 @@ enum AccountJobSpawn {
 /// of stderr, where a TUI would paint over it.
 ///
 /// The pane is addressed by id from the first read onwards, so the switch can
-/// only ever reach the pane the user right-clicked.
+/// only ever reach the pane the user right-clicked; and the protocol's own
+/// first read must find `agent_name` there, so it can only ever reach the
+/// agent that was in it when they did. The shell checked the same name
+/// against its snapshot before spawning this thread, but a snapshot is a
+/// moment old, and the read that pins the pane is the one that has to agree.
 fn run_switch_job(
     pane_id: String,
+    agent_name: String,
     profile: AccountProfile,
     interrupt: bool,
     events: &std::sync::mpsc::Sender<AccountJobEvent>,
@@ -711,6 +754,7 @@ fn run_switch_job(
 ) {
     let input = SwitchInput {
         target: pane_id,
+        expected_name: Some(agent_name),
         to: profile.clone(),
         to_inspection: inspect(&profile, InspectOptions::health()),
         options: SwitchOptions {
@@ -1227,6 +1271,7 @@ impl ClientShellState {
                 (
                     AccountJobSpawn::Switch {
                         pane_id,
+                        agent_name,
                         profile,
                         interrupt,
                     },
@@ -1247,9 +1292,10 @@ impl ClientShellState {
                 } => run_start_job(pane_id, agent_name, profile, &tx),
                 AccountJobSpawn::Switch {
                     pane_id,
+                    agent_name,
                     profile,
                     interrupt,
-                } => run_switch_job(pane_id, profile, interrupt, &tx, &answer_rx),
+                } => run_switch_job(pane_id, agent_name, profile, interrupt, &tx, &answer_rx),
             });
         let Some(ClientShellOverlay::AccountPicker(picker)) = self.overlay.as_mut() else {
             return;
@@ -1287,20 +1333,40 @@ impl ClientShellState {
     /// releases the worker into the protocol; `no` makes it fail with
     /// `Declined`, having sent nothing.
     fn answer_account_confirm(&mut self, yes: bool, outcome: &mut ClientShellInput) {
+        self.answer_account_confirm_at(yes, Instant::now(), outcome);
+    }
+
+    /// [`Self::answer_account_confirm`] at a given instant, so the arming
+    /// delay is testable without waiting it out.
+    fn answer_account_confirm_at(
+        &mut self,
+        yes: bool,
+        now: Instant,
+        outcome: &mut ClientShellInput,
+    ) {
         let Some(ClientShellOverlay::AccountPicker(picker)) = self.overlay.as_mut() else {
             return;
         };
         if picker.confirm.is_none() {
             return;
         }
+        if yes && !picker.confirm_armed(now) {
+            // The tail of the keystroke or click that opened the question,
+            // not an answer to it. The question stays up.
+            return;
+        }
         let delivered = picker.job.as_mut().is_some_and(|job| {
-            job.answer(if yes {
-                Confirmation::Yes
-            } else {
-                Confirmation::No
-            })
+            job.answer(
+                if yes {
+                    Confirmation::Yes
+                } else {
+                    Confirmation::No
+                },
+                now,
+            )
         });
         picker.confirm = None;
+        picker.confirm_shown_at = None;
         // The worker's own next phase overwrites this as soon as it moves; the
         // line is here so the modal never shows an empty body between the
         // answer and the next event.
@@ -1357,7 +1423,11 @@ impl ClientShellState {
         }
         let mut close = false;
         for event in events {
+            let asks = matches!(event, AccountJobEvent::Confirm(_));
             close |= picker.fold(event);
+            if asks {
+                picker.confirm_shown_at = Some(now);
+            }
         }
         if finished {
             if let Some(mut job) = picker.job.take() {
@@ -2593,8 +2663,17 @@ mod tests {
         crate::input::TerminalKey::new(code, crossterm::event::KeyModifiers::empty())
     }
 
-    /// A switch picker with a worker blocked on its confirmation.
+    /// A switch picker with a worker blocked on its confirmation, the question
+    /// having been up long enough that an answer counts.
     fn confirming(state: &mut ClientShellState) -> Receiver<Confirmation> {
+        let armed = Instant::now()
+            .checked_sub(CONFIRM_ARM_DELAY)
+            .expect("an instant before now");
+        confirming_since(state, armed)
+    }
+
+    /// [`confirming`], with the question put on screen at `shown`.
+    fn confirming_since(state: &mut ClientShellState, shown: Instant) -> Receiver<Confirmation> {
         let (answer_tx, answer_rx) = std::sync::mpsc::channel();
         let (overlay, event_tx) = ClientAccountPickerOverlay::idle(
             "pane_2".to_owned(),
@@ -2616,9 +2695,79 @@ mod tests {
         event_tx
             .send(AccountJobEvent::Confirm("Switch agent \"a1\"?".to_owned()))
             .expect("send");
-        assert!(state.tick_account_picker_at(Instant::now()));
+        assert!(state.tick_account_picker_at(shown));
         std::mem::forget(event_tx);
         answer_rx
+    }
+
+    fn picker_of(state: &ClientShellState) -> &ClientAccountPickerOverlay {
+        match state.overlay.as_ref() {
+            Some(ClientShellOverlay::AccountPicker(picker)) => picker,
+            other => panic!("expected the picker, got {other:?}"),
+        }
+    }
+
+    /// The question appears where the picker was, right after the Enter or
+    /// click that submitted it. An answer that early is that gesture's tail.
+    #[test]
+    fn a_yes_within_the_arming_delay_is_not_an_answer_but_a_no_is() {
+        let shown = Instant::now();
+        let mut state = shell_with(Profiles::default(), two_pane_snapshot());
+        let answers = confirming_since(&mut state, shown);
+        let too_soon = shown + CONFIRM_ARM_DELAY / 2;
+        let mut outcome = ClientShellInput::default();
+
+        state.answer_account_confirm_at(true, too_soon, &mut outcome);
+        assert!(
+            answers.try_recv().is_err(),
+            "a yes before anyone could have read the question is ignored"
+        );
+        assert!(
+            picker_of(&state).awaiting_confirm(),
+            "the question stays up"
+        );
+        assert!(picker_of(&state).running());
+
+        // Once the delay has passed, the same key is the answer.
+        state.answer_account_confirm_at(true, shown + CONFIRM_ARM_DELAY, &mut outcome);
+        assert_eq!(answers.try_recv(), Ok(Confirmation::Yes));
+        assert!(!picker_of(&state).awaiting_confirm());
+
+        // Declining is never delayed.
+        let mut state = shell_with(Profiles::default(), two_pane_snapshot());
+        let answers = confirming_since(&mut state, shown);
+        state.answer_account_confirm_at(false, too_soon, &mut outcome);
+        assert_eq!(answers.try_recv(), Ok(Confirmation::No));
+    }
+
+    /// A person may take minutes over the question. Answering it must not
+    /// read as "the worker has been silent for minutes".
+    #[test]
+    fn answering_the_question_restarts_the_stall_clock() {
+        let mut state = shell_with(Profiles::default(), two_pane_snapshot());
+        let answers = confirming(&mut state);
+        let much_later = Instant::now() + ACCOUNT_JOB_STALL_LIMIT * 10;
+        let mut outcome = ClientShellInput::default();
+        state.answer_account_confirm_at(true, much_later, &mut outcome);
+        assert_eq!(answers.try_recv(), Ok(Confirmation::Yes));
+
+        // The worker has been released and has not spoken yet; the modal
+        // waits for it rather than declaring a stall on the next tick.
+        let next_tick = much_later + Duration::from_millis(100);
+        assert!(!state.tick_account_picker_at(next_tick));
+        let picker = picker_of(&state);
+        assert!(picker.running(), "the worker is still being waited for");
+        assert!(!picker.settled);
+        assert_eq!(picker.error, None);
+
+        // The limit counts from the answer, not from the question.
+        assert!(state.tick_account_picker_at(much_later + ACCOUNT_JOB_STALL_LIMIT * 2));
+        let picker = picker_of(&state);
+        assert!(picker.settled);
+        assert!(picker
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("no answer from the server")));
     }
 
     #[test]

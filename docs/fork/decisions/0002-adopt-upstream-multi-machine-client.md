@@ -96,9 +96,9 @@ Option 3.
     | File | Re-apply |
     | --- | --- |
     | `src/client/shell.rs` | `mod account_overlay;` in the module list |
-    | `src/client/shell/state.rs` | `ClientShellOverlayKind::AccountPicker`; `ClientContextMenuAction::StartClaudeAs`; `ClientContextMenuTarget::Pane` fields `agent_kind: Option<String>` and `accounts_available: usize`; `ClientShellOverlay::AccountPicker(account_overlay::ClientAccountPickerOverlay)` and its `kind()` arm; `ClientShellConfig.accounts: crate::accounts::profile::Profiles` |
+    | `src/client/shell/state.rs` | `ClientShellOverlayKind::AccountPicker`; `ClientContextMenuAction::StartClaudeAs` and `ClientContextMenuAction::SwitchClaudeAccount`; `ClientContextMenuTarget::Pane` fields `agent_kind: Option<String>` and `accounts_available: usize`; `ClientShellOverlay::AccountPicker(account_overlay::ClientAccountPickerOverlay)` and its `kind()` arm; `ClientShellConfig.accounts: crate::accounts::profile::Profiles` |
     | `src/client/shell/config.rs` | `accounts: Profiles::default()` in `from_config`; the `with_accounts(&Config)` builder; the `if !invalid_section("accounts")` refresh in `apply_live_config` |
-    | `src/client/shell/context_menu.rs` | the two extra bindings + `items.extend(super::account_overlay::start_claude_context_item(…))` in the `Pane` arm of `items()`; in `open_pane_context_menu` the two lines `let agent_kind = super::account_overlay::pane_agent_kind(snapshot, &pane_id);` and `let accounts_available = self.accounts_available_for(&self.active_endpoint_id);` plus the two fields in the `Pane` target; the `StartClaudeAs => self.open_account_picker(pane_id, outcome)` arm |
+    | `src/client/shell/context_menu.rs` | the two extra bindings + `items.extend(super::account_overlay::start_claude_context_item(…))` and, right after it, `items.extend(super::account_overlay::switch_account_context_item(…))` in the `Pane` arm of `items()`; in `open_pane_context_menu` the two lines `let agent_kind = super::account_overlay::pane_agent_kind(snapshot, &pane_id);` and `let accounts_available = self.accounts_available_for(&self.active_endpoint_id);` plus the two fields in the `Pane` target; the `StartClaudeAs => self.open_account_picker(pane_id, outcome)` and `SwitchClaudeAccount => self.open_account_switch_picker(pane_id, outcome)` arms |
     | `src/client/shell/overlays.rs` | `mod account_overlay_render;`; the `ClientShellOverlay::AccountPicker(v)` render arm |
     | `src/client/shell/overlay_input.rs` | `if self.route_account_picker_key(key, outcome) { return; }` after the worktree router |
     | `src/client/shell/mouse.rs` | `if self.route_account_picker_mouse(mouse.kind, point, outcome) { return; }` before the worktree overlay arm |
@@ -111,7 +111,9 @@ Option 3.
     `composition.rs` and `ShellHitMap` out of this list. `src/cli.rs` is
     already "take both"; its E9 line is `pub(crate) mod agent;`, so the picker's
     worker can call the one `start_managed_agent` the CLI uses instead of a
-    second copy of the `agent.start` retry. E9 PR 8 extends this table.
+    second copy of the `agent.start` retry. E9 PR 8 (the switch action) added
+    the `SwitchClaudeAccount` variant, item and activation arm listed above
+    and nothing else outside the two fork-owned files.
   - E1's three hooks in `src/remote/attach.rs` (`pub(crate)` visibility on the
     ssh stdio bridge and discovery, `SshStdioBridge::start_with(…,
     BridgeErrorSink)`, `local_forward_socket_path_scoped`,
