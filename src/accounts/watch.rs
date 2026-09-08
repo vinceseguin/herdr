@@ -83,6 +83,16 @@ pub const BLOCKED_RECHECK: Duration = Duration::from_secs(60);
 /// [`BLOCKED_RECHECK`].
 pub const EPISODE_EXPLAIN_BUDGET: u32 = 3;
 
+/// How many times a refused clear is retried before the lease is left to it.
+///
+/// A refused clear re-arms the label so the next poll tries again, and a
+/// recovered agent is re-observed every interval — so a clear the server
+/// refuses *deterministically* (a report shape it will never accept) would
+/// otherwise be one failed write and one warning per interval for as long as
+/// the watcher runs, on an agent whose badge the lease has already taken away.
+/// Giving up is safe precisely because the label was leased.
+pub const CLEAR_ATTEMPT_BUDGET: u32 = 5;
+
 /// The most panes one watcher tracks at once.
 ///
 /// A bound rather than a guess: the map only ever holds panes that ran a Claude
@@ -211,6 +221,9 @@ struct Tracked {
     /// When this pane was last explained, and how many times in this episode.
     last_explain: Option<Instant>,
     episode_explains: u32,
+    /// How many clears the server has refused for this label, so a clear it
+    /// will never accept stops costing a write and a warning every poll.
+    clear_attempts: u32,
     /// Whether the last observation had the agent blocked. A blocked episode
     /// ends the moment it is anything else, which is also when the label goes.
     blocked: bool,
@@ -296,9 +309,12 @@ impl WatchState {
                 action => actions.push(action),
             }
         }
-        // An agent that is gone takes its labels with it: the server drops
-        // metadata scoped to the Claude integration when the process exits, and
-        // a pane herdr no longer lists cannot be reported against anyway.
+        // An agent that is gone cannot be reported against: the server refuses
+        // a metadata report that races the Claude process exiting, and the same
+        // exit sweeps every state label whose `agent` is the agent that left.
+        // The `account_state` *token* is not exit-scoped, so it outlives the
+        // agent — which is exactly what its lease is for, since there is no
+        // pane left to clear it on.
         self.panes
             .retain(|pane_id, _| seen.contains(pane_id.as_str()));
         actions
@@ -335,9 +351,10 @@ impl WatchState {
                     account: account.clone(),
                     name: agent.name.clone(),
                     labelled: None,
-                    restore_state: agent.account_state.clone(),
+                    restore_state: restorable_state(agent.account_state.as_deref()),
                     last_explain: None,
                     episode_explains: 0,
+                    clear_attempts: 0,
                     blocked: false,
                 },
             );
@@ -353,7 +370,7 @@ impl WatchState {
         if tracked.account != account {
             tracked.account = account.clone();
             tracked.labelled = None;
-            tracked.restore_state = agent.account_state.clone();
+            tracked.restore_state = restorable_state(agent.account_state.as_deref());
             tracked.last_explain = None;
             tracked.episode_explains = 0;
         }
@@ -363,10 +380,9 @@ impl WatchState {
             // remember the state this label will have to restore.
             tracked.blocked = true;
             tracked.episode_explains = 0;
-            if tracked.labelled.is_none()
-                && agent.account_state.as_deref() != Some(AccountState::Limited.as_str())
-            {
-                tracked.restore_state = agent.account_state.clone();
+            tracked.clear_attempts = 0;
+            if tracked.labelled.is_none() {
+                tracked.restore_state = restorable_state(agent.account_state.as_deref());
             }
         }
 
@@ -486,13 +502,25 @@ impl WatchState {
 
     /// A clear the server refused. Remember the label again, so the exit path
     /// and the next poll both keep trying to take it off.
-    pub fn clear_failed(&mut self, pane_id: &str, limit: UsageLimit, now: Instant) {
-        if let Some(tracked) = self.panes.get_mut(pane_id) {
-            tracked.labelled = Some(Labelled {
-                limit,
-                refreshed_at: now,
-            });
+    ///
+    /// Returns false once [`CLEAR_ATTEMPT_BUDGET`] attempts have been refused:
+    /// the watcher stops asking and leaves the badge to the lease it was
+    /// written with, rather than turning a refusal it cannot argue with into a
+    /// write and a warning every poll for the rest of the session.
+    #[must_use]
+    pub fn clear_failed(&mut self, pane_id: &str, limit: UsageLimit, now: Instant) -> bool {
+        let Some(tracked) = self.panes.get_mut(pane_id) else {
+            return false;
+        };
+        tracked.clear_attempts = tracked.clear_attempts.saturating_add(1);
+        if tracked.clear_attempts >= CLEAR_ATTEMPT_BUDGET {
+            return false;
         }
+        tracked.labelled = Some(Labelled {
+            limit,
+            refreshed_at: now,
+        });
+        true
     }
 
     /// The pane left `blocked`: the episode is over whatever ended it.
@@ -512,7 +540,7 @@ impl WatchState {
         tracked.last_explain = None;
         let Some(_) = tracked.labelled.take() else {
             // Keep the pane tracked but idle: nothing to undo.
-            tracked.restore_state = agent.account_state.clone();
+            tracked.restore_state = restorable_state(agent.account_state.as_deref());
             return WatchAction::Nothing;
         };
         WatchAction::Clear {
@@ -522,6 +550,24 @@ impl WatchState {
             restore_state: tracked.restore_state.clone(),
         }
     }
+}
+
+/// The `account_state` a clear is allowed to put back.
+///
+/// [`AccountState::Limited`] is never restorable, because it is *this label's
+/// own value*. A watcher does not always arrive at an unlabelled machine: a
+/// previous watcher that was killed, a `--once` pass, or a second `watch` in
+/// another terminal all leave a leased `limited` behind, and the next watcher's
+/// first sight of that pane reads it as "the state I am about to replace".
+/// Restoring it on the way out would then write `limited` **without a TTL** —
+/// turning a badge that was expiring by itself into a permanent one on an agent
+/// that has recovered. Answering `None` instead removes the token, which is the
+/// honest reading: this watcher never saw what the account state was before the
+/// limit, and absent means "herdr does not know".
+fn restorable_state(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|state| *state != AccountState::Limited.as_str())
+        .map(str::to_string)
 }
 
 /// The lease a label carries, derived from the poll interval.
@@ -883,6 +929,66 @@ mod tests {
         );
     }
 
+    /// The trap a second watcher walks into. A killed watcher, a `--once` pass
+    /// or a `watch` in another terminal leaves a *leased* `limited` behind; the
+    /// next watcher's first sight of that pane must not read it as the state it
+    /// is replacing, because restoring it writes `limited` with no TTL and
+    /// turns an expiring badge into a permanent one.
+    #[test]
+    fn a_limited_state_left_by_another_watcher_is_never_restored() {
+        for status in [AgentStatus::Blocked, AgentStatus::Idle] {
+            let mut state = WatchState::new();
+            let now = Instant::now();
+
+            // First sight of the pane: someone else's label is already on it.
+            let mut adopted = agent("pane_1", status);
+            adopted.account_state = Some(AccountState::Limited.as_str().to_string());
+            adopted.blocked_label = Some(LIMIT_LABEL.to_string());
+            let _ = state.observe_agent(&adopted, LEASE, now);
+
+            let blocked = labelled("pane_1");
+            let _ = state.observe_agent(&blocked, LEASE, now + EXPLAIN_DEBOUNCE);
+            let _ = state.explained(&blocked, Some(limit()), LEASE, now + EXPLAIN_DEBOUNCE);
+            assert!(state.is_labelled("pane_1"), "{status:?}");
+
+            let mut recovered = agent("pane_1", AgentStatus::Idle);
+            recovered.account_state = Some(AccountState::Limited.as_str().to_string());
+            assert_eq!(
+                state.observe_agent(&recovered, LEASE, now + EXPLAIN_DEBOUNCE),
+                WatchAction::Clear {
+                    pane_id: "pane_1".into(),
+                    name: Some("a1".into()),
+                    account: "work".into(),
+                    restore_state: None,
+                },
+                "first seen as {status:?}: the clear must remove the token, not \
+                 write `limited` back without a lease"
+            );
+        }
+    }
+
+    /// The same rule stated on its own, so it cannot be lost in a refactor of
+    /// the fold: `limited` is this label's value and is never restorable.
+    #[test]
+    fn only_a_state_that_is_not_the_label_can_be_restored() {
+        assert_eq!(restorable_state(None), None);
+        assert_eq!(restorable_state(Some("limited")), None);
+        for state in AccountState::ALL {
+            let restored = restorable_state(Some(state.as_str()));
+            if state == AccountState::Limited {
+                assert_eq!(restored, None);
+            } else {
+                assert_eq!(restored.as_deref(), Some(state.as_str()));
+            }
+        }
+        assert_eq!(
+            restorable_state(Some("a-state-this-build-never-heard-of")).as_deref(),
+            Some("a-state-this-build-never-heard-of"),
+            "an unknown state is carried verbatim, like everywhere else in the \
+             account tooling"
+        );
+    }
+
     fn agent_without_state(pane: &str, status: AgentStatus) -> WatchAgent {
         let mut agent = agent(pane, status);
         agent.account_state = None;
@@ -1010,9 +1116,54 @@ mod tests {
         let _ = state.observe_agent(&agent("pane_1", AgentStatus::Idle), LEASE, now);
         assert!(!state.is_labelled("pane_1"));
 
-        state.clear_failed("pane_1", limit(), now);
+        assert!(state.clear_failed("pane_1", limit(), now));
         assert!(state.is_labelled("pane_1"));
         assert_eq!(state.drain_clears().len(), 1);
+    }
+
+    /// …but not forever. A refusal the server will repeat is one write and one
+    /// warning per poll for the rest of the session, on a badge the lease has
+    /// already taken away.
+    #[test]
+    fn a_clear_the_server_keeps_refusing_is_left_to_the_lease() {
+        let mut state = WatchState::new();
+        let now = Instant::now();
+        let blocked = agent("pane_1", AgentStatus::Blocked);
+        let _ = state.observe_agent(&blocked, LEASE, now);
+        let _ = state.explained(&blocked, Some(limit()), LEASE, now);
+
+        let mut attempts = 0;
+        loop {
+            let idle = agent("pane_1", AgentStatus::Idle);
+            assert!(
+                matches!(
+                    state.observe_agent(&idle, LEASE, now),
+                    WatchAction::Clear { .. }
+                ),
+                "attempt {attempts} must still ask"
+            );
+            attempts += 1;
+            if !state.clear_failed("pane_1", limit(), now) {
+                break;
+            }
+            assert!(
+                attempts < CLEAR_ATTEMPT_BUDGET + 1,
+                "the watcher never gave up"
+            );
+        }
+        assert_eq!(attempts, CLEAR_ATTEMPT_BUDGET);
+        assert!(!state.is_labelled("pane_1"));
+        assert_eq!(
+            state.observe_agent(&agent("pane_1", AgentStatus::Idle), LEASE, now),
+            WatchAction::Nothing,
+            "and stops asking"
+        );
+        assert!(state.drain_clears().is_empty(), "including on the way out");
+
+        // A new blocked episode is a new label, and gets the full budget again.
+        let _ = state.observe_agent(&blocked, LEASE, now + EXPLAIN_DEBOUNCE);
+        let _ = state.explained(&blocked, Some(limit()), LEASE, now + EXPLAIN_DEBOUNCE);
+        assert!(state.clear_failed("pane_1", limit(), now + EXPLAIN_DEBOUNCE));
     }
 
     /// A long-running process reading a list it does not control keeps a bound

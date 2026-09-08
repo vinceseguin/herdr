@@ -999,7 +999,11 @@ pub fn watch(options: &WatchOptions) -> WatchEnd {
                     connected = true;
                 }
                 backoff = RECONNECT_BACKOFF_START;
-                apply(&mut state, &agents, lease, options);
+                // A stdout that can no longer be written is a request to stop,
+                // not a failure — the clears below still run.
+                if !apply(&mut state, &agents, lease, options) {
+                    break;
+                }
                 if state.overflowed() && !warned_overflow {
                     warned_overflow = true;
                     eprintln!(
@@ -1015,10 +1019,13 @@ pub fn watch(options: &WatchOptions) -> WatchEnd {
                 break;
             }
             Err(PollError::Unavailable(message)) => {
-                // The server going away takes every token with it, so there is
-                // nothing left to clear and nothing to remember about labels
-                // that no longer exist. The next successful poll re-labels
-                // whatever is still limited.
+                // Nothing is written and nothing is forgotten. A server that
+                // restarted lost every token (`src/persist/snapshot.rs` carries
+                // none) and a server that is merely unreachable kept them; the
+                // watcher cannot tell the two apart from here and does not have
+                // to, because the next successful poll compares what it
+                // believes against what the server actually holds and re-labels
+                // whatever went missing.
                 if connected {
                     eprintln!("note: {message}; waiting for it to come back");
                     connected = false;
@@ -1051,7 +1058,11 @@ pub fn watch(options: &WatchOptions) -> WatchEnd {
     // lifetime for a label to belong to, so it leaves what it found and lets
     // the lease expire it. Clearing on the way out would make `--once` a very
     // expensive no-op.
-    if !options.keep_labels && !options.once && connected {
+    //
+    // A fatal end is the one case where they are not even attempted: the only
+    // fatal today is a protocol the client cannot speak, so every clear would
+    // fail — and `send_request` re-prints the mismatch on each one.
+    if !options.keep_labels && !options.once && connected && end != WatchEnd::Failed {
         for action in state.drain_clears() {
             let crate::accounts::watch::WatchAction::Clear {
                 pane_id,
@@ -1063,14 +1074,18 @@ pub fn watch(options: &WatchOptions) -> WatchEnd {
                 continue;
             };
             match write_clear(pane_id, restore_state.as_deref()) {
-                Ok(()) => print_event(
-                    options,
-                    "cleared",
-                    pane_id,
-                    name.as_deref(),
-                    account,
-                    &crate::accounts::limit::UsageLimit::default(),
-                ),
+                // Nobody may be reading stdout any more; the write that matters
+                // on the way out is the one that already reached the server.
+                Ok(()) => {
+                    let _ = print_event(
+                        options,
+                        "cleared",
+                        pane_id,
+                        name.as_deref(),
+                        account,
+                        &crate::accounts::limit::UsageLimit::default(),
+                    );
+                }
                 Err(err) => eprintln!(
                     "warning: could not clear the usage-limit label on pane {pane_id} \
                      (account {account}): {err}; it expires by itself within {}s",
@@ -1084,16 +1099,22 @@ pub fn watch(options: &WatchOptions) -> WatchEnd {
 }
 
 /// One poll: read the agents, act on what changed.
+///
+/// Returns false when stdout has gone away (`herdr account watch --json | head`
+/// is an ordinary thing to type), which is a request to stop rather than a
+/// failure — the same reading `herdr fleet watch` gives a closed pipe.
+#[must_use]
 fn apply(
     state: &mut crate::accounts::watch::WatchState,
     agents: &[crate::accounts::watch::WatchAgent],
     lease: Duration,
     options: &WatchOptions,
-) {
+) -> bool {
     use crate::accounts::watch::WatchAction;
 
     let mut queue = state.observe(agents, lease, Instant::now());
     let mut guard = 0usize;
+    let mut writable = true;
     while let Some(action) = queue.pop() {
         // A bound on the follow-up work one poll can generate. `Explain` is the
         // only action that produces another action, and it produces at most
@@ -1123,7 +1144,7 @@ fn apply(
             } => match write_label(&pane_id, lease) {
                 Ok(()) => {
                     if announce {
-                        print_event(
+                        writable &= print_event(
                             options,
                             "limited",
                             &pane_id,
@@ -1144,29 +1165,52 @@ fn apply(
                 account,
                 restore_state,
             } => match write_clear(&pane_id, restore_state.as_deref()) {
-                Ok(()) => print_event(
-                    options,
-                    "cleared",
-                    &pane_id,
-                    name.as_deref(),
-                    &account,
-                    &crate::accounts::limit::UsageLimit::default(),
-                ),
+                Ok(()) => {
+                    writable &= print_event(
+                        options,
+                        "cleared",
+                        &pane_id,
+                        name.as_deref(),
+                        &account,
+                        &crate::accounts::limit::UsageLimit::default(),
+                    );
+                }
                 Err(err) => {
-                    state.clear_failed(
+                    if state.clear_failed(
                         &pane_id,
                         crate::accounts::limit::UsageLimit::default(),
                         Instant::now(),
-                    );
-                    eprintln!("warning: could not clear the label on pane {pane_id}: {err}");
+                    ) {
+                        eprintln!("warning: could not clear the label on pane {pane_id}: {err}");
+                    } else {
+                        eprintln!(
+                            "warning: could not clear the label on pane {pane_id}: {err}; \
+                             giving up on it — it expires by itself within {}s",
+                            lease.as_secs()
+                        );
+                    }
                 }
             },
             WatchAction::Nothing => {}
         }
     }
+    writable
 }
 
 /// One line per label change, in the shape the caller asked for.
+///
+/// Returns false when the line could not be written, which stops the watcher
+/// the way an interrupt does — clears included — instead of `println!`'s panic.
+///
+/// On unix a closed pipe usually never gets here: `begin_cli_output` puts
+/// `SIGPIPE` back to `SIG_DFL` so `herdr account watch --json | head -3` ends by
+/// signal like every other herdr CLI, and the labels it was holding are left to
+/// their leases (which is what the leases are for). This is the rest of it —
+/// Windows, where the write returns an error instead, and any other write
+/// failure on a redirected stdout — where a panic would unwind straight past
+/// the clears the exit path owes the server. `herdr fleet watch` draws the same
+/// distinction (`src/cli/fleet.rs`).
+#[must_use]
 fn print_event(
     options: &WatchOptions,
     event: &str,
@@ -1174,8 +1218,10 @@ fn print_event(
     name: Option<&str>,
     account: &str,
     limit: &crate::accounts::limit::UsageLimit,
-) {
-    if options.json {
+) -> bool {
+    use std::io::Write as _;
+
+    let line = if options.json {
         let mut record = serde_json::Map::new();
         record.insert("event".into(), event.into());
         record.insert("pane_id".into(), pane_id.into());
@@ -1186,19 +1232,19 @@ fn print_event(
         if let Some(reset) = limit.reset_text.as_deref() {
             record.insert("reset_text".into(), reset.into());
         }
-        println!("{}", serde_json::Value::Object(record));
+        serde_json::Value::Object(record).to_string()
     } else {
         let who = match name {
             Some(name) => format!("{name} ({pane_id})"),
             None => pane_id.to_string(),
         };
         match limit.reset_text.as_deref() {
-            Some(reset) => println!("{event} {who} account={account} resets {reset}"),
-            None => println!("{event} {who} account={account}"),
+            Some(reset) => format!("{event} {who} account={account} resets {reset}"),
+            None => format!("{event} {who} account={account}"),
         }
-    }
-    use std::io::Write as _;
-    let _ = std::io::stdout().flush();
+    };
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{line}").and_then(|()| out.flush()).is_ok()
 }
 
 /// Why a poll did not produce an agent list.
@@ -1247,6 +1293,17 @@ fn poll_agents() -> Result<Vec<crate::accounts::watch::WatchAgent>, PollError> {
 /// again — never as "not limited".
 fn usage_limit_on(pane_id: &str) -> Option<crate::accounts::limit::UsageLimit> {
     let explain = crate::cli::account::agent_explain(pane_id)?;
+    // The agent list this pane came from is one round trip old, and the answer
+    // is another. `explain.agent` is the detector's own view of what is in the
+    // pane *now*, so it is the cheapest possible re-check that the evidence
+    // being read still belongs to a Claude agent: a pane whose Claude exited
+    // and whose next agent started in between is refused here rather than
+    // labelled from a verdict about something else. It also pins the rule id to
+    // the manifest that defines it, since `usage_limit` is a name another
+    // agent's (possibly remotely fetched) manifest could reuse.
+    if explain.get("agent").and_then(serde_json::Value::as_str) != Some(AGENT_LABEL) {
+        return None;
+    }
     if !crate::accounts::limit::matched_usage_limit(&explain) {
         return None;
     }
@@ -1396,6 +1453,48 @@ fn sleep_interruptibly(total: Duration, interrupted: &std::sync::atomic::AtomicB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The watcher writes metadata onto agents it did not start, and the whole
+    /// safety argument for that is that metadata is *all* it can write:
+    /// decision (d) of the epic is "detect and suggest, never auto-switch".
+    /// `crate::accounts::watch` pins the decision half by giving the action
+    /// enum no vocabulary for typing; this pins the runtime half. The guard is
+    /// scoped to the watcher's section rather than the file because `client.rs`
+    /// legitimately types into panes for the launch and the switch — which is
+    /// exactly why a driver that grew a `pane.send_text` here would look
+    /// unremarkable in review.
+    #[test]
+    fn the_watch_driver_only_reads_and_reports_metadata() {
+        const SOURCE: &str = include_str!("client.rs");
+        const SECTION_START: &str = "// The watcher (PR 10).";
+
+        let section = SOURCE
+            .split_once(SECTION_START)
+            .expect("the watcher section is still marked in this file")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("the watcher section still ends where the tests begin")
+            .0;
+        assert!(
+            section.contains("Method::PaneReportMetadata"),
+            "the slice must really be the watcher"
+        );
+        for reaches_a_pane in [
+            "PaneSendText",
+            "AgentSendKeys",
+            "AgentPrompt",
+            "AgentStart",
+            "submit_pane_text",
+            "apply_env",
+            "switch_account",
+        ] {
+            assert!(
+                !section.contains(reaches_a_pane),
+                "the watcher must never reach {reaches_a_pane}: it looks and labels, \
+                 nothing else"
+            );
+        }
+    }
 
     const WORK: &str = "/p/work";
 
